@@ -150,7 +150,9 @@ def main():
     p.add_argument("--mesh",type=Path,help="Reference mesh, required only in oracle mode")
     p.add_argument("--fx",type=float,required=True);p.add_argument("--fy",type=float,required=True)
     p.add_argument("--cx",type=float,required=True);p.add_argument("--cy",type=float,required=True)
-    p.add_argument("--depth-scale",type=float,default=1000,help="Depth pixel units per metre")\n    p.add_argument("--pose-camera",choices=["opengl","opencv"],required=True,\n                   help="Axes of input camera-to-world pose; Replica typically uses OpenGL")
+    p.add_argument("--depth-scale",type=float,default=1000,help="Depth pixel units per metre")
+    p.add_argument("--pose-camera",choices=["opengl","opencv"],required=True,
+                   help="Axes of input camera-to-world pose; Replica typically uses OpenGL")
     p.add_argument("--frame-step",type=int,default=20)
     p.add_argument("--pixel-step",type=int,default=12)
     p.add_argument("--max-points",type=int,default=150000)
@@ -159,9 +161,14 @@ def main():
     if a.mode=="oracle" and a.mesh is None: p.error("--mesh required for oracle mode")
     if any(v<=0 for v in [a.fx,a.fy,a.depth_scale,a.frame_step,a.pixel_step,a.max_points,a.val_every]):
         p.error("Positive intrinsics/scales/strides required")
-    if a.val_every != 8:\n        p.error("Current VkSplat default validation split is every 8th image; --val-every must be 8")\n    scene=a.scene.resolve()
+    if a.val_every != 8:
+        p.error("Current VkSplat default validation split is every 8th image; --val-every must be 8")
+    scene=a.scene.resolve()
     pairs=pair_files(scene)
-    poses=trajectory(scene/"traj.txt")\n    if a.pose_camera=="opengl":\n        axis=np.diag([1.0,-1.0,-1.0,1.0])\n        poses=poses@axis
+    poses=trajectory(scene/"traj.txt")
+    if a.pose_camera=="opengl":
+        axis=np.diag([1.0,-1.0,-1.0,1.0])
+        poses=poses@axis
     if max(i for i,_,_ in pairs)>=len(poses): p.error("Frame index outside pose trajectory")
     sample=cv2.imread(str(pairs[0][1]))
     h,w=sample.shape[:2]
