@@ -14,10 +14,21 @@ The fork includes a committed `pixi.toml` for Python 3.12, NumPy, OpenCV, pybind
 
 On Fedora:
 ```bash
-sudo dnf install -y vulkan-loader-devel vulkan-headers glm-devel gcc-c++
+sudo dnf install -y gcc-c++ vulkan-loader-devel vulkan-headers glm-devel pkgconf-pkg-config
 cd ~/git/vksplat
 bash sceneweave/setup.sh
 ```
+
+On Ubuntu (22.04 / 24.04 or later, x86_64; actual GPU build still needs validation):
+```bash
+sudo apt update
+sudo apt install -y build-essential libvulkan-dev libglm-dev pkg-config \\
+    mesa-vulkan-drivers vulkan-tools libdrm2 libdrm-amdgpu1
+cd ~/git/vksplat
+bash sceneweave/setup.sh
+```
+
+The installer reports these prerequisite commands when headers are missing. The runtime launcher discovers the host libdrm locations through `ldconfig` (Fedora: `/lib64` or `/usr/lib64`; Ubuntu: `/lib/x86_64-linux-gnu` or `/usr/lib/x86_64-linux-gnu`). It leaves Vulkan ICD selection to the system by default, so Intel/NVIDIA machines can also use the standard driver. For AMD with problematic ICD selection, set `VK_SPLAT_FORCE_RADV=1`. Set `VK_SPLAT_SYSTEM_DRM=0` only if your host driver is compatible with the Pixi-loaded DRM libraries.
 
 Or perform the steps separately:
 ```bash
@@ -27,11 +38,11 @@ pixi run smoke      # Vulkan compute initialization test
 pixi run benchmark-help
 ```
 
-These scripts do **not** install PyTorch/TorchMetrics and do not train on a dataset. The system Vulkan device must support VkSplat's requirements. `pixi.lock` should be generated on a working machine and committed to your fork (the repository's original `*.lock` ignore pattern is overridden for `pixi.lock`). On Linux distributions without Fedora's DRM paths, run `VK_SPLAT_SYSTEM_DRM=0 VK_SPLAT_FORCE_RADV=0 pixi run smoke` and ensure the system Vulkan driver is correctly available. This configuration is currently Linux-only; other platforms require their own tested setup.
+These scripts do **not** install PyTorch/TorchMetrics and do not train on a dataset. The system Vulkan device must support VkSplat's requirements. `pixi.lock` should be generated on a working machine and committed to your fork (the repository's original `*.lock` ignore pattern is overridden for `pixi.lock`). On Ubuntu and Fedora the launcher automatically locates system DRM libraries. `VK_SPLAT_SYSTEM_DRM=1` requires them, `0` disables preloading, and the default `auto` preloads them if available. `VK_SPLAT_FORCE_RADV=1` explicitly selects AMD RADV where the manifest exists. This configuration is currently Linux-only; other platforms require their own tested setup.
 
 ## Quick start on the tested Fedora 44 + Strix Halo setup
 
-The local environment needs a built VkSplat extension installed in `.pixi/envs/default`. **This fork does not ship a Pixi environment manifest or build VkSplat**. Reuse the local one already created, then:
+The local environment needs a built VkSplat extension installed in `.pixi/envs/default`. This fork now ships a Pixi manifest and setup scripts. Build once using `bash sceneweave/setup.sh`, then:
 
 ```bash
 cd ~/git/vksplat
