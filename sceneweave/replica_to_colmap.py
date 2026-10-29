@@ -159,7 +159,7 @@ def main():
     if a.mode=="oracle" and a.mesh is None: p.error("--mesh required for oracle mode")
     if any(v<=0 for v in [a.fx,a.fy,a.depth_scale,a.frame_step,a.pixel_step,a.max_points,a.val_every]):
         p.error("Positive intrinsics/scales/strides required")
-    scene=a.scene.resolve()
+    if a.val_every != 8:\n        p.error("Current VkSplat default validation split is every 8th image; --val-every must be 8")\n    scene=a.scene.resolve()
     pairs=pair_files(scene)
     poses=trajectory(scene/"traj.txt")\n    if a.pose_camera=="opengl":\n        axis=np.diag([1.0,-1.0,-1.0,1.0])\n        poses=poses@axis
     if max(i for i,_,_ in pairs)>=len(poses): p.error("Frame index outside pose trajectory")
