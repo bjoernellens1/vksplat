@@ -28,17 +28,41 @@ cd ~/git/vksplat
 bash sceneweave/setup.sh
 ```
 
-The installer reports these prerequisite commands when headers are missing. The runtime launcher discovers the host libdrm locations through `ldconfig` (Fedora: `/lib64` or `/usr/lib64`; Ubuntu: `/lib/x86_64-linux-gnu` or `/usr/lib/x86_64-linux-gnu`). It leaves Vulkan ICD selection to the system by default, so Intel/NVIDIA machines can also use the standard driver. For AMD with problematic ICD selection, set `VK_SPLAT_FORCE_RADV=1`. Set `VK_SPLAT_SYSTEM_DRM=0` only if your host driver is compatible with the Pixi-loaded DRM libraries.
+**Required first-time setup:** install the OS packages listed above, ensure `vulkaninfo --summary` detects your physical GPU (not only `llvmpipe`), then run `pixi run setup`. Merely running `pixi run smoke` on a fresh clone will fail because the native extension has not been built. The installer reports distribution-specific prerequisite commands when headers are missing. The runtime launcher discovers the host libdrm locations through `ldconfig` (Fedora: `/lib64` or `/usr/lib64`; Ubuntu: `/lib/x86_64-linux-gnu` or `/usr/lib/x86_64-linux-gnu`). It leaves Vulkan ICD selection to the system by default, so Intel/NVIDIA machines can also use the standard driver. For AMD with problematic ICD selection, set `VK_SPLAT_FORCE_RADV=1`. Set `VK_SPLAT_SYSTEM_DRM=0` only if your host driver is compatible with the Pixi-loaded DRM libraries.
 
 Or perform the steps separately:
 ```bash
-pixi install
-pixi run build      # editable C++ extension build/install
-pixi run smoke      # Vulkan compute initialization test
+pixi run setup      # resolve dependencies, build and smoke-test
+pixi run build      # rebuild editable C++ extension
+pixi run smoke      # check that a hardware Vulkan GPU is viable
 pixi run benchmark-help
 ```
 
 These scripts do **not** install PyTorch/TorchMetrics and do not train on a dataset. The system Vulkan device must support VkSplat's requirements. `pixi.lock` should be generated on a working machine and committed to your fork (the repository's original `*.lock` ignore pattern is overridden for `pixi.lock`). On Ubuntu and Fedora the launcher automatically locates system DRM libraries. `VK_SPLAT_SYSTEM_DRM=1` requires them, `0` disables preloading, and the default `auto` preloads them if available. `VK_SPLAT_FORCE_RADV=1` explicitly selects AMD RADV where the manifest exists. This configuration is currently Linux-only; other platforms require their own tested setup.
+
+## Troubleshooting Ubuntu AMD GPU enumeration
+
+A successful `pixi run build` only proves that the Python extension compiled. On the Ubuntu Radeon R9700 machine, the current `pixi run smoke` prints **only llvmpipe**, meaning no viable physical GPU is available to VkSplat *in that process*. This is not yet proof that the R9700 lacks any required Vulkan feature.
+
+First diagnose the host:
+
+```bash
+vulkaninfo --summary
+ls -l /dev/dri/renderD* 2>/dev/null || true
+ls -l /usr/share/vulkan/icd.d/ 
+```
+
+If system `vulkaninfo` also lists only llvmpipe, confirm the AMD kernel/DRM driver is loaded and users can access a render node; examine `dmesg`/journal and device permissions. Reinstalling Pixi will not fix an absent host GPU.
+
+If system Vulkan lists the AMD GPU but VkSplat only sees llvmpipe, try the diagnostic RADV override:
+
+```bash
+VK_SPLAT_FORCE_RADV=1 pixi run smoke
+```
+
+The override is process-local. `VK_SPLAT_SYSTEM_DRM=auto` (default) preloads host `libdrm.so.2` and `libdrm_amdgpu.so.1` when present; `VK_SPLAT_SYSTEM_DRM=0` disables the workaround for isolation tests. `VK_SPLAT_FORCE_RADV=1` requires a matching installed RADV ICD manifest. Other vendor devices should use normal ICD discovery.
+
+Pixi's `gdk-pixbuf` post-link warning is generally unrelated to Vulkan GPU enumeration; do **not** globally enable insecure post-link scripts just to remove that warning.
 
 ## Quick start on the tested Fedora 44 + Strix Halo setup
 
