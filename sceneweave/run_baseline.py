@@ -3,6 +3,10 @@ import argparse
 import json
 from pathlib import Path
 from datetime import datetime, timezone
+import sys
+# Script lives in sceneweave/ while the upstream trainer lives in vksplat/.
+# Insert the actual trainer directory ahead of Python's namespace-package path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'vksplat'))
 from simple_trainer import TrainerConfig, MCMCTrainerConfig, train_main
 
 def main():
