@@ -53,7 +53,9 @@ bash sceneweave/run_amd.sh ../sceneweave/benchmark.py run \
   --output ~/git/sceneweave/outputs/vksplat/cross_machine
 ```
 
-The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
+The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR.
+
+Throughput is reported as **training it/s = configured iterations / VkSplat-reported training seconds**, and **wall it/s = configured iterations / full process invocation seconds** (includes startup, loading, PLY export and rendering). Both are included in the per-run JSON, console output, and cross-machine CSV. The comparator also computes these fields for older benchmark files that only contain timing and step counts. These are *average* throughputs, not GPU kernel-only throughput or steady-state instantaneous rates. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
 
 Copy the completed `benchmark.json` files together and compare:
 
