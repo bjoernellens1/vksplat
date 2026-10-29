@@ -5,6 +5,7 @@ from pathlib import Path
 import unittest
 import numpy as np
 import cv2
+from scipy.spatial.transform import Rotation
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from replica_to_colmap import quaternion_wxyz, trajectory, measured_points, write_colmap
 from check_replica_pair import check
@@ -19,6 +20,14 @@ class ReplicaAdapterTest(unittest.TestCase):
         q=quaternion_wxyz(R)
         np.testing.assert_allclose(abs(q[0]),np.sqrt(.5),atol=1e-6)
         np.testing.assert_allclose(abs(q[3]),np.sqrt(.5),atol=1e-6)
+        np.testing.assert_allclose(Rotation.from_quat([q[1],q[2],q[3],q[0]]).as_matrix(),R,atol=1e-6)
+
+    def test_quaternion_roundtrip_arbitrary_rotations(self):
+        for euler in ((0.3,-0.7,1.2),(-2.1,0.4,2.8),(3.14,0,0)):
+            R=Rotation.from_euler('xyz',euler).as_matrix()
+            q=quaternion_wxyz(R)
+            reconstructed=Rotation.from_quat([q[1],q[2],q[3],q[0]]).as_matrix()
+            np.testing.assert_allclose(reconstructed,R,atol=1e-6)
 
     def test_depth_backprojection_and_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
