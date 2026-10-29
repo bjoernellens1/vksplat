@@ -9,8 +9,15 @@ PYTHON="${VK_SPLAT_PYTHON:-$ROOT/.pixi/envs/default/bin/python}"
 # Resolve SONAMEs via the host dynamic-loader cache, not Fedora-only /usr/lib64.
 find_system_lib() {
   local name="$1"
-  command -v ldconfig >/dev/null 2>&1 || return 1
-  ldconfig -p 2>/dev/null | awk -v n="$name" '$1 == n && $0 ~ /x86-64/ {print $NF; exit}'
+  local tool
+  tool="$(command -v ldconfig || true)"
+  if [[ -z "$tool" ]]; then
+    for candidate in /usr/sbin/ldconfig /sbin/ldconfig; do
+      if [[ -x "$candidate" ]]; then tool="$candidate"; break; fi
+    done
+  fi
+  [[ -n "$tool" ]] || return 1
+  "$tool" -p 2>/dev/null | awk -v n="$name" '$1 == n && $0 ~ /x86-64/ {print $NF; exit}'
 }
 SYSTEM_DRM="${VK_SPLAT_SYSTEM_DRM:-auto}" # 0 disable, 1 require, auto if both libs available
 if [[ "$SYSTEM_DRM" != "0" ]]; then
