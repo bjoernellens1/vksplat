@@ -21,9 +21,15 @@ def main():
     if args.steps<=0 or args.cap_max<=0:
         p.error("steps and cap-max must be positive")
     dataset=args.dataset.expanduser().resolve()
-    for f in ("sparse/0/cameras.bin","sparse/0/images.bin","sparse/0/points3D.bin"):
-        if not (dataset/f).is_file():
-            p.error(f"Missing COLMAP file: {dataset/f}")
+    for stem in ("cameras","images","points3D"):
+        if not any((dataset/"sparse"/"0"/f"{stem}.{ext}").is_file() for ext in ("bin","txt")):
+            p.error(f"Missing COLMAP {stem}.bin or {stem}.txt in {dataset/'sparse/0'}")
+    manifest_file = dataset/"sceneweave_conversion.json"
+    if manifest_file.exists():
+        manifest=json.loads(manifest_file.read_text())
+        if manifest.get("schema_version")!="1.0.0" or manifest.get("mode") not in ("oracle","measured"):
+            p.error("Unsupported Sceneweave conversion manifest")
+        print("Prior mode:", manifest["mode"],"oracle:",manifest["oracle_privileged"],flush=True)
     if not (dataset/args.image_dir).is_dir():
         p.error(f"Missing image directory: {dataset/args.image_dir}")
     output=args.output.expanduser().resolve()
