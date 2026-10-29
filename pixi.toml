@@ -15,6 +15,8 @@ opencv = "*"
 tqdm = "*"
 
 [tasks]
+setup = "bash sceneweave/setup.sh"
+install = "bash sceneweave/install.sh --skip-pixi-install"
 build = "bash sceneweave/install.sh --skip-pixi-install"
 smoke = "bash sceneweave/smoke.sh"
 benchmark-help = "bash sceneweave/run_amd.sh ../sceneweave/benchmark.py --help"
