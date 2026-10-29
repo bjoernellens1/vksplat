@@ -17,17 +17,16 @@ import numpy as np
 import cv2
 
 def quaternion_wxyz(R):
-    """Stable rotation-matrix to scalar-first quaternion."""
+    """Convert a proper rotation matrix to COLMAP scalar-first (w,x,y,z)."""
+    from scipy.spatial.transform import Rotation
     m = np.asarray(R, dtype=np.float64)
-    vals, vecs = np.linalg.eigh(np.array([
-        [1+m[0,0]-m[1,1]-m[2,2], m[0,1]+m[1,0], m[0,2]+m[2,0], m[2,1]-m[1,2]],
-        [m[0,1]+m[1,0], 1-m[0,0]+m[1,1]-m[2,2], m[1,2]+m[2,1], m[0,2]+m[2,0]],
-        [m[0,2]+m[2,0], m[1,2]+m[2,1], 1-m[0,0]-m[1,1]+m[2,2], m[0,1]+m[1,0]],
-        [m[2,1]-m[1,2], m[0,2]+m[2,0], m[0,1]+m[1,0], m[0,0]+m[1,1]+m[2,2]]
-    ]))
-    q = vecs[:, np.argmax(vals)]
-    out = np.array([q[3],q[0],q[1],q[2]])
-    return out * (-1 if out[0]<0 else 1)
+    if m.shape != (3, 3) or not np.all(np.isfinite(m)):
+        raise ValueError("Expected a finite 3x3 rotation matrix")
+    if not np.allclose(m.T @ m, np.eye(3), atol=1e-4) or not np.isclose(np.linalg.det(m), 1., atol=1e-4):
+        raise ValueError("Expected a proper orthonormal rotation matrix")
+    x, y, z, w = Rotation.from_matrix(m).as_quat()
+    q = np.array([w, x, y, z], dtype=np.float64)
+    return -q if q[0] < 0 else q
 
 def trajectory(path):
     arr=np.loadtxt(path,dtype=np.float64)
