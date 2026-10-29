@@ -9,6 +9,14 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'vksplat'))
 from simple_trainer import TrainerConfig, MCMCTrainerConfig, train_main
 
+def controlled_reference_count(manifest):
+    """Validate a shared original-point prefix for controlled initialization."""
+    total=int(manifest["num_seed_points"])
+    count=int(manifest.get("p1c",{}).get("original_seed_count",total))
+    if not 4<=count<=total:
+        raise ValueError(f"Invalid reference prefix {count} of {total}")
+    return count
+
 def main():
     p=argparse.ArgumentParser(description="Reproducible no-prior VkSplat training baseline")
     p.add_argument("--dataset",type=Path,required=True)
@@ -52,11 +60,11 @@ def main():
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
     if args.controlled_init:
-        cfg.init_reference_count=int(manifest.get("p1c",{}).get(
-            "original_seed_count",manifest["num_seed_points"]))
+        try:
+            cfg.init_reference_count=controlled_reference_count(manifest)
+        except (ValueError, TypeError, KeyError) as exc:
+            p.error(str(exc))
         total=int(manifest["num_seed_points"])
-        if not (4<=cfg.init_reference_count<=total):
-            p.error("Invalid original seed count in dataset manifest")
         cfg.init_added_scale_m=args.added_scale_m
         cfg.shuffle_seed=42 if args.shuffle_seed is None else args.shuffle_seed
         print(f"Controlled init: reference={cfg.init_reference_count}/{total}, "
