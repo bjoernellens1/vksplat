@@ -154,11 +154,12 @@ def main():
                    help="Axes of input camera-to-world pose; Replica typically uses OpenGL")
     p.add_argument("--frame-step",type=int,default=20)
     p.add_argument("--pixel-step",type=int,default=12)
+    p.add_argument("--seed-frame-step",type=int,default=1,\n                   help="Use every Nth TRAIN frame to build Gaussian seeds; training and validation images remain unchanged")
     p.add_argument("--max-points",type=int,default=150000)
     p.add_argument("--val-every",type=int,default=8)
     a=p.parse_args()
     if a.mode=="oracle" and a.mesh is None: p.error("--mesh required for oracle mode")
-    if any(v<=0 for v in [a.fx,a.fy,a.depth_scale,a.frame_step,a.pixel_step,a.max_points,a.val_every]):
+    if any(v<=0 for v in [a.fx,a.fy,a.depth_scale,a.frame_step,a.pixel_step,a.seed_frame_step,a.max_points,a.val_every]):
         p.error("Positive intrinsics/scales/strides required")
     if a.val_every != 8:
         p.error("Current VkSplat default validation split is every 8th image; --val-every must be 8")
@@ -188,8 +189,8 @@ def main():
     out=a.output.resolve()
     if out.exists() and any(out.iterdir()): p.error("Output directory must be empty")
     manifest=write_colmap(out,selected,poses,(w,h,a.fx,a.fy,a.cx,a.cy),pts,cols,
-                          a.mode,a.depth_scale,[i for i,_,_ in training])
-    manifest["input_pose_camera_axes"]=a.pose_camera
+                          a.mode,a.depth_scale,[i for i,_,_ in seed_training])
+    manifest["input_pose_camera_axes"]=a.pose_camera\n    manifest["seed_frame_step"]=a.seed_frame_step\n    manifest["training_frame_indices"]=[i for i,_,_ in training]
     if oracle_stats is not None:
         manifest["oracle_alignment"]=oracle_stats
     (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\n")
