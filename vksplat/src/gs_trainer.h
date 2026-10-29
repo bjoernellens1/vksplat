@@ -28,6 +28,13 @@ struct TrainerConfig {
     float init_scale;
     float init_opacity;
 
+    // Optional Sceneweave controlled-init ablation. Zero preserves legacy
+    // normalization and 4-NN scales over the complete COLMAP cloud.
+    // Nonzero: use the first N seed points as a common normalization/4-NN
+    // reference and initialize appended points with a fixed world-metric scale.
+    size_t init_reference_count = 0;
+    float init_added_scale_m = 0.0f;
+
     enum class Strategy {
         Default, MCMC,
     } strategy;
