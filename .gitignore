@@ -10,3 +10,7 @@ dist/
 *.so
 
 vksplat/third_party/glm
+
+# Pixi environment is local; lockfile is versioned (override upstream *.lock).
+.pixi/
+!pixi.lock
