@@ -83,24 +83,34 @@ def measured_points(pairs, poses, fx,fy,cx,cy, depth_scale, frame_stride, pixel_
         pts=pts[ids];cols=cols[ids]
     return pts,cols
 
-def mesh_points(path,count):
-    try: import trimesh
-    except ImportError as e: raise RuntimeError("Install trimesh in Pixi for oracle mesh sampling") from e
-    mesh=trimesh.load(path,force="mesh",process=False)
+def oracle_snap(measured, mesh_path, sample_count):
+    """Project seed positions toward an oracle mesh, preserving measured seed RGB.
+    
+    Uses a densely sampled mesh and a KD-tree as an approximate surface oracle;
+    records that this is *not* exact nearest-triangle projection.
+    """
+    try:
+        from scipy.spatial import cKDTree
+        import trimesh
+    except ImportError as e:
+        raise RuntimeError("Oracle mode needs trimesh and scipy") from e
+    mesh=trimesh.load(mesh_path,force="mesh",process=False)
     if not isinstance(mesh,trimesh.Trimesh) or len(mesh.faces)==0:
         raise ValueError("Oracle mesh has no triangles")
-    # Deterministic triangle/area sampling, avoiding global random state in trimesh.sample().
-    faces=mesh.triangles
-    areas=mesh.area_faces.astype(np.float64)
+    areas=np.asarray(mesh.area_faces,dtype=np.float64)
     if not np.all(np.isfinite(areas)) or areas.sum()<=0: raise ValueError("Bad mesh areas")
     rng=np.random.default_rng(0)
-    idx=rng.choice(len(areas),size=count,replace=True,p=areas/areas.sum())
-    u=rng.random((count,1));v=rng.random((count,1))
-    mask=u+v>1;u[mask]=1-u[mask];v[mask]=1-v[mask]
-    tri=faces[idx]
-    pts=tri[:,0]+u*(tri[:,1]-tri[:,0])+v*(tri[:,2]-tri[:,0])
-    # Fixed neutral albedo for baseline oracle: do not leak held-out RGB appearance.
-    return pts,np.full((count,3),128,dtype=np.uint8)
+    tri=mesh.triangles[rng.choice(len(areas),size=sample_count,replace=True,p=areas/areas.sum())]
+    u=rng.random((sample_count,1));v=rng.random((sample_count,1))
+    flip=(u+v)>1;u[flip]=1-u[flip];v[flip]=1-v[flip]
+    samples=tri[:,0]+u*(tri[:,1]-tri[:,0])+v*(tri[:,2]-tri[:,0])
+    dist,nearest=cKDTree(samples).query(measured,k=1,workers=1)
+    # Outlier geometries should not be teleported across rooms.
+    valid=dist<=0.15
+    snapped=measured.copy()
+    snapped[valid]=samples[nearest[valid]]
+    return snapped,int(valid.sum()),float(np.median(dist))
+
 
 def write_colmap(out, selected, poses, K, points, colors, source, depth_scale, seed_indices):
     sparse=out/"sparse"/"0"
@@ -161,13 +171,17 @@ def main():
     if len(selected)<9: p.error("Need >=9 selected frames for meaningful holdout")
     training=[item for j,item in enumerate(selected) if j%a.val_every!=0]
     if not training: p.error("No training frames")
-    if a.mode=="measured":
-        pts,cols=measured_points(training,poses,a.fx,a.fy,a.cx,a.cy,
-            a.depth_scale,1,a.pixel_step,a.max_points)
-    else: pts,cols=mesh_points(a.mesh.resolve(),a.max_points)
+    # Always derive identical baseline seed count and appearance from training RGB-D.
+    pts,cols=measured_points(training,poses,a.fx,a.fy,a.cx,a.cy,
+        a.depth_scale,1,a.pixel_step,a.max_points)
+    oracle_stats=None
+    if a.mode=="oracle":
+        pts,count,median_distance=oracle_snap(pts,a.mesh.resolve(),max(500000,4*len(pts)))
+        oracle_stats={"snapped_within_0_15m":count,"median_mesh_sample_distance_m":median_distance,
+                      "approximation":"nearest sampled mesh point; no held-out RGB"}
     out=a.output.resolve()
     if out.exists() and any(out.iterdir()): p.error("Output directory must be empty")
     manifest=write_colmap(out,selected,poses,(w,h,a.fx,a.fy,a.cx,a.cy),pts,cols,
                           a.mode,a.depth_scale,[i for i,_,_ in training])
-    print(json.dumps(manifest,indent=2))
+    if oracle_stats is not None:\n        manifest["oracle_alignment"]=oracle_stats\n        (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    print(json.dumps(manifest,indent=2))
 if __name__=="__main__":main()
