@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <filesystem>
+#include <cmath>
 
 #ifdef max
 #undef max
@@ -192,8 +193,29 @@ void VulkanGSTrainer::load_colmap_dataset(
     }
     size_t numPoints = points.size();
 
-    // Normalize
-    dataparser_transform = ColmapReader::normalize_world_space(c2w_poses, points);
+    // Normalize. In controlled-init mode, the *shared original prefix*
+    // determines the transform, regardless of the appended point placement.
+    // Apply that same transform to every point, including added Gaussians.
+    const size_t init_reference_count = config.init_reference_count;
+    float world_to_normalized_scale = 1.0f;
+    if (init_reference_count == 0) {
+        dataparser_transform = ColmapReader::normalize_world_space(c2w_poses, points);
+    } else {
+        if (init_reference_count < 4 || init_reference_count > numPoints)
+            throw std::runtime_error("init_reference_count must be between 4 and num_points");
+        if (init_reference_count < numPoints &&
+            (!(config.init_added_scale_m > 0.0f) || !std::isfinite(config.init_added_scale_m)))
+            throw std::runtime_error("Appended Gaussians require a positive finite init_added_scale_m");
+        std::vector<glm::vec3> reference_points(points.begin(), points.begin() + init_reference_count);
+        dataparser_transform = ColmapReader::normalize_world_space(c2w_poses, reference_points);
+        glm::mat3 linear(dataparser_transform);
+        glm::vec3 translation(dataparser_transform[3]);
+        for (auto &point : points)
+            point = linear * point + translation;
+        world_to_normalized_scale = glm::length(glm::vec3(dataparser_transform[0]));
+        printf("Controlled initialization: reference=%zu, added=%zu, world_to_normalized=%g\n",
+               init_reference_count, numPoints - init_reference_count, world_to_normalized_scale);
+    }
 
     const unsigned int numThreads = std::thread::hardware_concurrency();
 
@@ -509,18 +531,28 @@ void VulkanGSTrainer::load_colmap_dataset(
     std::normal_distribution<float> unit_normal(0.0, 1.0);
     std::uniform_real_distribution<float> unit_uniform(0.0, 1.0);
 
-    // find splat scales from nearest neighbor
-    // per GSplat/Nerfstudio
+    // Derive original scales from the same shared prefix in both variants.
+    // Legacy behavior uses the complete cloud (init_reference_count == 0).
+    const size_t knn_count = init_reference_count ? init_reference_count : numPoints;
+    const std::vector<glm::vec3> knn_points(points.begin(), points.begin() + knn_count);
     NearestNeighbors3D knn;
-    knn.fit(points);
-    auto [distances, indices] = knn.kneighbors(points, 4);
-    std::vector<float> dist_avg;
-    for (auto& dists : distances) {
-        float sum_dist2 = 0.0;
+    knn.fit(knn_points);
+    auto [distances, indices] = knn.kneighbors(knn_points, 4);
+    std::vector<float> dist_avg(numPoints);
+    for (size_t i = 0; i < knn_count; ++i) {
+        const auto &dists = distances[i];
+        float sum_dist2 = 0.0f;
         for (float dist : dists)
             sum_dist2 += dist * dist;
-        float mean_dist = sqrt(sum_dist2 / float(dists.size() - 1));
-        dist_avg.push_back(mean_dist);
+        dist_avg[i] = sqrt(sum_dist2 / float(dists.size() - 1));
+    }
+    if (init_reference_count && init_reference_count < numPoints) {
+        // The CLI scale is in the raw Replica world-coordinate metres.
+        // The COLMAP dataparser may rescale the world before initialization.
+        const float added_scale = config.init_added_scale_m * world_to_normalized_scale;
+        std::fill(dist_avg.begin() + init_reference_count, dist_avg.end(), added_scale);
+        printf("Controlled appended Gaussian scale: %g m raw -> %g normalized\n",
+               config.init_added_scale_m, added_scale);
     }
 
     for (size_t pointIdx = 0; pointIdx < numPoints; pointIdx++) {
