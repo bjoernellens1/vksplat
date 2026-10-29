@@ -9,7 +9,7 @@ Expected Replica scene directory:
 - `results/frame000000.jpg` (or PNG) and `results/depth000000.png`
 - For the oracle branch: a reference mesh file in a format supported by `trimesh`
 
-**Coordinate conventions must be checked on real data before using results:** `--pose-camera opengl` converts camera-to-world OpenGL axes to OpenCV optical axes by right-multiplication with diag(1,-1,-1,1). Set `opencv` if the input trajectories already use optical coordinates. Depths are assumed Z-depth along the optical axis, not Euclidean ray range. The default `--depth-scale 1000` assumes millimetres stored as unsigned integer; verify your Replica export. Intrinsics must come from the dataset/camera config, never invented.
+**Coordinate conventions must be checked on real data before using results:** `--pose-camera opencv` converts camera-to-world OpenGL axes to OpenCV optical axes by right-multiplication with diag(1,-1,-1,1). **Validated against the local NICE-SLAM `room0` and original Replica `room_0` mesh:** `--pose-camera opencv` is required. A direct 20-frame point/mesh vertex check gave median 5.7 mm and 100% within 15 cm; applying `opengl` instead gave 832.9 mm and 9.9%. Other Replica trajectory variants must be verified independently. Depths are assumed Z-depth along the optical axis, not Euclidean ray range. The default `--depth-scale 1000` assumes millimetres stored as unsigned integer; verify your Replica export. Intrinsics must come from the dataset/camera config, never invented.
 
 The converter requires `numpy`, `opencv`, `trimesh`, `scipy` from the project Pixi environment. Run `pixi install`.
 
@@ -34,12 +34,12 @@ FX=0; FY=0; CX=0; CY=0
 
 bash sceneweave/run_amd.sh ../sceneweave/replica_to_colmap.py \
   --scene "$SCENE" --output "$OUT/measured" --mode measured \
-  --pose-camera opengl --fx "$FX" --fy "$FY" --cx "$CX" --cy "$CY" \
+  --pose-camera opencv --fx "$FX" --fy "$FY" --cx "$CX" --cy "$CY" \
   --frame-step 20 --pixel-step 12 --max-points 150000
 
 bash sceneweave/run_amd.sh ../sceneweave/replica_to_colmap.py \
   --scene "$SCENE" --output "$OUT/oracle" --mode oracle --mesh "$MESH" \
-  --pose-camera opengl --fx "$FX" --fy "$FY" --cx "$CX" --cy "$CY" \
+  --pose-camera opencv --fx "$FX" --fy "$FY" --cx "$CX" --cy "$CY" \
   --frame-step 20 --pixel-step 12 --max-points 150000
 
 bash sceneweave/run_amd.sh ../sceneweave/check_replica_pair.py \
