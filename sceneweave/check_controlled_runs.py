@@ -25,8 +25,6 @@ def load_condition(root: Path, steps: int, name: str):
     settings=json.loads((directory/"sceneweave_run_manifest.json").read_text())
     if not settings["controlled_init"]:
         raise ValueError(f"Not a controlled-init run: {directory}")
-    if int(settings["reference_seed_count"]) != 34200:
-        raise ValueError(f"Unexpected reference count: {directory}")
     eval_file=run/"eval_psnr.json"
     quality=json.loads(eval_file.read_text()) if eval_file.exists() else evaluate(run)
     if not eval_file.exists():eval_file.write_text(json.dumps(quality,indent=2)+"\n")
@@ -61,6 +59,10 @@ def main():
                 raise AssertionError("Held-out image lists differ")
             if first["data"]["shuffle_seed"]!=rec["data"]["shuffle_seed"]:
                 raise AssertionError("Shuffle seeds differ")
+            if first["data"]["reference_count"]!=rec["data"]["reference_count"]:
+                raise AssertionError("Original seed prefix count differs")
+            if first["data"]["added_scale_m"]!=rec["data"]["added_scale_m"]:
+                raise AssertionError("Added-point initialization scale differs")
         rows += [r["data"] for r in records]
         vals={x["condition"]:x["psnr_db"] for x in [r["data"] for r in records]}
         print(f"{steps} steps: B0={vals['baseline']:.3f} dB, "
