@@ -44,6 +44,9 @@ class TrainerConfig:
     global_scale: float = 1.0
     init_scale: float = 1.0  # 0.1 for MCMC
     init_opacity: float = 0.1  # 0.5 for MCMC
+    init_reference_count: int = 0  # 0 preserves legacy full-cloud normalization/KNN
+    init_added_scale_m: float = 0.0  # world-metric initial scale of appended Gaussians
+    shuffle_seed: Optional[int] = None  # None preserves legacy unseeded view order
 
     # densification strategy
     # to use MCMC, you must train with MCMCTrainerConfig instead of only changing this field to reproduce paper results
@@ -204,10 +207,11 @@ def train(config: TrainerConfig):
     # train
     t0 = perf_counter()
     shuffle_idx = list(range(module.num_train))
+    shuffle_rng = random.Random(config.shuffle_seed) if config.shuffle_seed is not None else random
     for step in tqdm(range(config.train_steps), "Training"):
         if step > 0 and step % len(shuffle_idx) == 0:
             # random.seed(step)
-            random.shuffle(shuffle_idx)
+            shuffle_rng.shuffle(shuffle_idx)
         image_idx = shuffle_idx[step % len(shuffle_idx)]
         with lock:
             module.train_step(image_idx, step)
