@@ -150,7 +150,7 @@ def main():
     p.add_argument("--mesh",type=Path,help="Reference mesh, required only in oracle mode")
     p.add_argument("--fx",type=float,required=True);p.add_argument("--fy",type=float,required=True)
     p.add_argument("--cx",type=float,required=True);p.add_argument("--cy",type=float,required=True)
-    p.add_argument("--depth-scale",type=float,default=1000,help="Depth pixel units per metre")
+    p.add_argument("--depth-scale",type=float,default=1000,help="Depth pixel units per metre")\n    p.add_argument("--pose-camera",choices=["opengl","opencv"],required=True,\n                   help="Axes of input camera-to-world pose; Replica typically uses OpenGL")
     p.add_argument("--frame-step",type=int,default=20)
     p.add_argument("--pixel-step",type=int,default=12)
     p.add_argument("--max-points",type=int,default=150000)
@@ -161,7 +161,7 @@ def main():
         p.error("Positive intrinsics/scales/strides required")
     scene=a.scene.resolve()
     pairs=pair_files(scene)
-    poses=trajectory(scene/"traj.txt")
+    poses=trajectory(scene/"traj.txt")\n    if a.pose_camera=="opengl":\n        axis=np.diag([1.0,-1.0,-1.0,1.0])\n        poses=poses@axis
     if max(i for i,_,_ in pairs)>=len(poses): p.error("Frame index outside pose trajectory")
     sample=cv2.imread(str(pairs[0][1]))
     h,w=sample.shape[:2]
@@ -183,5 +183,5 @@ def main():
     if out.exists() and any(out.iterdir()): p.error("Output directory must be empty")
     manifest=write_colmap(out,selected,poses,(w,h,a.fx,a.fy,a.cx,a.cy),pts,cols,
                           a.mode,a.depth_scale,[i for i,_,_ in training])
-    if oracle_stats is not None:\n        manifest["oracle_alignment"]=oracle_stats\n        (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    print(json.dumps(manifest,indent=2))
+    manifest["input_pose_camera_axes"]=a.pose_camera\n    if oracle_stats is not None:\n        manifest["oracle_alignment"]=oracle_stats\n        (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    print(json.dumps(manifest,indent=2))
 if __name__=="__main__":main()
