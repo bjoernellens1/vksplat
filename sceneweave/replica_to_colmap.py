@@ -180,7 +180,8 @@ def main():
     training=[item for j,item in enumerate(selected) if j%a.val_every!=0]
     if not training: p.error("No training frames")
     # Always derive identical baseline seed count and appearance from training RGB-D.
-    pts,cols=measured_points(training,poses,a.fx,a.fy,a.cx,a.cy,
+    seed_training=training[::a.seed_frame_step]
+    pts,cols=measured_points(seed_training,poses,a.fx,a.fy,a.cx,a.cy,
         a.depth_scale,1,a.pixel_step,a.max_points)
     oracle_stats=None
     if a.mode=="oracle":
