@@ -1,6 +1,7 @@
 """CPU-only tests for the Replica converter (run with Pixi Python)."""
 import sys
 import tempfile
+import subprocess
 from pathlib import Path
 import unittest
 import numpy as np
@@ -28,6 +29,36 @@ class ReplicaAdapterTest(unittest.TestCase):
             q=quaternion_wxyz(R)
             reconstructed=Rotation.from_quat([q[1],q[2],q[3],q[0]]).as_matrix()
             np.testing.assert_allclose(reconstructed,R,atol=1e-6)
+
+    def test_cli_sparse_seed_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            scene=root/"scene"
+            (scene/"results").mkdir(parents=True)
+            np.savetxt(scene/"traj.txt", np.tile(np.eye(4).reshape(1,16),(16,1)))
+            for i in range(16):
+                im=np.full((4,4,3),[10,20,30],dtype=np.uint8)
+                cv2.imwrite(str(scene/f"results/frame{i:06d}.png"),im)
+                cv2.imwrite(str(scene/f"results/depth{i:06d}.png"),np.full((4,4),1000,dtype=np.uint16))
+            for stride in (1,2):
+                args=[sys.executable,str(Path(__file__).with_name("replica_to_colmap.py")),
+                    "--scene",str(scene),"--output",str(root/f"converted_{stride}"),
+                    "--mode","measured","--pose-camera","opencv",
+                    "--fx","2","--fy","2","--cx","1.5","--cy","1.5",
+                    "--depth-scale","1000","--frame-step","1",
+                    "--pixel-step","2","--max-points","100",
+                    "--seed-frame-step",str(stride)]
+                subprocess.run(args,check=True,capture_output=True,text=True)
+            full=json_load(root/"converted_1/sceneweave_conversion.json")
+            sparse=json_load(root/"converted_2/sceneweave_conversion.json")
+            self.assertEqual(full["frame_indices"],sparse["frame_indices"])
+            self.assertEqual(full["training_frame_indices"],sparse["training_frame_indices"])
+            self.assertEqual(sparse["seed_frame_indices"],full["seed_frame_indices"][::2])
+            self.assertEqual(len(full["seed_frame_indices"]),14)
+            self.assertEqual(len(sparse["seed_frame_indices"]),7)
+            self.assertEqual(sparse["seed_frame_step"],2)
+            self.assertEqual((root/"converted_1/sparse/0/images.txt").read_bytes(),
+                             (root/"converted_2/sparse/0/images.txt").read_bytes())
 
     def test_depth_backprojection_and_pair(self):
         with tempfile.TemporaryDirectory() as tmp:
