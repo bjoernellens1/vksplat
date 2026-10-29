@@ -12,7 +12,9 @@ wheel = "*"
 pybind11 = ">=2.11.1"
 numpy = "*"
 opencv = "*"
-tqdm = "*"\nscipy = "*"\ntrimesh = "*"
+tqdm = "*"
+scipy = "*"
+trimesh = "*"
 
 [tasks]
 setup = "bash sceneweave/setup.sh"
