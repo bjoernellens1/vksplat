@@ -8,9 +8,65 @@ The external Sceneweave project is responsible for priors and experiment policy;
 
 The source root contains a `vksplat/` directory, which Python may import as a namespace package if run from the outer root. The launcher runs from the inner Python source directory to ensure that the compiled extension is loaded.
 
+## Pixi build/install (Linux x86_64)
+
+The fork includes a committed `pixi.toml` for Python 3.12, NumPy, OpenCV, pybind11, setuptools, wheel and tqdm. Keep Vulkan driver/ICD and GLM headers at the OS level.
+
+On Fedora:
+```bash
+sudo dnf install -y gcc-c++ vulkan-loader-devel vulkan-headers glm-devel pkgconf-pkg-config
+cd ~/git/vksplat
+bash sceneweave/setup.sh
+```
+
+On Ubuntu (22.04 / 24.04 or later, x86_64; actual GPU build still needs validation):
+```bash
+sudo apt update
+sudo apt install -y build-essential libvulkan-dev libglm-dev pkg-config \\
+    mesa-vulkan-drivers vulkan-tools libdrm2 libdrm-amdgpu1
+cd ~/git/vksplat
+bash sceneweave/setup.sh
+```
+
+**Required first-time setup:** install the OS packages listed above, ensure `vulkaninfo --summary` detects your physical GPU (not only `llvmpipe`), then run `pixi run setup`. Merely running `pixi run smoke` on a fresh clone will fail because the native extension has not been built. The installer reports distribution-specific prerequisite commands when headers are missing. The runtime launcher discovers the host libdrm locations through `ldconfig` (Fedora: `/lib64` or `/usr/lib64`; Ubuntu: `/lib/x86_64-linux-gnu` or `/usr/lib/x86_64-linux-gnu`). It leaves Vulkan ICD selection to the system by default, so Intel/NVIDIA machines can also use the standard driver. For AMD with problematic ICD selection, set `VK_SPLAT_FORCE_RADV=1`. Set `VK_SPLAT_SYSTEM_DRM=0` only if your host driver is compatible with the Pixi-loaded DRM libraries.
+
+Or perform the steps separately:
+```bash
+pixi run setup      # resolve dependencies, build and smoke-test
+pixi run build      # rebuild editable C++ extension
+pixi run smoke      # check that a hardware Vulkan GPU is viable
+pixi run benchmark-help
+```
+
+These scripts do **not** install PyTorch/TorchMetrics and do not train on a dataset. The system Vulkan device must support VkSplat's requirements. `pixi.lock` should be generated on a working machine and committed to your fork (the repository's original `*.lock` ignore pattern is overridden for `pixi.lock`). On Ubuntu and Fedora the launcher automatically locates system DRM libraries. `VK_SPLAT_SYSTEM_DRM=1` requires them, `0` disables preloading, and the default `auto` preloads them if available. `VK_SPLAT_FORCE_RADV=1` explicitly selects AMD RADV where the manifest exists. This configuration is currently Linux-only; other platforms require their own tested setup.
+
+## Troubleshooting Ubuntu AMD GPU enumeration
+
+A successful `pixi run build` only proves that the Python extension compiled. On the Ubuntu Radeon R9700 machine, the current `pixi run smoke` prints **only llvmpipe**, meaning no viable physical GPU is available to VkSplat *in that process*. This is not yet proof that the R9700 lacks any required Vulkan feature.
+
+First diagnose the host:
+
+```bash
+vulkaninfo --summary
+ls -l /dev/dri/renderD* 2>/dev/null || true
+ls -l /usr/share/vulkan/icd.d/ 
+```
+
+If system `vulkaninfo` also lists only llvmpipe, confirm the AMD kernel/DRM driver is loaded and users can access a render node; examine `dmesg`/journal and device permissions. Reinstalling Pixi will not fix an absent host GPU.
+
+If system Vulkan lists the AMD GPU but VkSplat only sees llvmpipe, try the diagnostic RADV override:
+
+```bash
+VK_SPLAT_FORCE_RADV=1 pixi run smoke
+```
+
+The override is process-local. `VK_SPLAT_SYSTEM_DRM=auto` (default) preloads host `libdrm.so.2` and `libdrm_amdgpu.so.1` when present; `VK_SPLAT_SYSTEM_DRM=0` disables the workaround for isolation tests. `VK_SPLAT_FORCE_RADV=1` requires a matching installed RADV ICD manifest. Other vendor devices should use normal ICD discovery.
+
+Pixi's `gdk-pixbuf` post-link warning is generally unrelated to Vulkan GPU enumeration; do **not** globally enable insecure post-link scripts just to remove that warning.
+
 ## Quick start on the tested Fedora 44 + Strix Halo setup
 
-The local environment needs a built VkSplat extension installed in `.pixi/envs/default`. **This fork does not ship a Pixi environment manifest or build VkSplat**. Reuse the local one already created, then:
+The local environment needs a built VkSplat extension installed in `.pixi/envs/default`. This fork now ships a Pixi manifest and setup scripts. Build once using `bash sceneweave/setup.sh`, then:
 
 ```bash
 cd ~/git/vksplat
@@ -53,7 +109,9 @@ bash sceneweave/run_amd.sh ../sceneweave/benchmark.py run \
   --output ~/git/sceneweave/outputs/vksplat/cross_machine
 ```
 
-The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
+The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR.
+
+Throughput is reported as **training it/s = configured iterations / VkSplat-reported training seconds**, and **wall it/s = configured iterations / full process invocation seconds** (includes startup, loading, PLY export and rendering). Both are included in the per-run JSON, console output, and cross-machine CSV. The comparator also computes these fields for older benchmark files that only contain timing and step counts. These are *average* throughputs, not GPU kernel-only throughput or steady-state instantaneous rates. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
 
 Copy the completed `benchmark.json` files together and compare:
 

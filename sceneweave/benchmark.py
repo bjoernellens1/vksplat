@@ -109,6 +109,8 @@ def run(args):
                 "exit_code": proc.returncode, "invocation_wall_seconds": wall,
                 "run_directory": str(subdirs[-1]) if subdirs else None,
                 "gpu_training_seconds_reported": None,
+                "training_iterations_per_second": None,
+                "invocation_iterations_per_second": steps / wall if wall > 0 else None,
                 "peak_vram_bytes_reported": None,
                 "num_splats": None,
                 "mean_psnr_db": None,
@@ -119,6 +121,9 @@ def run(args):
                 last = subdirs[-1]
                 report = json.loads((last / "train.json").read_text())
                 record["gpu_training_seconds_reported"] = report.get("time_elapsed")
+                training_seconds = record["gpu_training_seconds_reported"]
+                if isinstance(training_seconds, (int, float)) and training_seconds > 0:
+                    record["training_iterations_per_second"] = steps / training_seconds
                 record["peak_vram_bytes_reported"] = report.get("peak_vram")
                 record["num_splats"] = report.get("num_splats")
                 try:
@@ -137,7 +142,8 @@ def run(args):
             (output / "benchmark.json").write_text(json.dumps(summary, indent=2) + "\n")
             print(json.dumps({k:v for k,v in record.items()
                              if k in ("name","exit_code","invocation_wall_seconds",
-                                      "gpu_training_seconds_reported","mean_psnr_db",
+                                      "gpu_training_seconds_reported","training_iterations_per_second",
+                                      "invocation_iterations_per_second","mean_psnr_db",
                                       "num_splats")}, indent=2), flush=True)
             if proc.returncode != 0:
                 raise SystemExit(f"Failed: {name}. See {dest / 'train.log'}")
@@ -163,6 +169,12 @@ def compare(args):
                 "steps": item["steps"], "repeat": item["repeat"],
                 "wall_s": item["invocation_wall_seconds"],
                 "training_s": item["gpu_training_seconds_reported"],
+                "train_it_s": (item["steps"] / item["gpu_training_seconds_reported"]
+                               if isinstance(item.get("gpu_training_seconds_reported"), (int, float))
+                               and item["gpu_training_seconds_reported"] > 0 else None),
+                "wall_it_s": (item["steps"] / item["invocation_wall_seconds"]
+                              if isinstance(item.get("invocation_wall_seconds"), (int, float))
+                              and item["invocation_wall_seconds"] > 0 else None),
                 "psnr_db": item["mean_psnr_db"],
                 "splats": item["num_splats"],
             })
@@ -175,11 +187,13 @@ def compare(args):
             raise SystemExit("Inputs, strategy or revision differ; use --allow-different-inputs for descriptive-only table")
     writer = csv.writer(sys.stdout)
     writer.writerow(["machine","gpu","revision","steps","repeat","total_wall_s",
-                     "training_s","psnr_db","gaussians"])
+                     "training_s","train_it_s","wall_it_s","psnr_db","gaussians"])
     for r in sorted(results, key=lambda x:(x["steps"],x["machine"],x["repeat"])):
         writer.writerow([r["machine"],r["gpu"],(r["revision"] or "")[:12],
                          r["steps"],r["repeat"],f'{r["wall_s"]:.3f}',
                          "" if r["training_s"] is None else f'{r["training_s"]:.3f}',
+                         "" if r["train_it_s"] is None else f'{r["train_it_s"]:.2f}',
+                         "" if r["wall_it_s"] is None else f'{r["wall_it_s"]:.2f}',
                          f'{r["psnr_db"]:.3f}',r["splats"]])
 
 
