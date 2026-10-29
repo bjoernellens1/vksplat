@@ -8,6 +8,27 @@ The external Sceneweave project is responsible for priors and experiment policy;
 
 The source root contains a `vksplat/` directory, which Python may import as a namespace package if run from the outer root. The launcher runs from the inner Python source directory to ensure that the compiled extension is loaded.
 
+## Pixi build/install (Linux x86_64)
+
+The fork includes a committed `pixi.toml` for Python 3.12, NumPy, OpenCV, pybind11, setuptools, wheel and tqdm. Keep Vulkan driver/ICD and GLM headers at the OS level.
+
+On Fedora:
+```bash
+sudo dnf install -y vulkan-loader-devel vulkan-headers glm-devel gcc-c++
+cd ~/git/vksplat
+bash sceneweave/setup.sh
+```
+
+Or perform the steps separately:
+```bash
+pixi install
+pixi run build      # editable C++ extension build/install
+pixi run smoke      # Vulkan compute initialization test
+pixi run benchmark-help
+```
+
+These scripts do **not** install PyTorch/TorchMetrics and do not train on a dataset. The system Vulkan device must support VkSplat's requirements. `pixi.lock` should be generated on a working machine and committed to your fork (the repository's original `*.lock` ignore pattern is overridden for `pixi.lock`). On Linux distributions without Fedora's DRM paths, run `VK_SPLAT_SYSTEM_DRM=0 VK_SPLAT_FORCE_RADV=0 pixi run smoke` and ensure the system Vulkan driver is correctly available. This configuration is currently Linux-only; other platforms require their own tested setup.
+
 ## Quick start on the tested Fedora 44 + Strix Halo setup
 
 The local environment needs a built VkSplat extension installed in `.pixi/envs/default`. **This fork does not ship a Pixi environment manifest or build VkSplat**. Reuse the local one already created, then:
@@ -53,7 +74,9 @@ bash sceneweave/run_amd.sh ../sceneweave/benchmark.py run \
   --output ~/git/sceneweave/outputs/vksplat/cross_machine
 ```
 
-The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
+The output contains a `benchmark.json` with host/OS, Vulkan enumerated GPUs, git revision, COLMAP calibration hashes, per-run training time, full invocation wall time, Gaussian count, peak reported VRAM, and **RGB-only** held-out mean PSNR.
+
+Throughput is reported as **training it/s = configured iterations / VkSplat-reported training seconds**, and **wall it/s = configured iterations / full process invocation seconds** (includes startup, loading, PLY export and rendering). Both are included in the per-run JSON, console output, and cross-machine CSV. The comparator also computes these fields for older benchmark files that only contain timing and step counts. These are *average* throughputs, not GPU kernel-only throughput or steady-state instantaneous rates. Each run stores `train.log`, `train.json`, `config.json`, `eval_psnr.json`, PLY and validation renders.
 
 Copy the completed `benchmark.json` files together and compare:
 
