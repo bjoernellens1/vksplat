@@ -86,6 +86,10 @@ bash sceneweave/run_amd.sh ../sceneweave/eval_psnr.py \
   --run ~/git/sceneweave/outputs/vksplat/baseline/REPLACE_WITH_RUN_DIRECTORY
 ```
 
+## P1 Replica conversion and oracle geometry initialization
+
+See [REPLICA_P1.md](REPLICA_P1.md) for a paired Replica RGB-D-to-COLMAP conversion, measured-depth versus oracle-mesh seed-position ablation and required calibration checks. The P1 converter uses versioned provenance manifests; neither a trained scene generator nor depth-supervised Gaussian optimization is included yet.
+
 ## Validity
 
 - PSNR uses original decoded precision (8-bit or 16-bit) and full RGB, not resized or re-encoded 8-bit previews.
