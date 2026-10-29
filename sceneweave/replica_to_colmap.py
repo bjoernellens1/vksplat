@@ -183,5 +183,9 @@ def main():
     if out.exists() and any(out.iterdir()): p.error("Output directory must be empty")
     manifest=write_colmap(out,selected,poses,(w,h,a.fx,a.fy,a.cx,a.cy),pts,cols,
                           a.mode,a.depth_scale,[i for i,_,_ in training])
-    manifest["input_pose_camera_axes"]=a.pose_camera\n    if oracle_stats is not None:\n        manifest["oracle_alignment"]=oracle_stats\n        (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\\n")\n    print(json.dumps(manifest,indent=2))
+    manifest["input_pose_camera_axes"]=a.pose_camera
+    if oracle_stats is not None:
+        manifest["oracle_alignment"]=oracle_stats
+    (out/"sceneweave_conversion.json").write_text(json.dumps(manifest,indent=2)+"\n")
+    print(json.dumps(manifest,indent=2))
 if __name__=="__main__":main()
