@@ -168,8 +168,11 @@ public:
         config.global_scale = train_config["global_scale"].cast<float>();
         config.init_scale = train_config["init_scale"].cast<float>();
         config.init_opacity = train_config["init_opacity"].cast<float>();
-        config.init_reference_count = train_config["init_reference_count"].cast<size_t>();
-        config.init_added_scale_m = train_config["init_added_scale_m"].cast<float>();
+        // Optional keys: preserve existing callers that pass pre-Sceneweave dicts.
+        config.init_reference_count = train_config.contains(py::str("init_reference_count"))
+            ? train_config["init_reference_count"].cast<size_t>() : size_t(0);
+        config.init_added_scale_m = train_config.contains(py::str("init_added_scale_m"))
+            ? train_config["init_added_scale_m"].cast<float>() : 0.0f;
 
         std::string strategy = train_config["strategy"].cast<std::string>();
         if (strategy == "default")
