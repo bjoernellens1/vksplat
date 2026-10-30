@@ -555,6 +555,40 @@ void VulkanGSTrainer::load_colmap_dataset(
                config.init_added_scale_m, added_scale);
     }
 
+    // Estimate normals solely from the shared measured prefix. No GT scan.
+    std::vector<glm::vec3> local_normals(knn_count, glm::vec3(0.0f,0.0f,1.0f));
+    std::vector<uint8_t> normals_valid(knn_count, 0);
+    if (config.init_surface_mode != 0) {
+        if (config.init_surface_mode != 1 && config.init_surface_mode != 2)
+            throw std::runtime_error("init_surface_mode must be 0/1/2");
+        if (!(config.init_normal_scale_ratio > 0.0f && config.init_normal_scale_ratio <= 1.0f))
+            throw std::runtime_error("init_normal_scale_ratio must be in (0,1]");
+        auto [normal_distances, normal_indices] = knn.kneighbors(knn_points, 12);
+        for (size_t i=0; i<knn_count; ++i) {
+            const auto& nb=normal_indices[i];
+            glm::vec3 best(0.0f);
+            float maxarea=0.0f;
+            for (size_t j=0; j<nb.size(); ++j) {
+                const size_t ia=static_cast<size_t>(nb[j]);
+                if (ia>=knn_count || ia==i) continue;
+                const glm::vec3 a=knn_points[ia]-knn_points[i];
+                for (size_t k=j+1; k<nb.size(); ++k) {
+                    const size_t ib=static_cast<size_t>(nb[k]);
+                    if (ib>=knn_count || ib==i) continue;
+                    const glm::vec3 n=glm::cross(a,knn_points[ib]-knn_points[i]);
+                    const float ar=glm::dot(n,n);
+                    if (ar>maxarea) { maxarea=ar; best=n; }
+                }
+            }
+            if (maxarea>1e-12f) {
+                local_normals[i]=glm::normalize(best);
+                normals_valid[i]=1;
+            }
+        }
+        printf("Sceneweave surface-init mode=%d normal ratio=%g\\n",
+               config.init_surface_mode,config.init_normal_scale_ratio);
+    }
+
     for (size_t pointIdx = 0; pointIdx < numPoints; pointIdx++) {
 
         // position
@@ -564,13 +598,25 @@ void VulkanGSTrainer::load_colmap_dataset(
         glm::vec4 quat = glm::normalize(glm::vec4(unit_normal(rng), unit_normal(rng), unit_normal(rng), unit_normal(rng)));  // per Nerfstudio (uses a different parameterization)
         // glm::vec4 quat = glm::vec4(unit_uniform(rng), unit_uniform(rng), unit_uniform(rng), unit_uniform(rng));  // per GSplat
         // quat = glm::vec4(1, 0, 0, 0);  // per Inria
-        rotations[pointIdx] = quat;
-
-        // scales and opacity
-        float scale = config.init_scale * dist_avg[pointIdx];
-        float opac = config.init_opacity;
-
-        scales_opacs[pointIdx] = glm::vec4(glm::vec3(scale), opac);
+        // Anisotropic control: identical eigenvalues, different rotation only.
+        float scale=config.init_scale * dist_avg[pointIdx];
+        float opac=config.init_opacity;
+        glm::vec3 radii(scale);
+        if (config.init_surface_mode != 0 &&
+            pointIdx<knn_count && normals_valid[pointIdx]) {
+            radii.z*=config.init_normal_scale_ratio;
+            if (config.init_surface_mode==1) {
+                const auto n=local_normals[pointIdx];
+                const auto ref=std::abs(n.z)<0.9f ?
+                    glm::vec3(0.0f,0.0f,1.0f) : glm::vec3(1.0f,0.0f,0.0f);
+                const auto t=glm::normalize(glm::cross(ref,n));
+                const auto b=glm::normalize(glm::cross(n,t));
+                const glm::quat q=glm::quat_cast(glm::mat3(t,b,n));
+                quat=glm::vec4(q.x,q.y,q.z,q.w);
+            }
+        }
+        rotations[pointIdx]=quat;
+        scales_opacs[pointIdx]=glm::vec4(radii,opac);
 
         // SH
         glm::vec3* sh_base = &sh_coeffs[kNumSH*pointIdx];
