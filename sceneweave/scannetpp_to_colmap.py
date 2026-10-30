@@ -31,9 +31,10 @@ def scale_intrinsics(K, source_wh, destination_wh):
     out[0,:]*=sx;out[1,:]*=sy
     return out
 
-def select_frames(metadata, max_frames, frame_stride):
+def select_frames(metadata, max_frames, frame_stride, start_frame=0, end_frame=None):
     # Sample the complete trajectory to retain meaningful scene coverage.
     ids=sorted(int(k.removeprefix("frame_")) for k in metadata if k.startswith("frame_"))
+    ids=[i for i in ids if i>=start_frame and (end_frame is None or i<end_frame)]
     ids=ids[::frame_stride]
     if len(ids)>max_frames:
         selected=np.linspace(0,len(ids)-1,max_frames,dtype=int)
@@ -60,6 +61,9 @@ def main():
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--max-frames",type=int,default=176)
     parser.add_argument("--frame-stride",type=int,default=30)
+    parser.add_argument("--start-frame",type=int,default=0)
+    parser.add_argument("--end-frame",type=int,default=None,
+                        help="Exclusive end frame; use a local overlapping sequence")
     parser.add_argument("--seed-frame-step",type=int,default=8)
     parser.add_argument("--pixel-step",type=int,default=2)
     parser.add_argument("--max-points",type=int,default=100000)
@@ -79,7 +83,7 @@ def main():
     if out.exists() and any(out.iterdir()):parser.error("Output must be empty")
     iphone=scene/"iphone"
     meta=json.loads((iphone/"pose_intrinsic_imu.json").read_text())
-    ids=select_frames(meta,args.max_frames,args.frame_stride)
+    ids=select_frames(meta,args.max_frames,args.frame_stride,args.start_frame,args.end_frame)
     train_ids=[idx for i,idx in enumerate(ids) if i%8!=0]
     seed_ids=set(train_ids[::args.seed_frame_step])
     # Above slicing is performed on the TRAIN frame list, never validation.
@@ -144,6 +148,8 @@ def main():
             f.write(f"{i} {p[0]:.9g} {p[1]:.9g} {p[2]:.9g} {int(c[0])} {int(c[1])} {int(c[2])} 0\n")
     manifest=dict(schema_version="1.0.0",mode="measured",oracle_privileged=False,
         scene=str(scene),dataset=str(out),frame_indices=ids,seed_frame_indices=used_seed_ids,
+        frame_selection={"start":args.start_frame,"end":args.end_frame,
+                         "stride":args.frame_stride,"max_frames":args.max_frames},
         num_seed_points=len(xyz),rgb_resolution=[args.rgb_width,args.rgb_height],
         pose_source="aligned_pose",pose_axes=args.pose_axes,depth_scale_units_per_meter=args.depth_scale,
         mask_valid=args.mask_valid,mask_dir="masks",
