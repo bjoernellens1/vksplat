@@ -79,6 +79,9 @@ def write_dataset(base, destination, original, rgb, extra, mode, stats, params):
     sparse = destination / "sparse" / "0"
     sparse.mkdir(parents=True)
     (destination / "images").symlink_to((base / "images").resolve(), target_is_directory=True)
+    # Preserve the exact same anonymization masks as the measured baseline.
+    if (base / "masks").is_dir():
+        (destination / "masks").symlink_to((base / "masks").resolve(), target_is_directory=True)
     for name in ("cameras.txt", "images.txt"):
         shutil.copy2(base / "sparse" / "0" / name, sparse / name)
     with (sparse / "points3D.txt").open("w") as stream:
