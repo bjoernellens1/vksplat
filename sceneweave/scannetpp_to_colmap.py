@@ -80,7 +80,8 @@ def main():
     iphone=scene/"iphone"
     meta=json.loads((iphone/"pose_intrinsic_imu.json").read_text())
     ids=select_frames(meta,args.max_frames,args.frame_stride)
-    seed_ids=set(ids[i] for i in range(len(ids)) if i%8!=0)[::args.seed_frame_step]
+    train_ids=[idx for i,idx in enumerate(ids) if i%8!=0]
+    seed_ids=set(train_ids[::args.seed_frame_step])
     # Above slicing is performed on the TRAIN frame list, never validation.
     sparse=out/"sparse"/"0";images=out/"images";masks=out/"masks"
     sparse.mkdir(parents=True);images.mkdir();masks.mkdir()
