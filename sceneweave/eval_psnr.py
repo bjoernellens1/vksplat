@@ -28,7 +28,18 @@ def evaluate(run:Path):
         rendered=read_rgb(run/f"val_{i:05d}.png")
         if actual.shape!=rendered.shape:
             raise ValueError(f"Image {i} shape mismatch {actual.shape} != {rendered.shape}")
-        mse=float(np.mean(np.square(actual-rendered)))
+        squared=np.square(actual-rendered)
+        mask_path=item.get("mask_path")
+        if mask_path:
+            mask=cv2.imread(str(mask_path),cv2.IMREAD_GRAYSCALE)
+            if mask is None or mask.shape!=actual.shape[:2]:
+                raise ValueError(f"Missing or incorrectly shaped eval mask: {mask_path}")
+            valid=mask>0
+            if not valid.any():
+                raise ValueError(f"Empty eval mask: {mask_path}")
+            mse=float(np.mean(squared[valid]))
+        else:
+            mse=float(np.mean(squared))
         psnr=float(-10*np.log10(max(mse,1e-15)))
         results.append({"image_path":item["image_path"],"render_path":f"val_{i:05d}.png","psnr_db":psnr})
     if not results:
@@ -36,7 +47,7 @@ def evaluate(run:Path):
     return {"evaluation":"decoded_image_psnr","precision":"float64_from_original_8_or_16_bit_images",
             "count":len(results),"mean_psnr_db":float(np.mean([r["psnr_db"] for r in results])),
             "median_psnr_db":float(np.median([r["psnr_db"] for r in results])),
-            "photometric_only":True,"images":results}
+            "photometric_only":True,"mask_handling":"nonzero mask pixels only when mask_path available", "images":results}
 
 def main():
     p=argparse.ArgumentParser()
