@@ -173,6 +173,10 @@ public:
             ? train_config["init_reference_count"].cast<size_t>() : size_t(0);
         config.init_added_scale_m = train_config.contains(py::str("init_added_scale_m"))
             ? train_config["init_added_scale_m"].cast<float>() : 0.0f;
+        config.init_surface_mode = train_config.contains(py::str("init_surface_mode"))
+            ? train_config["init_surface_mode"].cast<int>() : 0;
+        config.init_normal_scale_ratio = train_config.contains(py::str("init_normal_scale_ratio"))
+            ? train_config["init_normal_scale_ratio"].cast<float>() : 0.25f;
 
         std::string strategy = train_config["strategy"].cast<std::string>();
         if (strategy == "default")
