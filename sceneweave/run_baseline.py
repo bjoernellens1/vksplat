@@ -37,6 +37,8 @@ def main():
                    help="Use shared original seeds for normalization/KNN and fixed-scale additions")
     p.add_argument("--added-scale-m",type=float,default=0.025,
                    help="Metric-world scale for appended Gaussians in controlled-init mode")
+    p.add_argument("--surface-mode",choices=("isotropic","aligned","random_anisotropic"),default="isotropic")
+    p.add_argument("--normal-scale-ratio",type=float,default=0.25)
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
     args=p.parse_args()
@@ -44,6 +46,8 @@ def main():
         p.error("steps and cap-max must be positive")
     if args.controlled_init and not (0 < args.added_scale_m < 10):
         p.error("--added-scale-m must be positive and finite")
+    if not 0 < args.normal_scale_ratio <= 1:
+        p.error("--normal-scale-ratio must be in (0,1]")
     dataset=args.dataset.expanduser().resolve()
     for stem in ("cameras","images","points3D"):
         if not any((dataset/"sparse"/"0"/f"{stem}.{ext}").is_file() for ext in ("bin","txt")):
@@ -67,6 +71,8 @@ def main():
     cfg=cfg_cls(dataset_dir=str(dataset),image_dir=args.image_dir,mask_dir=args.mask_dir,sparse_dir="sparse/0",
         output_dir=str(output),train_steps=args.steps,max_steps=args.max_steps,
         enable_viewer=False,save_train_renders=False)
+    cfg.init_surface_mode={"isotropic":0,"aligned":1,"random_anisotropic":2}[args.surface_mode]
+    cfg.init_normal_scale_ratio=args.normal_scale_ratio
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
     if args.refine_start is not None:
@@ -108,6 +114,8 @@ def main():
               "init_opacity":cfg.init_opacity,
               "added_scale_m":cfg.init_added_scale_m,
               "shuffle_seed":cfg.shuffle_seed,
+              "surface_mode":args.surface_mode,
+              "normal_scale_ratio":args.normal_scale_ratio,
               "quality_scope":"photometric_only"}
     (output/"sceneweave_run_manifest.json").write_text(json.dumps(metadata,indent=2)+"\n")
     print("Baseline manifest:",output/"sceneweave_run_manifest.json",flush=True)
