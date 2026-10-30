@@ -28,6 +28,7 @@ def main():
                    help="Learning-rate schedule horizon, independent of actual training steps")
     p.add_argument("--refine-start",type=int,default=None)
     p.add_argument("--refine-stop",type=int,default=None)
+    p.add_argument("--refine-every",type=int,default=None)
     p.add_argument("--grow-grad2d",type=float,default=None)
     p.add_argument("--init-opacity",type=float,default=None)
     p.add_argument("--strategy",choices=("default","mcmc"),default="default")
@@ -72,6 +73,9 @@ def main():
         cfg.refine_start_iter=args.refine_start
     if args.refine_stop is not None:
         cfg.refine_stop_iter=args.refine_stop
+    if args.refine_every is not None:
+        if args.refine_every<=0: p.error("--refine-every must be positive")
+        cfg.refine_every=args.refine_every
     if args.grow_grad2d is not None:
         if args.grow_grad2d<=0: p.error("--grow-grad2d must be positive")
         cfg.grow_grad2d=args.grow_grad2d
@@ -99,6 +103,7 @@ def main():
               "schedule_max_steps":cfg.max_steps,
               "refine_start_iter":cfg.refine_start_iter,
               "refine_stop_iter":cfg.refine_stop_iter,
+              "refine_every":cfg.refine_every,
               "grow_grad2d":cfg.grow_grad2d,
               "init_opacity":cfg.init_opacity,
               "added_scale_m":cfg.init_added_scale_m,
