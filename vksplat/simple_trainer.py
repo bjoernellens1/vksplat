@@ -46,6 +46,8 @@ class TrainerConfig:
     init_opacity: float = 0.1  # 0.5 for MCMC
     init_reference_count: int = 0  # 0 preserves legacy full-cloud normalization/KNN
     init_added_scale_m: float = 0.0  # world-metric initial scale of appended Gaussians
+    init_surface_mode: int = 0  # 0 isotropic; 1 aligned anisotropic; 2 random anisotropic
+    init_normal_scale_ratio: float = 0.25
     shuffle_seed: Optional[int] = None  # None preserves legacy unseeded view order
 
     # densification strategy
