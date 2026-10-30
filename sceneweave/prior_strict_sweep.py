@@ -5,6 +5,7 @@ retrieval costs are NOT included, therefore no total prior speedup is claimed.
 """
 from __future__ import annotations
 import argparse,csv,json,subprocess,sys,time
+import numpy as np
 from pathlib import Path
 from eval_psnr import evaluate
 
@@ -79,9 +80,22 @@ def main():
         results.append(row)
         print(f"{name}: {row['psnr_db']:.3f} dB, {row['train_s']:.2f}s, "
               f"{row['splats']} splats",flush=True)
-    images=[r["val_images"] for r in results]
+    images=[[Path(v["image_path"]).name for v in r["val_images"]] for r in results]
     if len(results)>1 and any(images[0]!=i for i in images[1:]):
-        raise ValueError("Validation frame metadata differ across paired runs")
+        raise ValueError("Validation image identities differ across paired runs")
+    transforms=[]
+    settings=[]
+    for row in results:
+        train=json.loads((Path(row["run_dir"])/"train.json").read_text())
+        transforms.append(np.asarray(train["dataparser_transform"],dtype=float))
+        settings.append(json.loads((a.output/row["condition"]/
+                                    "sceneweave_run_manifest.json").read_text()))
+    if len(results)>1:
+        if any(not np.allclose(transforms[0],T,rtol=0,atol=2e-6) for T in transforms[1:]):
+            raise ValueError("Incomparable training world-normalization transforms")
+        for key in ("reference_seed_count","shuffle_seed","added_scale_m"):
+            if any(settings[0][key]!=cfg[key] for cfg in settings[1:]):
+                raise ValueError(f"Controlled initialization mismatch: {key}")
     compact=[{k:v for k,v in r.items() if k not in ("train_images","val_images")}
              for r in results]
     with (a.output/"summary.csv").open("w",newline="") as fh:
@@ -91,6 +105,7 @@ def main():
         "schema_version":"sceneweave-vksplat-prior-strict-v0",
         "results":compact,"matched_val_image_manifests":True,
         "controlled_initialization":True,"fixed_growth_policy":"strict",
+        "shared_normalization_and_seed_settings_verified":True,
         "speedup_scope":"training_only_not_end_to_end",
         "prior_data_acquisition_and_preparation_missing":True,
         "geometry_quality_measured":False
