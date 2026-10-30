@@ -34,6 +34,10 @@ struct TrainerConfig {
     // reference and initialize appended points with a fixed world-metric scale.
     size_t init_reference_count = 0;
     float init_added_scale_m = 0.0f;
+    // 0 legacy random/isotropic, 1 local surface normal + anisotropy,
+    // 2 random orientation + identical anisotropic scales (capacity control).
+    int init_surface_mode = 0;
+    float init_normal_scale_ratio = 0.25f;
 
     enum class Strategy {
         Default, MCMC,
