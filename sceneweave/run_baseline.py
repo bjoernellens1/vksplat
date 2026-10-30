@@ -22,6 +22,7 @@ def main():
     p.add_argument("--dataset",type=Path,required=True)
     p.add_argument("--output",type=Path,required=True)
     p.add_argument("--image-dir",default="images_2")
+    p.add_argument("--mask-dir",default=None,help="Optional grayscale mask directory relative to dataset")
     p.add_argument("--steps",type=int,default=1000)
     p.add_argument("--strategy",choices=("default","mcmc"),default="default")
     p.add_argument("--cap-max",type=int,default=1_000_000)
@@ -51,10 +52,12 @@ def main():
         p.error("--controlled-init requires a versioned Sceneweave dataset manifest")
     if not (dataset/args.image_dir).is_dir():
         p.error(f"Missing image directory: {dataset/args.image_dir}")
+    if args.mask_dir and not (dataset/args.mask_dir).is_dir():
+        p.error(f"Missing mask directory: {dataset/args.mask_dir}")
     output=args.output.expanduser().resolve()
     output.mkdir(parents=True,exist_ok=True)
     cfg_cls=MCMCTrainerConfig if args.strategy=="mcmc" else TrainerConfig
-    cfg=cfg_cls(dataset_dir=str(dataset),image_dir=args.image_dir,sparse_dir="sparse/0",
+    cfg=cfg_cls(dataset_dir=str(dataset),image_dir=args.image_dir,mask_dir=args.mask_dir,sparse_dir="sparse/0",
         output_dir=str(output),train_steps=args.steps,max_steps=30000,
         enable_viewer=False,save_train_renders=False)
     if args.strategy=="mcmc":
@@ -73,7 +76,7 @@ def main():
     else:
         cfg.shuffle_seed=args.shuffle_seed
     metadata={"dataset":str(dataset),"steps":args.steps,"strategy":args.strategy,
-              "image_dir":args.image_dir,"created_utc":datetime.now(timezone.utc).isoformat(),
+              "image_dir":args.image_dir,"mask_dir":args.mask_dir,"created_utc":datetime.now(timezone.utc).isoformat(),
               "prior":manifest["mode"] if manifest else "none",
               "controlled_init":args.controlled_init,
               "reference_seed_count":cfg.init_reference_count,
