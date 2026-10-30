@@ -24,6 +24,12 @@ def main():
     p.add_argument("--image-dir",default="images_2")
     p.add_argument("--mask-dir",default=None,help="Optional grayscale mask directory relative to dataset")
     p.add_argument("--steps",type=int,default=1000)
+    p.add_argument("--max-steps",type=int,default=30000,
+                   help="Learning-rate schedule horizon, independent of actual training steps")
+    p.add_argument("--refine-start",type=int,default=None)
+    p.add_argument("--refine-stop",type=int,default=None)
+    p.add_argument("--grow-grad2d",type=float,default=None)
+    p.add_argument("--init-opacity",type=float,default=None)
     p.add_argument("--strategy",choices=("default","mcmc"),default="default")
     p.add_argument("--cap-max",type=int,default=1_000_000)
     p.add_argument("--controlled-init",action="store_true",
@@ -33,7 +39,7 @@ def main():
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
     args=p.parse_args()
-    if args.steps<=0 or args.cap_max<=0:
+    if args.steps<=0 or args.max_steps<=0 or args.cap_max<=0:
         p.error("steps and cap-max must be positive")
     if args.controlled_init and not (0 < args.added_scale_m < 10):
         p.error("--added-scale-m must be positive and finite")
@@ -58,10 +64,20 @@ def main():
     output.mkdir(parents=True,exist_ok=True)
     cfg_cls=MCMCTrainerConfig if args.strategy=="mcmc" else TrainerConfig
     cfg=cfg_cls(dataset_dir=str(dataset),image_dir=args.image_dir,mask_dir=args.mask_dir,sparse_dir="sparse/0",
-        output_dir=str(output),train_steps=args.steps,max_steps=30000,
+        output_dir=str(output),train_steps=args.steps,max_steps=args.max_steps,
         enable_viewer=False,save_train_renders=False)
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
+    if args.refine_start is not None:
+        cfg.refine_start_iter=args.refine_start
+    if args.refine_stop is not None:
+        cfg.refine_stop_iter=args.refine_stop
+    if args.grow_grad2d is not None:
+        if args.grow_grad2d<=0: p.error("--grow-grad2d must be positive")
+        cfg.grow_grad2d=args.grow_grad2d
+    if args.init_opacity is not None:
+        if not 0 < args.init_opacity < 1: p.error("--init-opacity must be in (0,1)")
+        cfg.init_opacity=args.init_opacity
     if args.controlled_init:
         try:
             cfg.init_reference_count=controlled_reference_count(manifest)
@@ -80,6 +96,11 @@ def main():
               "prior":manifest["mode"] if manifest else "none",
               "controlled_init":args.controlled_init,
               "reference_seed_count":cfg.init_reference_count,
+              "schedule_max_steps":cfg.max_steps,
+              "refine_start_iter":cfg.refine_start_iter,
+              "refine_stop_iter":cfg.refine_stop_iter,
+              "grow_grad2d":cfg.grow_grad2d,
+              "init_opacity":cfg.init_opacity,
               "added_scale_m":cfg.init_added_scale_m,
               "shuffle_seed":cfg.shuffle_seed,
               "quality_scope":"photometric_only"}
