@@ -169,6 +169,10 @@ public:
         config.init_scale = train_config["init_scale"].cast<float>();
         config.init_opacity = train_config["init_opacity"].cast<float>();
         // Optional keys: preserve existing callers that pass pre-Sceneweave dicts.
+        config.seed = train_config.contains(py::str("seed"))
+            ? train_config["seed"].cast<int>() : 42;
+        config.init_gaussians_ply = train_config.contains(py::str("init_gaussians_ply"))
+            ? train_config["init_gaussians_ply"].cast<std::string>() : std::string();
         config.init_reference_count = train_config.contains(py::str("init_reference_count"))
             ? train_config["init_reference_count"].cast<size_t>() : size_t(0);
         config.init_added_scale_m = train_config.contains(py::str("init_added_scale_m"))

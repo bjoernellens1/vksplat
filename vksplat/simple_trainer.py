@@ -8,6 +8,7 @@ import numpy as np
 import cv2
 
 import json
+from ckpt_trace import CheckpointRecorder, HwmonSampler, build_manifest
 from tqdm import tqdm
 from datetime import datetime
 from time import perf_counter
@@ -55,6 +56,14 @@ class TrainerConfig:
     selective_plane_freeze: bool = False
     unfreeze_loss_spike_ratio: float = 1.35
     shuffle_seed: Optional[int] = None  # None preserves legacy unseeded view order
+    seed: int = 42  # C++ RNG (initial quaternions, densification/MCMC noise)
+    init_gaussians_ply: str = ""  # standard 3DGS PLY (normalized frame, as written by write_ply) replacing points3D seeding
+
+    # continuous quality-vs-time trace (DB0); None disables all checkpoint work
+    checkpoint_steps: Optional[List[int]] = None  # numbers of completed steps; see log_spaced_steps()
+    ckpt_dir: str = ""  # default: <output_dir>/ckpt
+    ckpt_render_dtype: Literal['float16', 'float32'] = 'float16'
+    gates_json: Optional[str] = None  # only hashed into manifest.json (gates_sha256)
 
     # densification strategy
     # to use MCMC, you must train with MCMCTrainerConfig instead of only changing this field to reproduce paper results
@@ -127,6 +136,15 @@ def PRINT(*args, **kargs):
 def train(config: TrainerConfig):
     # from build import vksplat  # or build.Debug, build.Release for MSVC
     import vksplat
+
+    ckpt_steps = sorted(set(config.checkpoint_steps or []))
+    if any(not 1 <= n <= config.train_steps for n in ckpt_steps):
+        raise ValueError("checkpoint_steps must lie in [1, train_steps]")
+
+    os.makedirs(config.output_dir, exist_ok=True)
+    with open(os.path.join(config.output_dir, 'manifest.json'), 'w') as fp:
+        json.dump(build_manifest(config, config.gates_json), fp, indent=4)
+    t_prep = perf_counter()
 
     # create and initialize module
     module = vksplat.VkSplat()
@@ -213,7 +231,15 @@ def train(config: TrainerConfig):
         thread.start()
 
     # train
+    ckpt_set = {n - 1 for n in ckpt_steps}  # loop indices after which n steps are done
+    recorder = sampler = None
+    if ckpt_set:
+        sampler = HwmonSampler().start()
     t0 = perf_counter()
+    if ckpt_set:
+        recorder = CheckpointRecorder(
+            module, config, config.ckpt_dir or os.path.join(config.output_dir, 'ckpt'),
+            t0, t0 - t_prep, lock, sampler)
     shuffle_idx = list(range(module.num_train))
     shuffle_rng = random.Random(config.shuffle_seed) if config.shuffle_seed is not None else random
     for step in tqdm(range(config.train_steps), "Training"):
@@ -223,7 +249,12 @@ def train(config: TrainerConfig):
         image_idx = shuffle_idx[step % len(shuffle_idx)]
         with lock:
             module.train_step(image_idx, step)
+        if step in ckpt_set:
+            recorder.checkpoint(step)
     t1 = perf_counter()
+    if recorder is not None:
+        t1 -= recorder.eval_wall_s  # report train-only time
+        recorder.write_trace(final=True)
     with lock:
         num_splats = len(module.opacities)
     vram_usage = module.get_vram_usage()

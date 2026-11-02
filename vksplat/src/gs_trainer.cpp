@@ -12,6 +12,8 @@
 #include <filesystem>
 #include <fstream>
 #include <cmath>
+#include <sstream>
+#include <cstring>
 
 #ifdef max
 #undef max
@@ -137,10 +139,94 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
 }
 
 
+// Read a binary_little_endian 3DGS PLY (x,y,z,f_dc_*,f_rest_*,opacity(logit),
+// scale_*(log),rot_*) into the trainer's host layout (unreordered SH: [k][rgb]).
+static size_t read_gaussian_ply(
+    const std::string &path, VulkanGSPipelineBuffers &buffers, int num_sh
+) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("init_gaussians_ply: cannot open " + path);
+    std::string line;
+    std::getline(f, line);
+    if (line != "ply") throw std::runtime_error("init_gaussians_ply: not a PLY: " + path);
+    size_t n = 0;
+    bool binary_le = false, in_vertex = false;
+    std::vector<std::string> names;
+    std::vector<int> widths;
+    while (std::getline(f, line) && line != "end_header") {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        std::istringstream ss(line);
+        std::string kw, a, b;
+        ss >> kw >> a >> b;
+        if (kw == "format") binary_le = (a == "binary_little_endian");
+        else if (kw == "element") {
+            in_vertex = (a == "vertex");
+            if (in_vertex) n = std::stoull(b);
+        } else if (kw == "property" && in_vertex) {
+            if (a != "float" && a != "double")
+                throw std::runtime_error("init_gaussians_ply: only float/double properties supported");
+            widths.push_back(a == "float" ? 4 : 8);
+            names.push_back(b);
+        }
+    }
+    if (!binary_le || n == 0) throw std::runtime_error("init_gaussians_ply: need non-empty binary_little_endian PLY");
+
+    std::map<std::string, size_t> col;
+    for (size_t i = 0; i < names.size(); ++i) col[names[i]] = i;
+    auto need = [&](const std::string &k) {
+        auto it = col.find(k);
+        if (it == col.end()) throw std::runtime_error("init_gaussians_ply: missing property " + k);
+        return it->second;
+    };
+    size_t rest_per_channel = 0;
+    while (col.count("f_rest_" + std::to_string(rest_per_channel))) ++rest_per_channel;
+    rest_per_channel /= 3;
+    if (rest_per_channel > size_t(num_sh - 1))
+        throw std::runtime_error("init_gaussians_ply: more than 15 SH rest coefficients per channel");
+
+    buffers.num_splats = n;
+    buffers.xyz_ws.resize(3 * n);
+    std::fill(buffers.xyz_ws.begin(), buffers.xyz_ws.end(), 0.0f);
+    buffers.sh_coeffs.resize(size_t(num_sh) * 3 * n);
+    std::fill(buffers.sh_coeffs.begin(), buffers.sh_coeffs.end(), 0.0f);
+    buffers.rotations.resize(4 * n);
+    std::fill(buffers.rotations.begin(), buffers.rotations.end(), 0.0f);
+    buffers.scales_opacs.resize(4 * n);
+    std::fill(buffers.scales_opacs.begin(), buffers.scales_opacs.end(), 0.0f);
+
+    size_t row_bytes = 0;
+    std::vector<size_t> offs;
+    for (int w : widths) { offs.push_back(row_bytes); row_bytes += w; }
+    std::vector<char> row(row_bytes);
+    std::vector<float> v(names.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (!f.read(row.data(), static_cast<std::streamsize>(row_bytes)))
+            throw std::runtime_error("init_gaussians_ply: truncated file");
+        for (size_t c = 0; c < names.size(); ++c) {
+            if (widths[c] == 4) std::memcpy(&v[c], row.data() + offs[c], 4);
+            else { double d; std::memcpy(&d, row.data() + offs[c], 8); v[c] = float(d); }
+        }
+        for (int c = 0; c < 3; ++c) {
+            buffers.xyz_ws[3 * i + c] = v[need(std::string(1, "xyz"[c]))];
+            buffers.sh_coeffs[size_t(num_sh) * 3 * i + c] = v[need("f_dc_" + std::to_string(c))];
+            for (size_t k = 0; k < rest_per_channel; ++k)
+                buffers.sh_coeffs[size_t(num_sh) * 3 * i + 3 * (k + 1) + c] =
+                    v[col.at("f_rest_" + std::to_string(c * rest_per_channel + k))];
+            buffers.scales_opacs[4 * i + c] = std::exp(v[need("scale_" + std::to_string(c))]);
+        }
+        buffers.scales_opacs[4 * i + 3] = 1.0f / (1.0f + std::exp(-v[need("opacity")]));
+        for (int c = 0; c < 4; ++c)
+            buffers.rotations[4 * i + c] = v[need("rot_" + std::to_string(c))];
+    }
+    return n;
+}
+
+
 void VulkanGSTrainer::load_colmap_dataset(
     const TrainerConfig &config,
     VulkanGSPipelineBuffers& buffers
 ) {
+    rng.seed(config.seed);
     ColmapReader reader;
 
     std::map<int, ColmapReader::Camera> rawCameras;
@@ -708,6 +794,13 @@ void VulkanGSTrainer::load_colmap_dataset(
                        num_anchored_splats, numPoints);
             }
         }
+    }
+
+    if (!config.init_gaussians_ply.empty()) {
+        if (config.selective_plane_freeze)
+            throw std::runtime_error("init_gaussians_ply is incompatible with selective_plane_freeze");
+        numPoints = read_gaussian_ply(config.init_gaussians_ply, buffers, kNumSH);
+        num_anchored_splats = 0;
     }
 
     buffers.reorderSH(buffers.sh_coeffs);

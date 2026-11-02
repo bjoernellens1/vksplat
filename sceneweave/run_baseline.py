@@ -8,6 +8,7 @@ import sys
 # Insert the actual trainer directory ahead of Python's namespace-package path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'vksplat'))
 from simple_trainer import TrainerConfig, MCMCTrainerConfig, train_main
+from ckpt_trace import log_spaced_steps
 
 def controlled_reference_count(manifest):
     """Validate a shared original-point prefix for controlled initialization."""
@@ -51,6 +52,11 @@ def main():
                    help="Freeze only Gaussians in plane_group_ids.bin while keeping non-planar objects trainable")
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
+    p.add_argument("--seed",type=int,default=42,help="C++ RNG seed")
+    p.add_argument("--init-ply",default="",help="Initialize Gaussians from a 3DGS PLY instead of points3D")
+    p.add_argument("--checkpoint-steps",default=None,
+                   help="Comma-separated step counts, or 'log:N' for N log-spaced steps up to --steps")
+    p.add_argument("--gates-json",default=None,help="Gates file whose sha256 is recorded in manifest.json")
     args=p.parse_args()
     if args.steps<=0 or args.max_steps<=0 or args.cap_max<=0:
         p.error("steps and cap-max must be positive")
@@ -83,6 +89,13 @@ def main():
     cfg=cfg_cls(dataset_dir=str(dataset),image_dir=args.image_dir,mask_dir=args.mask_dir,sparse_dir="sparse/0",
         output_dir=str(output),train_steps=args.steps,max_steps=args.max_steps,
         enable_viewer=False,save_train_renders=False)
+    cfg.seed=args.seed
+    cfg.init_gaussians_ply=str(Path(args.init_ply).expanduser().resolve()) if args.init_ply else ""
+    cfg.gates_json=args.gates_json
+    if args.checkpoint_steps:
+        cfg.checkpoint_steps=(log_spaced_steps(args.steps,int(args.checkpoint_steps[4:]))
+            if args.checkpoint_steps.startswith("log:")
+            else sorted({int(x) for x in args.checkpoint_steps.split(",")}))
     cfg.init_surface_mode={"isotropic":0,"aligned":1,"random_anisotropic":2}[args.surface_mode]
     cfg.init_normal_scale_ratio=args.normal_scale_ratio
     cfg.freeze_geometry_after_iter=args.freeze_geometry_after

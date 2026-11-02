@@ -28,6 +28,13 @@ struct TrainerConfig {
     float init_scale;
     float init_opacity;
 
+    // RNG seed for quaternion init, densification noise and MCMC sampling.
+    int seed = 42;
+    // Non-empty: initialize all Gaussians from this standard 3DGS PLY
+    // (dataparser-normalized frame, as written by writePLY) instead of
+    // seeding them from points3D. points3D still defines the world normalization.
+    std::string init_gaussians_ply;
+
     // Optional Sceneweave controlled-init ablation. Zero preserves legacy
     // normalization and 4-NN scales over the complete COLMAP cloud.
     // Nonzero: use the first N seed points as a common normalization/4-NN
