@@ -1071,7 +1071,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     resizeDeviceBuffer(buffers.default_split_mask, num_splats),
                 }
             );
-            if (selective_active && num_anchored_splats <= num_splats) {
+            if (config.selective_plane_freeze && num_anchored_splats > 0 &&
+                num_anchored_splats <= num_splats && !selective_freeze_unfrozen) {
                 bufferMemoryBarrier({
                     { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
@@ -1188,7 +1189,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 resizeDeviceBuffer(buffers.default_keep_mask, num_splats),
             }
         );
-        if (selective_active && num_anchored_splats <= num_splats) {
+        if (config.selective_plane_freeze && num_anchored_splats > 0 &&
+            num_anchored_splats <= num_splats && !selective_freeze_unfrozen) {
             bufferMemoryBarrier({
                 { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, TRANSFER_WRITE);
@@ -1208,16 +1210,6 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
         if (num_prune > 0) {
             executeCumsum(buffers, buffers.default_keep_mask, buffers._temp_indices);
-            if (!selective_active && config.selective_plane_freeze &&
-                num_anchored_splats > 0 && num_anchored_splats <= num_splats) {
-                if (commandBatchInProgress) bufferMemoryBarrier({
-                    { buffers._temp_indices.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-                }, TRANSFER_READ);
-                int surviving_anchored = readElement<int32_t>(
-                    buffers._temp_indices.deviceBuffer, num_anchored_splats - 1
-                );
-                num_anchored_splats = std::max(0, surviving_anchored);
-            }
             
             enum PruneType {
                 Default, Sh, Mean
