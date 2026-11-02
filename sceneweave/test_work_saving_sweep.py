@@ -28,11 +28,21 @@ def test_make_command_and_resolve_freeze_step():
             seed=42,
             freeze_after_iter=step,
             surface_mode="isotropic",
+            init_opacity=0.5,
+            enable_lr_boost=True,
+            max_sh_degree=0,
+            enable_pre_freeze_prune=True,
+            selective_plane_freeze=True,
         )
         assert "--freeze-geometry-after" in cmd
         idx = cmd.index("--freeze-geometry-after")
         assert cmd[idx + 1] == "3000"
         assert cmd[cmd.index("--surface-mode") + 1] == "isotropic"
+        assert "--enable-lr-boost" in cmd
+        assert "--enable-pre-freeze-prune" in cmd
+        assert "--selective-plane-freeze" in cmd
+        assert cmd[cmd.index("--init-opacity") + 1] == "0.5"
+        assert cmd[cmd.index("--max-sh-degree") + 1] == "0"
 
 
 if __name__ == "__main__":

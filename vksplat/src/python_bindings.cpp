@@ -179,6 +179,16 @@ public:
             ? train_config["init_normal_scale_ratio"].cast<float>() : 0.25f;
         config.freeze_geometry_after_iter = train_config.contains(py::str("freeze_geometry_after_iter"))
             ? train_config["freeze_geometry_after_iter"].cast<int>() : 0;
+        config.enable_lr_boost = train_config.contains(py::str("enable_lr_boost"))
+            ? train_config["enable_lr_boost"].cast<bool>() : false;
+        config.max_sh_degree_override = train_config.contains(py::str("max_sh_degree_override"))
+            ? train_config["max_sh_degree_override"].cast<int>() : -1;
+        config.enable_pre_freeze_prune = train_config.contains(py::str("enable_pre_freeze_prune"))
+            ? train_config["enable_pre_freeze_prune"].cast<bool>() : false;
+        config.selective_plane_freeze = train_config.contains(py::str("selective_plane_freeze"))
+            ? train_config["selective_plane_freeze"].cast<bool>() : false;
+        config.unfreeze_loss_spike_ratio = train_config.contains(py::str("unfreeze_loss_spike_ratio"))
+            ? train_config["unfreeze_loss_spike_ratio"].cast<float>() : 1.35f;
 
         std::string strategy = train_config["strategy"].cast<std::string>();
         if (strategy == "default")
@@ -237,6 +247,7 @@ public:
             reinterpret_cast<float*>(&dataparser_transform)
         );
         train_meta["device"] = trainer.get_device_info();
+        train_meta["num_anchored_splats"] = trainer.get_num_anchored_splats();
         return train_meta;
     }
 
@@ -543,8 +554,8 @@ public:
     void train_step(size_t train_idx, int step) {
         set_train_image(train_idx);
         const int kShDegreeInterval = 1000;
-        uniforms.active_sh = (config.freeze_geometry_after_iter > 0)
-            ? 0
+        uniforms.active_sh = (config.max_sh_degree_override >= 0)
+            ? std::min(step / kShDegreeInterval, config.max_sh_degree_override)
             : std::min(step / kShDegreeInterval, 3);
         uniforms.step = step;
 

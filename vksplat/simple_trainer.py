@@ -48,7 +48,12 @@ class TrainerConfig:
     init_added_scale_m: float = 0.0  # world-metric initial scale of appended Gaussians
     init_surface_mode: int = 0  # 0 isotropic; 1 aligned anisotropic; 2 random anisotropic
     init_normal_scale_ratio: float = 0.25
-    freeze_geometry_after_iter: int = 0  # >0 freezes 3D mean/quat/scale and densification at this step
+    freeze_geometry_after_iter: int = 0  # >0 freezes 3D mean/densification at this step
+    enable_lr_boost: bool = False
+    max_sh_degree_override: int = -1
+    enable_pre_freeze_prune: bool = False
+    selective_plane_freeze: bool = False
+    unfreeze_loss_spike_ratio: float = 1.35
     shuffle_seed: Optional[int] = None  # None preserves legacy unseeded view order
 
     # densification strategy

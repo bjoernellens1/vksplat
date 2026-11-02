@@ -38,9 +38,15 @@ struct TrainerConfig {
     // 2 random orientation + identical anisotropic scales (capacity control).
     int init_surface_mode = 0;
     float init_normal_scale_ratio = 0.25f;
-    // >0 freezes 3D mean/rotation/scale updates and post-backward densification
+    // >0 freezes 3D mean updates and post-backward densification
     // once step >= freeze_geometry_after_iter.
     int freeze_geometry_after_iter = 0;
+    // Orthogonal mechanism-isolating flags (decoupled from freeze_geometry_after_iter)
+    bool enable_lr_boost = false;
+    int max_sh_degree_override = -1;
+    bool enable_pre_freeze_prune = false;
+    bool selective_plane_freeze = false;
+    float unfreeze_loss_spike_ratio = 1.35f;
 
     enum class Strategy {
         Default, MCMC,
@@ -149,6 +155,9 @@ public:
 
     void writePLY(std::string filename, VulkanGSPipelineBuffers& buffers);
 
+    size_t get_num_anchored_splats() const { return num_anchored_splats; }
+    bool is_selective_freeze_unfrozen() const { return selective_freeze_unfrozen; }
+
 private:
     std::default_random_engine rng;
 
@@ -156,6 +165,12 @@ private:
     std::vector<DatasetImage> dataset_val;
     glm::mat4 dataparser_transform;
     float scene_scale;
+
+    size_t num_anchored_splats = 0;
+    bool anchored_xyz_snapshot_valid = false;
+    bool selective_freeze_unfrozen = false;
+    float pre_freeze_grad_ema = 0.0f;
+    Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);
     _ComputePipeline pipeline_ssim_backward = _ComputePipeline(4);

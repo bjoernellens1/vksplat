@@ -10,6 +10,7 @@
 #include <atomic>
 #include <mutex>
 #include <filesystem>
+#include <fstream>
 #include <cmath>
 
 #ifdef max
@@ -89,6 +90,13 @@ void VulkanGSTrainer::cleanup() {
         im.buffer.shrink_to_fit();
     }
     dataset_val.clear();
+
+    destroyBuffer(anchored_xyz_ws.deviceBuffer);
+    anchored_xyz_ws.clear();
+    anchored_xyz_ws.shrink_to_fit();
+    num_anchored_splats = 0;
+    anchored_xyz_snapshot_valid = false;
+    selective_freeze_unfrozen = false;
 
     VulkanGSRenderer::cleanup();
 }
@@ -600,7 +608,7 @@ void VulkanGSTrainer::load_colmap_dataset(
         // quat = glm::vec4(1, 0, 0, 0);  // per Inria
         // Anisotropic control: identical eigenvalues, different rotation only.
         float scale=config.init_scale * dist_avg[pointIdx];
-        float opac=(config.freeze_geometry_after_iter > 0) ? 0.50f : config.init_opacity;
+        float opac=config.init_opacity;
         glm::vec3 radii(scale);
         if (config.init_surface_mode != 0 &&
             pointIdx<knn_count && normals_valid[pointIdx]) {
@@ -626,12 +634,67 @@ void VulkanGSTrainer::load_colmap_dataset(
             sh_base[i] = glm::vec3(0.0f);
     }
 
+    num_anchored_splats = 0;
+    anchored_xyz_snapshot_valid = false;
+    selective_freeze_unfrozen = false;
+    pre_freeze_grad_ema = 0.0f;
+    if (config.selective_plane_freeze) {
+        std::string group_bin_path = config.dataset_dir + "plane_group_ids.bin";
+        if (!std::filesystem::exists(group_bin_path) && !config.dataset_dir.empty() &&
+            config.dataset_dir.back() != '/') {
+            group_bin_path = config.dataset_dir + "/plane_group_ids.bin";
+        }
+        if (std::filesystem::exists(group_bin_path)) {
+            std::ifstream gfile(group_bin_path, std::ios::binary);
+            std::vector<int32_t> group_ids(numPoints, -1);
+            if (gfile.read(reinterpret_cast<char*>(group_ids.data()),
+                           static_cast<std::streamsize>(numPoints * sizeof(int32_t)))) {
+                std::vector<size_t> anchored_idx;
+                std::vector<size_t> unanchored_idx;
+                anchored_idx.reserve(numPoints);
+                unanchored_idx.reserve(numPoints);
+                for (size_t i = 0; i < numPoints; ++i) {
+                    if (group_ids[i] >= 0) anchored_idx.push_back(i);
+                    else unanchored_idx.push_back(i);
+                }
+                num_anchored_splats = anchored_idx.size();
+                if (num_anchored_splats > 0 && num_anchored_splats < numPoints) {
+                    std::vector<size_t> perm;
+                    perm.reserve(numPoints);
+                    perm.insert(perm.end(), anchored_idx.begin(), anchored_idx.end());
+                    perm.insert(perm.end(), unanchored_idx.begin(), unanchored_idx.end());
+                    std::vector<glm::vec3> new_xyz(numPoints);
+                    std::vector<glm::vec3> new_sh(kNumSH * numPoints);
+                    std::vector<glm::vec4> new_rot(numPoints);
+                    std::vector<glm::vec4> new_so(numPoints);
+                    for (size_t dst = 0; dst < numPoints; ++dst) {
+                        size_t src = perm[dst];
+                        new_xyz[dst] = xyz_ws[src];
+                        new_rot[dst] = rotations[src];
+                        new_so[dst] = scales_opacs[src];
+                        for (int k = 0; k < kNumSH; ++k)
+                            new_sh[kNumSH * dst + k] = sh_coeffs[kNumSH * src + k];
+                    }
+                    std::memcpy(xyz_ws, new_xyz.data(), numPoints * sizeof(glm::vec3));
+                    std::memcpy(sh_coeffs, new_sh.data(), kNumSH * numPoints * sizeof(glm::vec3));
+                    std::memcpy(rotations, new_rot.data(), numPoints * sizeof(glm::vec4));
+                    std::memcpy(scales_opacs, new_so.data(), numPoints * sizeof(glm::vec4));
+                }
+                printf("Selective plane freeze loaded: %zu / %zu anchored planar splats\n",
+                       num_anchored_splats, numPoints);
+            }
+        }
+    }
+
     buffers.reorderSH(buffers.sh_coeffs);
 
     copyToDevice(buffers.xyz_ws);
     copyToDevice(buffers.sh_coeffs);
     copyToDevice(buffers.rotations);
     copyToDevice(buffers.scales_opacs);
+    if (num_anchored_splats > 0) {
+        resizeDeviceBuffer(anchored_xyz_ws, 3 * num_anchored_splats);
+    }
 
     printf("%d initial points\n", (int)numPoints);
     fflush(stdout);
@@ -788,17 +851,44 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.cy = uniforms.cy;
     for (int i = 0; i < 4; i++)
         shaderUniforms.dist_coeffs[i] = uniforms.dist_coeffs[i];
-    const bool ws_active = (config.freeze_geometry_after_iter > 0);
-    const bool freeze_geom = (ws_active && step >= config.freeze_geometry_after_iter);
-    const float progress = fminf(float(step) / float(std::max(1, config.freeze_geometry_after_iter * 2)), 1.0f);
-    const float ws_boost = ws_active ? (4.0f * powf(0.20f, progress)) : 1.0f;
-    shaderUniforms.lr_means = freeze_geom ? 0.0f : (config.get_means_lr(step, scene_scale) * ws_boost);
+    const bool freeze_active = (config.freeze_geometry_after_iter > 0 && step >= config.freeze_geometry_after_iter);
+    const bool selective_active = (freeze_active && config.selective_plane_freeze &&
+                                   num_anchored_splats > 0 && !selective_freeze_unfrozen);
+    const bool global_freeze = (freeze_active && !selective_active &&
+                                (!config.selective_plane_freeze || num_anchored_splats == 0));
+    const int boost_horizon = (config.freeze_geometry_after_iter > 0)
+        ? (config.freeze_geometry_after_iter * 2) : 600;
+    const float progress = fminf(float(step) / float(std::max(1, boost_horizon)), 1.0f);
+    const float ws_boost = config.enable_lr_boost ? (4.0f * powf(0.20f, progress)) : 1.0f;
+
+    if (selective_active && !anchored_xyz_snapshot_valid && num_anchored_splats <= num_splats) {
+        bufferMemoryBarrier({
+            { buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+        }, TRANSFER_READ);
+        VkBufferCopy snapCopy{};
+        snapCopy.srcOffset = 0;
+        snapCopy.dstOffset = 0;
+        snapCopy.size = 3 * num_anchored_splats * sizeof(float);
+        vkCmdCopyBuffer(
+            command_buffer,
+            buffers.xyz_ws.deviceBuffer.buffer,
+            anchored_xyz_ws.deviceBuffer.buffer,
+            1,
+            &snapCopy
+        );
+        bufferMemoryBarrier({
+            { anchored_xyz_ws.deviceBuffer, TRANSFER_WRITE },
+        }, TRANSFER_READ);
+        anchored_xyz_snapshot_valid = true;
+    }
+
+    shaderUniforms.lr_means = global_freeze ? 0.0f : (config.get_means_lr(step, scene_scale) * ws_boost);
     shaderUniforms.lr_quats = config.quats_lr * ws_boost;
     shaderUniforms.lr_scales = config.scales_lr * ws_boost;
     shaderUniforms.lr_opacities = config.opacities_lr * ws_boost;
     shaderUniforms.reg_scale = config.scale_reg / (3*num_splats);
     shaderUniforms.reg_opacity = config.opacity_reg / num_splats;
-    shaderUniforms.lr_sh_dc = config.features_dc_lr * (ws_active ? (4.5f * powf(0.25f, progress)) : 1.0f);
+    shaderUniforms.lr_sh_dc = config.features_dc_lr * (config.enable_lr_boost ? (4.5f * powf(0.25f, progress)) : 1.0f);
     shaderUniforms.lr_sh_rest = config.features_rest_lr * ws_boost;
     for (size_t i = 0; i < 16; i++)
         shaderUniforms.world_view_transform[i] = uniforms.world_view_transform[i];
@@ -827,6 +917,27 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2*4*alloc_size, true),
         }
     );
+
+    if (selective_active && anchored_xyz_snapshot_valid && num_anchored_splats <= num_splats) {
+        bufferMemoryBarrier({
+            { buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { anchored_xyz_ws.deviceBuffer, TRANSFER_READ },
+        }, TRANSFER_WRITE);
+        VkBufferCopy restoreCopy{};
+        restoreCopy.srcOffset = 0;
+        restoreCopy.dstOffset = 0;
+        restoreCopy.size = 3 * num_anchored_splats * sizeof(float);
+        vkCmdCopyBuffer(
+            command_buffer,
+            anchored_xyz_ws.deviceBuffer.buffer,
+            buffers.xyz_ws.deviceBuffer.buffer,
+            1,
+            &restoreCopy
+        );
+        bufferMemoryBarrier({
+            { buffers.xyz_ws.deviceBuffer, TRANSFER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+    }
 }
 
 
@@ -881,8 +992,11 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         config.pause_refine_after_reset :
         (int32_t)dataset_train.size() + uniforms.refine_every;
 
-    if (step >= uniforms.refine_stop_iter ||
-        (config.freeze_geometry_after_iter > 0 && step >= config.freeze_geometry_after_iter))
+    const bool freeze_active = (config.freeze_geometry_after_iter > 0 &&
+                                step >= config.freeze_geometry_after_iter);
+    const bool selective_active = (freeze_active && config.selective_plane_freeze &&
+                                   num_anchored_splats > 0 && !selective_freeze_unfrozen);
+    if (step >= uniforms.refine_stop_iter || (freeze_active && !selective_active))
         return;
 
     bufferMemoryBarrier({
@@ -909,7 +1023,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         { buffers.default_radii.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ);
 
-    const bool freeze_prune_step = (config.freeze_geometry_after_iter > 0 &&
+    const bool freeze_prune_step = (config.enable_pre_freeze_prune &&
+                                    config.freeze_geometry_after_iter > 0 &&
                                     step == config.freeze_geometry_after_iter - 1);
     if ((step > uniforms.refine_start_iter
          && step % uniforms.refine_every == 0
@@ -932,10 +1047,25 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     resizeDeviceBuffer(buffers.default_split_mask, num_splats),
                 }
             );
-            bufferMemoryBarrier({
-                { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
-                { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
-            }, COMPUTE_SHADER_READ);
+            if (selective_active && num_anchored_splats <= num_splats) {
+                bufferMemoryBarrier({
+                    { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                    { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                }, TRANSFER_WRITE);
+                vkCmdFillBuffer(command_buffer, buffers.default_dupli_mask.deviceBuffer.buffer,
+                                0, num_anchored_splats * sizeof(int32_t), 0u);
+                vkCmdFillBuffer(command_buffer, buffers.default_split_mask.deviceBuffer.buffer,
+                                0, num_anchored_splats * sizeof(int32_t), 0u);
+                bufferMemoryBarrier({
+                    { buffers.default_dupli_mask.deviceBuffer, TRANSFER_WRITE },
+                    { buffers.default_split_mask.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ);
+            } else {
+                bufferMemoryBarrier({
+                    { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                    { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                }, COMPUTE_SHADER_READ);
+            }
 
             num_dupli = executeSum(buffers, buffers.default_dupli_mask);
             num_split = executeSum(buffers, buffers.default_split_mask);
@@ -1034,15 +1164,36 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 resizeDeviceBuffer(buffers.default_keep_mask, num_splats),
             }
         );
-        bufferMemoryBarrier({
-            { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
-        }, COMPUTE_SHADER_READ);
+        if (selective_active && num_anchored_splats <= num_splats) {
+            bufferMemoryBarrier({
+                { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_WRITE);
+            vkCmdFillBuffer(command_buffer, buffers.default_keep_mask.deviceBuffer.buffer,
+                            0, num_anchored_splats * sizeof(int32_t), 1u);
+            bufferMemoryBarrier({
+                { buffers.default_keep_mask.deviceBuffer, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ);
+        } else {
+            bufferMemoryBarrier({
+                { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, COMPUTE_SHADER_READ);
+        }
 
         int num_keep = executeSum(buffers, buffers.default_keep_mask);
         int num_prune = (int)num_splats - num_keep;
 
         if (num_prune > 0) {
             executeCumsum(buffers, buffers.default_keep_mask, buffers._temp_indices);
+            if (!selective_active && config.selective_plane_freeze &&
+                num_anchored_splats > 0 && num_anchored_splats <= num_splats) {
+                if (commandBatchInProgress) bufferMemoryBarrier({
+                    { buffers._temp_indices.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+                }, TRANSFER_READ);
+                int surviving_anchored = readElement<int32_t>(
+                    buffers._temp_indices.deviceBuffer, num_anchored_splats - 1
+                );
+                num_anchored_splats = std::max(0, surviving_anchored);
+            }
             
             enum PruneType {
                 Default, Sh, Mean
@@ -1137,7 +1288,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     }
 
   #if 1
-    if (step % config.refine_every == 0) {
+    if (step % config.refine_every == 0 && !(config.selective_plane_freeze && num_anchored_splats > 0)) {
         executeMortonSorting(renderer_uniforms, buffers);
     }
   #endif

@@ -40,7 +40,15 @@ def main():
     p.add_argument("--surface-mode",choices=("isotropic","aligned","random_anisotropic"),default="isotropic")
     p.add_argument("--normal-scale-ratio",type=float,default=0.25)
     p.add_argument("--freeze-geometry-after",type=int,default=0,
-                   help="Step (>0) after which 3D mean/quat/scale updates and densification freeze")
+                   help="Step (>0) after which 3D mean updates and densification freeze")
+    p.add_argument("--enable-lr-boost",action="store_true",
+                   help="Enable decoupled work-saving LR boost schedule")
+    p.add_argument("--max-sh-degree",type=int,default=-1,
+                   help="Override maximum active SH degree (0..3, -1 for standard schedule)")
+    p.add_argument("--enable-pre-freeze-prune",action="store_true",
+                   help="Run low-opacity compaction at freeze_geometry_after - 1")
+    p.add_argument("--selective-plane-freeze",action="store_true",
+                   help="Freeze only Gaussians in plane_group_ids.bin while keeping non-planar objects trainable")
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
     args=p.parse_args()
@@ -78,6 +86,10 @@ def main():
     cfg.init_surface_mode={"isotropic":0,"aligned":1,"random_anisotropic":2}[args.surface_mode]
     cfg.init_normal_scale_ratio=args.normal_scale_ratio
     cfg.freeze_geometry_after_iter=args.freeze_geometry_after
+    cfg.enable_lr_boost=bool(args.enable_lr_boost)
+    cfg.max_sh_degree_override=int(args.max_sh_degree)
+    cfg.enable_pre_freeze_prune=bool(args.enable_pre_freeze_prune)
+    cfg.selective_plane_freeze=bool(args.selective_plane_freeze)
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
     if args.refine_start is not None:
@@ -122,7 +134,11 @@ def main():
               "surface_mode":args.surface_mode,
               "normal_scale_ratio":args.normal_scale_ratio,
               "freeze_geometry_after_iter":cfg.freeze_geometry_after_iter,
-              "quality_scope":"photometric_only"}
+              "enable_lr_boost":cfg.enable_lr_boost,
+              "max_sh_degree_override":cfg.max_sh_degree_override,
+              "enable_pre_freeze_prune":cfg.enable_pre_freeze_prune,
+              "selective_plane_freeze":cfg.selective_plane_freeze,
+              "quality_scope":"photometric_and_metric_geometry"}
     (output/"sceneweave_run_manifest.json").write_text(json.dumps(metadata,indent=2)+"\n")
     print("Baseline manifest:",output/"sceneweave_run_manifest.json",flush=True)
     train_main(cfg)
