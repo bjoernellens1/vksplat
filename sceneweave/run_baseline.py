@@ -39,11 +39,15 @@ def main():
                    help="Metric-world scale for appended Gaussians in controlled-init mode")
     p.add_argument("--surface-mode",choices=("isotropic","aligned","random_anisotropic"),default="isotropic")
     p.add_argument("--normal-scale-ratio",type=float,default=0.25)
+    p.add_argument("--freeze-geometry-after",type=int,default=0,
+                   help="Step (>0) after which 3D mean/quat/scale updates and densification freeze")
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
     args=p.parse_args()
     if args.steps<=0 or args.max_steps<=0 or args.cap_max<=0:
         p.error("steps and cap-max must be positive")
+    if args.freeze_geometry_after<0:
+        p.error("--freeze-geometry-after must be non-negative")
     if args.controlled_init and not (0 < args.added_scale_m < 10):
         p.error("--added-scale-m must be positive and finite")
     if not 0 < args.normal_scale_ratio <= 1:
@@ -73,6 +77,7 @@ def main():
         enable_viewer=False,save_train_renders=False)
     cfg.init_surface_mode={"isotropic":0,"aligned":1,"random_anisotropic":2}[args.surface_mode]
     cfg.init_normal_scale_ratio=args.normal_scale_ratio
+    cfg.freeze_geometry_after_iter=args.freeze_geometry_after
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
     if args.refine_start is not None:
@@ -116,6 +121,7 @@ def main():
               "shuffle_seed":cfg.shuffle_seed,
               "surface_mode":args.surface_mode,
               "normal_scale_ratio":args.normal_scale_ratio,
+              "freeze_geometry_after_iter":cfg.freeze_geometry_after_iter,
               "quality_scope":"photometric_only"}
     (output/"sceneweave_run_manifest.json").write_text(json.dumps(metadata,indent=2)+"\n")
     print("Baseline manifest:",output/"sceneweave_run_manifest.json",flush=True)

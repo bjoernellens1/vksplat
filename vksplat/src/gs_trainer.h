@@ -38,6 +38,9 @@ struct TrainerConfig {
     // 2 random orientation + identical anisotropic scales (capacity control).
     int init_surface_mode = 0;
     float init_normal_scale_ratio = 0.25f;
+    // >0 freezes 3D mean/rotation/scale updates and post-backward densification
+    // once step >= freeze_geometry_after_iter.
+    int freeze_geometry_after_iter = 0;
 
     enum class Strategy {
         Default, MCMC,

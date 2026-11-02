@@ -600,7 +600,7 @@ void VulkanGSTrainer::load_colmap_dataset(
         // quat = glm::vec4(1, 0, 0, 0);  // per Inria
         // Anisotropic control: identical eigenvalues, different rotation only.
         float scale=config.init_scale * dist_avg[pointIdx];
-        float opac=config.init_opacity;
+        float opac=(config.freeze_geometry_after_iter > 0) ? 0.50f : config.init_opacity;
         glm::vec3 radii(scale);
         if (config.init_surface_mode != 0 &&
             pointIdx<knn_count && normals_valid[pointIdx]) {
@@ -788,14 +788,18 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.cy = uniforms.cy;
     for (int i = 0; i < 4; i++)
         shaderUniforms.dist_coeffs[i] = uniforms.dist_coeffs[i];
-    shaderUniforms.lr_means = config.get_means_lr(step, scene_scale);
-    shaderUniforms.lr_quats = config.quats_lr;
-    shaderUniforms.lr_scales = config.scales_lr;
-    shaderUniforms.lr_opacities = config.opacities_lr;
+    const bool ws_active = (config.freeze_geometry_after_iter > 0);
+    const bool freeze_geom = (ws_active && step >= config.freeze_geometry_after_iter);
+    const float progress = fminf(float(step) / float(std::max(1, config.freeze_geometry_after_iter * 2)), 1.0f);
+    const float ws_boost = ws_active ? (4.0f * powf(0.20f, progress)) : 1.0f;
+    shaderUniforms.lr_means = freeze_geom ? 0.0f : (config.get_means_lr(step, scene_scale) * ws_boost);
+    shaderUniforms.lr_quats = config.quats_lr * ws_boost;
+    shaderUniforms.lr_scales = config.scales_lr * ws_boost;
+    shaderUniforms.lr_opacities = config.opacities_lr * ws_boost;
     shaderUniforms.reg_scale = config.scale_reg / (3*num_splats);
     shaderUniforms.reg_opacity = config.opacity_reg / num_splats;
-    shaderUniforms.lr_sh_dc = config.features_dc_lr;
-    shaderUniforms.lr_sh_rest = config.features_rest_lr;
+    shaderUniforms.lr_sh_dc = config.features_dc_lr * (ws_active ? (4.5f * powf(0.25f, progress)) : 1.0f);
+    shaderUniforms.lr_sh_rest = config.features_rest_lr * ws_boost;
     for (size_t i = 0; i < 16; i++)
         shaderUniforms.world_view_transform[i] = uniforms.world_view_transform[i];
 
@@ -877,7 +881,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         config.pause_refine_after_reset :
         (int32_t)dataset_train.size() + uniforms.refine_every;
 
-    if (step >= uniforms.refine_stop_iter)
+    if (step >= uniforms.refine_stop_iter ||
+        (config.freeze_geometry_after_iter > 0 && step >= config.freeze_geometry_after_iter))
         return;
 
     bufferMemoryBarrier({
@@ -904,31 +909,37 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         { buffers.default_radii.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ);
 
-    if (step > uniforms.refine_start_iter
-        && step % uniforms.refine_every == 0
-        && (step % uniforms.reset_every >= uniforms.pause_refine_after_reset)
+    const bool freeze_prune_step = (config.freeze_geometry_after_iter > 0 &&
+                                    step == config.freeze_geometry_after_iter - 1);
+    if ((step > uniforms.refine_start_iter
+         && step % uniforms.refine_every == 0
+         && (step % uniforms.reset_every >= uniforms.pause_refine_after_reset))
+        || freeze_prune_step
     ) {
-        // grow GS
+        // grow GS (skip growth on the pre-freeze compaction step)
+        int num_dupli = 0;
+        int num_split = 0;
+        if (!freeze_prune_step) {
+            executeCompute(
+                {{num_splats, 256}},
+                &uniforms, sizeof(uniforms),
+                pipeline_default.compute_grow_mask,
+                {
+                    buffers.default_grad.deviceBuffer,
+                    buffers.default_radii.deviceBuffer,
+                    buffers.scales_opacs.deviceBuffer,
+                    resizeDeviceBuffer(buffers.default_dupli_mask, num_splats),
+                    resizeDeviceBuffer(buffers.default_split_mask, num_splats),
+                }
+            );
+            bufferMemoryBarrier({
+                { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, COMPUTE_SHADER_READ);
 
-        executeCompute(
-            {{num_splats, 256}},
-            &uniforms, sizeof(uniforms),
-            pipeline_default.compute_grow_mask,
-            {
-                buffers.default_grad.deviceBuffer,
-                buffers.default_radii.deviceBuffer,
-                buffers.scales_opacs.deviceBuffer,
-                resizeDeviceBuffer(buffers.default_dupli_mask, num_splats),
-                resizeDeviceBuffer(buffers.default_split_mask, num_splats),
-            }
-        );
-        bufferMemoryBarrier({
-            { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
-            { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
-        }, COMPUTE_SHADER_READ);
-
-        int num_dupli = executeSum(buffers, buffers.default_dupli_mask);
-        int num_split = executeSum(buffers, buffers.default_split_mask);
+            num_dupli = executeSum(buffers, buffers.default_dupli_mask);
+            num_split = executeSum(buffers, buffers.default_split_mask);
+        }
 
         if (num_dupli + num_split > 0) {
             size_t new_num_splats = num_splats + num_dupli + num_split;

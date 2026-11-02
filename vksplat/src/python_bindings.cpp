@@ -177,6 +177,8 @@ public:
             ? train_config["init_surface_mode"].cast<int>() : 0;
         config.init_normal_scale_ratio = train_config.contains(py::str("init_normal_scale_ratio"))
             ? train_config["init_normal_scale_ratio"].cast<float>() : 0.25f;
+        config.freeze_geometry_after_iter = train_config.contains(py::str("freeze_geometry_after_iter"))
+            ? train_config["freeze_geometry_after_iter"].cast<int>() : 0;
 
         std::string strategy = train_config["strategy"].cast<std::string>();
         if (strategy == "default")
@@ -541,7 +543,9 @@ public:
     void train_step(size_t train_idx, int step) {
         set_train_image(train_idx);
         const int kShDegreeInterval = 1000;
-        uniforms.active_sh = std::min(step / kShDegreeInterval, 3);
+        uniforms.active_sh = (config.freeze_geometry_after_iter > 0)
+            ? 0
+            : std::min(step / kShDegreeInterval, 3);
         uniforms.step = step;
 
         auto deviceGuard = DeviceGuard(&trainer);
