@@ -388,17 +388,19 @@ def main() -> None:
             elif cond in ("work_saving_freeze", "work_saving_selective"):
                 c_steps = treat_steps
                 f_iter = freeze_step
-                init_opa = 0.5
-                lr_boost = True
-                max_sh = 0
+                init_opa = 0.1
+                lr_boost = False
+                max_sh = -1
                 pre_prune = True
                 sel_freeze = True
             elif cond == "work_saving_quality_matched":
                 c_steps = int(args.quality_matched_steps)
-                f_iter = freeze_step
-                init_opa = 0.5
-                lr_boost = True
-                max_sh = 0
+                f_iter = max(freeze_step, int(round(0.65 * c_steps)))
+                if f_iter > 500 and (f_iter % 300) < 50:
+                    f_iter += 50 - (f_iter % 300)
+                init_opa = 0.1
+                lr_boost = False
+                max_sh = -1
                 pre_prune = True
                 sel_freeze = True
             else:

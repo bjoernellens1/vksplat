@@ -659,6 +659,30 @@ void VulkanGSTrainer::load_colmap_dataset(
                 }
                 num_anchored_splats = anchored_idx.size();
                 if (num_anchored_splats > 0 && num_anchored_splats < numPoints) {
+                    glm::vec3 bmin(1e30f), bmax(-1e30f);
+                    for (size_t i = 0; i < numPoints; ++i) {
+                        bmin = glm::min(bmin, xyz_ws[i]);
+                        bmax = glm::max(bmax, xyz_ws[i]);
+                    }
+                    glm::vec3 bspan = glm::max(bmax - bmin, glm::vec3(1e-6f));
+                    auto expandBits10 = [](uint32_t v) -> uint32_t {
+                        v = (v * 0x00010001u) & 0xFF0000FFu;
+                        v = (v * 0x00000101u) & 0x0F00F00Fu;
+                        v = (v * 0x00000011u) & 0xC30C30C3u;
+                        v = (v * 0x00000005u) & 0x49249249u;
+                        return v;
+                    };
+                    auto mortonKey = [&](size_t idx) -> uint32_t {
+                        glm::vec3 u = glm::clamp((xyz_ws[idx] - bmin) / bspan, 0.0f, 1.0f);
+                        uint32_t qx = std::min(1023u, static_cast<uint32_t>(u.x * 1024.0f));
+                        uint32_t qy = std::min(1023u, static_cast<uint32_t>(u.y * 1024.0f));
+                        uint32_t qz = std::min(1023u, static_cast<uint32_t>(u.z * 1024.0f));
+                        return (expandBits10(qx) << 2) | (expandBits10(qy) << 1) | expandBits10(qz);
+                    };
+                    std::stable_sort(anchored_idx.begin(), anchored_idx.end(),
+                                     [&](size_t a, size_t b) { return mortonKey(a) < mortonKey(b); });
+                    std::stable_sort(unanchored_idx.begin(), unanchored_idx.end(),
+                                     [&](size_t a, size_t b) { return mortonKey(a) < mortonKey(b); });
                     std::vector<size_t> perm;
                     perm.reserve(numPoints);
                     perm.insert(perm.end(), anchored_idx.begin(), anchored_idx.end());
