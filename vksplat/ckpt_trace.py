@@ -124,6 +124,18 @@ class HwmonSampler:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _active_sclk(hwmon_dir):
+        """Active shader clock (MHz) from the pp_dpm_sclk line marked '*'; None if unavailable."""
+        text = _read(hwmon_dir + "../../pp_dpm_sclk")
+        for line in (text or "").splitlines():
+            if line.rstrip().endswith("*"):
+                try:
+                    return float(line.split(":")[1].strip().split("M")[0])
+                except (IndexError, ValueError):
+                    return None
+        return None
+
     def _run(self):
         while not self._stop.is_set():
             for d in self._dirs:
@@ -133,6 +145,7 @@ class HwmonSampler:
                 self.samples.append({
                     "t_s": perf_counter() - self._t0, "hwmon": d,
                     "power_w": power, "temp_c": self._val(d + "temp1_input", 1e3),
+                    "sclk_mhz": self._active_sclk(d),
                 })
             self._stop.wait(self.interval_s)
 
