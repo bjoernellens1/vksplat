@@ -766,4 +766,6 @@ struct Uniforms {
     float cy;
     float4 dist_coeffs;
     float4x4 world_view_transform;
+    uint render_depth;  // host-side pipeline selector (rasterize_forward vs rasterize_forward_depth); unused by shaders
+    uint frozen_prefix;  // per-splat rasterizer backward only: splats [0, frozen_prefix) get no gradient math/atomics
 }

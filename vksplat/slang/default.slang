@@ -39,6 +39,7 @@ struct Uniforms {
     int32_t reset_every;
     int32_t refine_every;
     int32_t pause_refine_after_reset;
+    uint32_t first_active;  // splats [0, first_active) are frozen (opacity reset skips them)
 };
 
 
@@ -417,7 +418,7 @@ void resetOpacity(
     uniform Uniforms uniforms
 ) {
     const uint32_t num_splats = uniforms.num_splats;
-    const uint32_t gid = thread_id.x;
+    const uint32_t gid = thread_id.x + uniforms.first_active;
     if (gid >= num_splats)
         return;
 

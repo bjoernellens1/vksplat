@@ -18,7 +18,9 @@ from time import perf_counter
 import numpy as np
 
 # Config keys that do not affect the experiment (volatile paths / bookkeeping).
-_HASH_EXCLUDE = ("output_dir", "output_ply", "ckpt_dir", "gates_json")
+_HASH_EXCLUDE = ("output_dir", "output_ply", "ckpt_dir", "gates_json", "ckpt_depth", "ckpt_depth_min_alpha")
+# Knobs added after configs were first hashed: omitted at their default so older configs keep their hash.
+_HASH_OMIT_AT_DEFAULT = {"freeze_prefix_count": 0, "pin_raster_backward_per_splat": False}
 
 
 def log_spaced_steps(total_steps, n=25):
@@ -38,7 +40,8 @@ def sha256_file(path):
 
 
 def config_hash(cfg):
-    d = {k: v for k, v in asdict(cfg).items() if k not in _HASH_EXCLUDE}
+    d = {k: v for k, v in asdict(cfg).items()
+         if k not in _HASH_EXCLUDE and not (k in _HASH_OMIT_AT_DEFAULT and v == _HASH_OMIT_AT_DEFAULT[k])}
     return hashlib.sha256(json.dumps(d, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -161,6 +164,39 @@ class HwmonSampler:
         return self.samples
 
 
+def depth_from_render(pixel_state, pixel_depth, min_alpha=0.5):
+    """Expected camera-space Z-depth and accumulated alpha from a depth-enabled render.
+
+    pixel_depth = sum_i w_i z_i with w_i = T_i * alpha_i, and sum_i w_i = 1 - T_final = alpha.
+    Expected depth = pixel_depth / alpha, NaN where alpha < min_alpha (including empty pixels).
+    z is the view-space Z coordinate (distance along the optical axis, NOT Euclidean ray range);
+    use z_to_ray_range() to convert if the reference depth is a ray distance.
+
+    pixel_depth is only written by renders made with depth on (render_val/render_train(idx, True)); after a
+    depth-off render or a train_step it still holds the last depth render (stale), so always render with depth
+    immediately before reading it.
+    """
+    alpha = 1.0 - np.asarray(pixel_state[:, :, 3], dtype=np.float32)
+    d = np.asarray(pixel_depth[:, :, 0], dtype=np.float32)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        depth = np.where(alpha >= min_alpha, d / alpha, np.nan).astype(np.float32)
+    return depth, alpha
+
+
+def z_to_ray_range(depth_z, fx, fy, cx, cy):
+    """Convert pinhole Z-depth (H, W) to Euclidean distance along each pixel ray.
+
+    Rays go through pixel centers (+0.5), whereas the rasterizer evaluates each Gaussian at integer pixel
+    coordinates. The half-pixel shift changes the ray-range factor sqrt(1 + u^2 + v^2) by at most ~1e-3 relative at
+    the image corner for typical cameras (6e-4 for f=500 at 1280 px, 1.1e-3 for f=300 at 640 px) and ~0 at the center;
+    it is larger only for tiny images (6e-3 for f=60 at 64 px).
+    """
+    h, w = depth_z.shape
+    u = (np.arange(w, dtype=np.float32) + 0.5 - cx) / fx
+    v = (np.arange(h, dtype=np.float32) + 0.5 - cy) / fy
+    return depth_z * np.sqrt(1.0 + u[None, :] ** 2 + v[:, None] ** 2)
+
+
 def _gpu_seconds(breakdown):
     return {k: float(dt) for k, (n, dt) in breakdown.items()}
 
@@ -189,8 +225,13 @@ class CheckpointRecorder:
             tag = f"ckpt_{n_done:06d}"
             renders = {}
             for i in range(m.num_val):
-                m.render_val(i)
-                renders[f"val_{i:05d}"] = np.ascontiguousarray(m.pixel_state[:, :, :3], dtype=dtype)
+                m.render_val(i, self.cfg.ckpt_depth)
+                state = m.pixel_state
+                renders[f"val_{i:05d}"] = np.ascontiguousarray(state[:, :, :3], dtype=dtype)
+                if self.cfg.ckpt_depth:
+                    depth, alpha = depth_from_render(state, m.pixel_depth, self.cfg.ckpt_depth_min_alpha)
+                    renders[f"depth_{i:05d}"] = depth.astype(np.float16)
+                    renders[f"alpha_{i:05d}"] = alpha.astype(np.float16)
             renders_path = os.path.join(self.ckpt_dir, tag + "_renders.npz")
             np.savez(renders_path, **renders)
 

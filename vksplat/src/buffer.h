@@ -106,6 +106,7 @@ struct VulkanGSPipelineBuffers {
     // pixels
     Buffer<float> pixel_state;  // (H, W, 4)
     Buffer<int32_t> n_contributors;  // (H, W, 1)
+    Buffer<float> pixel_depth;  // (H, W, 1) sum T*alpha*z, written only by depth renders (stale otherwise)
 
     // rasterization v_outputs
     Buffer<float> ssim_map;  // (H, W, 3, 4)

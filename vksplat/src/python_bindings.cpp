@@ -92,6 +92,7 @@ public:
             "generate_keys",
             "compute_tile_ranges",
             "rasterize_forward",
+            "rasterize_forward_depth",
             "rasterize_backward_0",
             "rasterize_backward_1",
             "rasterize_backward_2",
@@ -191,6 +192,10 @@ public:
             ? train_config["enable_pre_freeze_prune"].cast<bool>() : false;
         config.selective_plane_freeze = train_config.contains(py::str("selective_plane_freeze"))
             ? train_config["selective_plane_freeze"].cast<bool>() : false;
+        config.freeze_prefix_count = train_config.contains(py::str("freeze_prefix_count"))
+            ? train_config["freeze_prefix_count"].cast<int>() : 0;
+        config.pin_raster_backward_per_splat = train_config.contains(py::str("pin_raster_backward_per_splat"))
+            ? train_config["pin_raster_backward_per_splat"].cast<bool>() : false;
         config.unfreeze_loss_spike_ratio = train_config.contains(py::str("unfreeze_loss_spike_ratio"))
             ? train_config["unfreeze_loss_spike_ratio"].cast<float>() : 1.35f;
 
@@ -557,6 +562,8 @@ public:
 
     void train_step(size_t train_idx, int step) {
         set_train_image(train_idx);
+        uniforms.render_depth = 0;
+        uniforms.frozen_prefix = (uint32_t)config.freeze_prefix_count;
         const int kShDegreeInterval = 1000;
         uniforms.active_sh = (config.max_sh_degree_override >= 0)
             ? std::min(step / kShDegreeInterval, config.max_sh_degree_override)
@@ -574,14 +581,27 @@ public:
 
     }
 
-    void render_train(size_t idx) {
+    // Sets uniforms.render_depth for one render and restores 0 even if forward() throws.
+    struct DepthFlagGuard {
+        VulkanGSRendererUniforms &u;
+        DepthFlagGuard(VulkanGSRendererUniforms &u, bool on) : u(u) { u.render_depth = on; }
+        ~DepthFlagGuard() { u.render_depth = 0; }
+    };
+
+    void render_train(size_t idx, bool with_depth) {
         trainer.get_train_camera(idx, uniforms);
+        DepthFlagGuard guard(uniforms, with_depth);
         forward();
     }
 
-    void render_val(size_t idx) {
+    void render_val(size_t idx, bool with_depth) {
         trainer.get_val_camera(idx, uniforms);
+        DepthFlagGuard guard(uniforms, with_depth);
         forward();
+    }
+
+    std::string get_raster_backward_impl() {
+        return trainer.raster_backward_impl_name;
     }
 
     size_t get_vram_usage() {
@@ -629,6 +649,7 @@ public:
 
 PYBIND11_MODULE(vksplat, m) {
     m.doc() = "Vulkan Gaussian Rasterization Python Bindings";
+    m.attr("SH_REORDER_SIZE") = (int)SH_REORDER_SIZE;  // freeze_prefix_count must be a multiple of this
     
     py::class_<VkSplat>(m, "VkSplat")
         .def(py::init<>())
@@ -664,12 +685,16 @@ PYBIND11_MODULE(vksplat, m) {
         .def("compute_pixel_loss_grad", &VkSplat::compute_pixel_loss_grad, "Execute compute gradient of pixel loss")
         .def("set_train_image", &VkSplat::set_train_image, "Train on the give image for one step.")
         .def("train_step", &VkSplat::train_step, "Train on the give image for one step.")
-        .def("render_train", &VkSplat::render_train, "Render the train camera pose to buffer.")
-        .def("render_val", &VkSplat::render_val, "Render the eval camera pose to buffer.")
+        .def("render_train", &VkSplat::render_train, "Render the train camera pose to buffer; with_depth also fills pixel_depth.",
+             py::arg("idx"), py::arg("with_depth") = false)
+        .def("render_val", &VkSplat::render_val, "Render the eval camera pose to buffer; with_depth also fills pixel_depth (sum T*alpha*z).",
+             py::arg("idx"), py::arg("with_depth") = false)
         .def("post_backward_step", &VkSplat::post_backward_step,
              "Run this after each step for densification.")
         .def("get_vram_usage", &VkSplat::get_vram_usage, "Get VRAM Usage")
         .def("get_peak_vram_usage", &VkSplat::get_peak_vram_usage, "Get peak VRAM Usage")
+        .def("get_raster_backward_impl", &VkSplat::get_raster_backward_impl,
+             "Rasterizer-backward implementation used by the most recent backward pass (empty before the first)")
         .def("get_timing_breakdown", &VkSplat::get_timing_breakdown, "Get timing for each step since start")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file")
@@ -694,8 +719,13 @@ PYBIND11_MODULE(vksplat, m) {
         .DEF_BUFFER_ARRAY(tile_ranges, int32_t, 2)
         .DEF_BUFFER_ARRAY(pixel_state, float, self.uniforms.image_width, 4)
         .DEF_BUFFER_ARRAY(n_contributors, int32_t, self.uniforms.image_width, 1)
+        .DEF_BUFFER_ARRAY(pixel_depth, float, self.uniforms.image_width, 1)
         .DEF_BUFFER_ARRAY(ssim_map, float, self.uniforms.image_width, 12)
         .DEF_BUFFER_ARRAY(v_pixel_state, float, self.uniforms.image_width, 4)
+        // Adam moments, layout (N, [first, second], components); read-only
+        .DEF_BUFFER(g_xyz_ws, float, 2, 3)
+        .DEF_BUFFER(g_rotations, float, 2, 4)
+        .DEF_BUFFER(g_scales_opacs, float, 2, 4)
         .DEF_BUFFER_ARRAY(v_xy_vs, float, 2)
         .DEF_BUFFER_ARRAY(v_depths, float, 1)
         .DEF_BUFFER_ARRAY(v_inv_cov_vs_opacity, float, 4)

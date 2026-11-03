@@ -89,11 +89,15 @@ void main(
         // thread 0 loads last splat, thread 1 loads second last, ...
         int32_t splat_id = -1;
         Splat_2D_AlphaBlend splat;
+        // Frozen splats still take part in the pixel-state undo/update recursion below (they are composited),
+        // but need no splat gradient.
+        bool splat_frozen = false;
         int32_t progress = batch_idx * SPLAT_BATCH_SIZE + thread_rank;
         int32_t splat_gid = tile_idx_end - progress - 1;
         int32_t splat_tid = splat_gid - tile_idx_start;
         if (active & (splat_tid >= 0)) {
             splat_id = sorted_gauss_idx[splat_gid];
+            splat_frozen = uint32_t(splat_id) < uniforms.frozen_prefix;
             splat = load_splat_alphablend(splat_id, xy_vs, inv_cov_vs_opacity, rgb);
         }
 
@@ -173,11 +177,13 @@ void main(
             bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
             v_pixel_state[pix_rank] = dp_current_pixel_state.d;
 
-            DifferentialPair<Splat_2D_AlphaBlend> dp_g = diffPair(splat);
-            bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
-            v_xy_vs += dp_g.d.xy_vs;
-            v_inv_cov_vs_opacity += dp_g.d.inv_cov_vs_opacity;
-            v_rgb += dp_g.d.rgb;
+            if (!splat_frozen) {
+                DifferentialPair<Splat_2D_AlphaBlend> dp_g = diffPair(splat);
+                bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
+                v_xy_vs += dp_g.d.xy_vs;
+                v_inv_cov_vs_opacity += dp_g.d.inv_cov_vs_opacity;
+                v_rgb += dp_g.d.rgb;
+            }
         }
 
       #if USE_EMULATED_F32_ATOMIC
@@ -187,7 +193,7 @@ void main(
         #define _ATOMIC_ADD(buffer, address, value) \
             if (value != 0.0) buffer.InterlockedAddF32((address)*sizeof(float), value);
       #endif
-        if (active) {
+        if (active && !splat_frozen) {
             _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+0, v_xy_vs.x);
             _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+1, v_xy_vs.y);
             _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+0, v_inv_cov_vs_opacity.x);

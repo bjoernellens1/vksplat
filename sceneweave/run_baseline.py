@@ -50,6 +50,9 @@ def main():
                    help="Run low-opacity compaction at freeze_geometry_after - 1")
     p.add_argument("--selective-plane-freeze",action="store_true",
                    help="Freeze only Gaussians in plane_group_ids.bin while keeping non-planar objects trainable")
+    p.add_argument("--freeze-prefix-count",type=int,default=0,
+                   help="Fully freeze splats [0,F) (multiple of 32): rendered but skipped by the optimizer, never densified/reset/re-sorted")
+    p.add_argument("--ckpt-depth",action="store_true",help="Also save expected-depth + alpha maps at checkpoints")
     p.add_argument("--shuffle-seed",type=int,default=None,
                    help="Deterministic RGB order; defaults to 42 in controlled mode")
     p.add_argument("--seed",type=int,default=42,help="C++ RNG seed")
@@ -60,6 +63,10 @@ def main():
     args=p.parse_args()
     if args.steps<=0 or args.max_steps<=0 or args.cap_max<=0:
         p.error("steps and cap-max must be positive")
+    if args.freeze_prefix_count<0 or args.freeze_prefix_count%32:
+        p.error("--freeze-prefix-count must be a non-negative multiple of 32")
+    if args.freeze_prefix_count and (args.strategy=="mcmc" or args.selective_plane_freeze):
+        p.error("--freeze-prefix-count requires the default strategy and no --selective-plane-freeze")
     if args.freeze_geometry_after<0:
         p.error("--freeze-geometry-after must be non-negative")
     if args.controlled_init and not (0 < args.added_scale_m < 10):
@@ -103,6 +110,8 @@ def main():
     cfg.max_sh_degree_override=int(args.max_sh_degree)
     cfg.enable_pre_freeze_prune=bool(args.enable_pre_freeze_prune)
     cfg.selective_plane_freeze=bool(args.selective_plane_freeze)
+    cfg.freeze_prefix_count=args.freeze_prefix_count
+    cfg.ckpt_depth=bool(args.ckpt_depth)
     if args.strategy=="mcmc":
         cfg.cap_max=args.cap_max
     if args.refine_start is not None:
@@ -151,6 +160,7 @@ def main():
               "max_sh_degree_override":cfg.max_sh_degree_override,
               "enable_pre_freeze_prune":cfg.enable_pre_freeze_prune,
               "selective_plane_freeze":cfg.selective_plane_freeze,
+              "freeze_prefix_count":cfg.freeze_prefix_count,
               "quality_scope":"photometric_and_metric_geometry"}
     (output/"sceneweave_run_manifest.json").write_text(json.dumps(metadata,indent=2)+"\n")
     print("Baseline manifest:",output/"sceneweave_run_manifest.json",flush=True)

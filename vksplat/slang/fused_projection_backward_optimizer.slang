@@ -69,6 +69,7 @@ struct ShaderUniforms {
     float lr_sh_dc;
     float lr_sh_rest;
     float4x4 world_view_transform;
+    uint32_t first_active;  // splats [0, first_active) are frozen and never dispatched
 };
 
 
@@ -87,7 +88,7 @@ void main(
     const uint image_width = uniforms.image_size & ((1 << 16) - 1);
     const float4x4 world_view_transform = (uniforms.world_view_transform);
 
-    uint g_idx = dispatchThreadID.x;
+    uint g_idx = dispatchThreadID.x + uniforms.first_active;
     
     if (g_idx >= uniforms.num_splats)
         return;

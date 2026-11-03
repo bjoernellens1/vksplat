@@ -60,6 +60,7 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
     for (int i = 0; i < 2; ++i) {
         createComputePipeline(pipeline_compute_tile_ranges[i], spirv_paths.at("compute_tile_ranges"));
         createComputePipeline(pipeline_rasterize_forward[i], spirv_paths.at("rasterize_forward"));
+        createComputePipeline(pipeline_rasterize_forward_depth[i], spirv_paths.at("rasterize_forward_depth"));
         createComputePipeline(pipeline_rasterize_backward[0][i], spirv_paths.at("rasterize_backward_0"));
         createComputePipeline(pipeline_rasterize_backward[1][i], spirv_paths.at("rasterize_backward_1"));
         createComputePipeline(pipeline_rasterize_backward[2][i], spirv_paths.at("rasterize_backward_2"), 35840);
@@ -205,27 +206,35 @@ void VulkanGSRenderer::executeRasterizeForward(
 
     size_t num_pixels = uniforms.image_height * uniforms.image_width;
 
-    bufferMemoryBarrier({
+    const bool with_depth = uniforms.render_depth != 0;
+    std::vector<std::pair<_VulkanBuffer, BarrierMask>> inputs = {
         { buffers.sorted_gauss_idx().deviceBuffer, COMPUTE_SHADER_WRITE },
         { buffers.tile_ranges.deviceBuffer, COMPUTE_SHADER_WRITE },
         { buffers.rgb.deviceBuffer, COMPUTE_SHADER_WRITE },
-    }, COMPUTE_SHADER_READ);
+    };
+    std::vector<_VulkanBuffer> bindings = {
+        // inputs
+        buffers.sorted_gauss_idx().deviceBuffer,
+        buffers.tile_ranges.deviceBuffer,
+        buffers.xy_vs.deviceBuffer,
+        buffers.inv_cov_vs_opacity.deviceBuffer,
+        buffers.rgb.deviceBuffer,
+        // outputs
+        resizeDeviceBuffer(buffers.pixel_state, 4*num_pixels),
+        resizeDeviceBuffer(buffers.n_contributors, num_pixels),
+    };
+    if (with_depth) {
+        inputs.push_back({ buffers.depths.deviceBuffer, COMPUTE_SHADER_WRITE });
+        bindings.push_back(buffers.depths.deviceBuffer);
+        bindings.push_back(resizeDeviceBuffer(buffers.pixel_depth, num_pixels));
+    }
+    bufferMemoryBarrier(inputs, COMPUTE_SHADER_READ);
 
     executeCompute(
         {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
         &uniforms, sizeof(uniforms),
-        pipeline_rasterize_forward[buffers.is_unsorted_1],
-        std::vector<_VulkanBuffer>({
-            // inputs
-            buffers.sorted_gauss_idx().deviceBuffer,
-            buffers.tile_ranges.deviceBuffer,
-            buffers.xy_vs.deviceBuffer,
-            buffers.inv_cov_vs_opacity.deviceBuffer,
-            buffers.rgb.deviceBuffer,
-            // outputs
-            resizeDeviceBuffer(buffers.pixel_state, 4*num_pixels),
-            resizeDeviceBuffer(buffers.n_contributors, num_pixels),
-        })
+        (with_depth ? pipeline_rasterize_forward_depth : pipeline_rasterize_forward)[buffers.is_unsorted_1],
+        bindings
     );
 
     // _displayImage(buffers.pixel_state, uniforms.image_width, true);
@@ -290,6 +299,12 @@ void VulkanGSRenderer::initRasterizationBackwardScheduler() {
     timerCallbacks.push_back(timerCallback);
 }
 
+bool VulkanGSRenderer::rasterBackwardPerSplatAvailable() {
+    initRasterizationBackwardScheduler();
+    return std::find(rasterizeBackwardAlternatives.begin(), rasterizeBackwardAlternatives.end(),
+                     RasterBackwardImpl::PerSplat) != rasterizeBackwardAlternatives.end();
+}
+
 void VulkanGSRenderer::executeRasterizeBackward(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
@@ -300,7 +315,13 @@ void VulkanGSRenderer::executeRasterizeBackward(
         using namespace PerfTimer;
         initRasterizationBackwardScheduler();
         scheduled_impl = rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
-        // scheduled_impl = RasterBackwardImpl::PerSplat;
+        // Only the per-splat variant skips gradient math for the frozen prefix; the knob also pins it at F=0
+        // so that F=0 and F>0 runs share one implementation.
+        if (pin_raster_backward_per_splat || uniforms.frozen_prefix > 0) {
+            if (!rasterBackwardPerSplatAvailable())
+                throw std::runtime_error("per-splat rasterizer backward is unavailable on this device");
+            scheduled_impl = RasterBackwardImpl::PerSplat;
+        }
         if (scheduled_impl == RasterBackwardImpl::PerPixel)
             timer = std::make_shared<Timer<_RasterizeBackwardScheduling_PerPixel>>(this);
         else if (scheduled_impl == RasterBackwardImpl::PerSplat)
@@ -315,6 +336,10 @@ void VulkanGSRenderer::executeRasterizeBackward(
     else {
         timer = std::make_shared<PerfTimer::Timer<PerfTimer::RasterizeBackward>>(this);
     }
+
+    static const char *const impl_names[] = {"PerPixel", "PerSplat", "Tensor_0_8_0", "Tensor_0_8_8", "Tensor_1_16_0"};
+    raster_backward_impl_name = scheduled_impl == RasterBackwardImpl::Default ? "PerSplat (unscheduled)"
+                                                                               : impl_names[(size_t)scheduled_impl];
 
     size_t num_elements = buffers.num_splats;
     

@@ -53,6 +53,12 @@ struct TrainerConfig {
     int max_sh_degree_override = -1;
     bool enable_pre_freeze_prune = false;
     bool selective_plane_freeze = false;
+    // Splats [0, freeze_prefix_count) are frozen: they render but are skipped by the fused
+    // optimizer (no gradients, no Adam update) and are never grown, pruned, reset or re-sorted.
+    // Must be a multiple of SH_REORDER_SIZE; Default strategy only.
+    int freeze_prefix_count = 0;
+    // Debug: use the per-splat rasterizer backward even when freeze_prefix_count == 0 (implied when it is > 0).
+    bool pin_raster_backward_per_splat = false;
     float unfreeze_loss_spike_ratio = 1.35f;
 
     enum class Strategy {

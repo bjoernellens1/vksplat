@@ -21,6 +21,8 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float cy;
     float dist_coeffs[4];
     float world_view_transform[16];
+    uint32_t render_depth = 0;
+    uint32_t frozen_prefix = 0;
 });
 
 
@@ -37,6 +39,12 @@ public:
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+
+    // Force the per-splat rasterizer backward even without a frozen prefix (same implementation for F=0 and F>0 runs).
+    bool pin_raster_backward_per_splat = false;
+    // Implementation used by the most recent executeRasterizeBackward (for logging).
+    const char *raster_backward_impl_name = "";
+    bool rasterBackwardPerSplatAvailable();
 
     void executeCalculateIndexBufferOffset(VulkanGSPipelineBuffers& buffers);
     void executeSort(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, int num_bits);
@@ -80,6 +88,7 @@ protected:
         _ComputePipeline(2)
     };
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
+    _ComputePipelinePair pipeline_rasterize_forward_depth = _ComputePipelinePair(9);  // + depths, pixel_depth
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
         _ComputePipelinePair(11),  // per pixel
         _ComputePipelinePair(11),  // per splat

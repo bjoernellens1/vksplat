@@ -54,6 +54,8 @@ class TrainerConfig:
     max_sh_degree_override: int = -1
     enable_pre_freeze_prune: bool = False
     selective_plane_freeze: bool = False
+    freeze_prefix_count: int = 0  # splats [0,F) fully frozen (no grads/Adam/densify/reset/re-sort); multiple of vksplat.SH_REORDER_SIZE; default strategy only
+    pin_raster_backward_per_splat: bool = False  # debug: per-splat raster backward even at F=0 (implied when F>0)
     unfreeze_loss_spike_ratio: float = 1.35
     shuffle_seed: Optional[int] = None  # None preserves legacy unseeded view order
     seed: int = 42  # C++ RNG (initial quaternions, densification/MCMC noise)
@@ -63,6 +65,8 @@ class TrainerConfig:
     checkpoint_steps: Optional[List[int]] = None  # numbers of completed steps; see log_spaced_steps()
     ckpt_dir: str = ""  # default: <output_dir>/ckpt
     ckpt_render_dtype: Literal['float16', 'float32'] = 'float16'
+    ckpt_depth: bool = False  # also dump held-out expected-depth maps + alpha into the renders npz
+    ckpt_depth_min_alpha: float = 0.5  # depth is NaN where accumulated alpha is below this
     gates_json: Optional[str] = None  # only hashed into manifest.json (gates_sha256)
 
     # densification strategy

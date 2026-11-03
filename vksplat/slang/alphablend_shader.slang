@@ -94,6 +94,12 @@ uint32_t computeTileOverlapBitmask(bool exact, float2 g_xy, float4 g_inv_cov_opa
 // forward
 #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
 
+// RENDER_DEPTH=1 compiles the separate rasterize_forward_depth variant (extra depth bindings, shared memory and
+// accumulation); the training pipeline always uses the RENDER_DEPTH=0 variant, which contains no depth code.
+#ifndef RENDER_DEPTH
+#define RENDER_DEPTH 0
+#endif
+
 #if SHARED_STRUCT
 groupshared Splat_2D_AlphaBlend collected_splats[TILE_SIZE];
 #else
@@ -102,6 +108,9 @@ groupshared float4 collected_inv_cov_vs_opacity[TILE_SIZE];
 #endif
 
 groupshared uint32_t collected_idx[TILE_SIZE];
+#if RENDER_DEPTH
+groupshared float collected_depth[TILE_SIZE];
+#endif
 
 #if SUBTILE_SIZE > 0
 groupshared uint32_t subtile_overlap_bitmasks[TILE_SIZE];
@@ -116,6 +125,10 @@ layout(binding=4) StructuredBuffer<float> rgb;
 
 layout(binding=5) RWStructuredBuffer<float4> final_pixel_state;
 layout(binding=6) RWStructuredBuffer<int32_t> n_contributors;
+#if RENDER_DEPTH
+layout(binding=7) StructuredBuffer<float> depths;  // view-space z per splat
+layout(binding=8) RWStructuredBuffer<float> out_depth;  // sum_i T_i * alpha_i * z_i per pixel
+#endif
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -152,6 +165,9 @@ void main(
 
     int32_t num_cull = 0;  // for visualization
     int32_t local_n_contrib = 0;
+    #if RENDER_DEPTH
+    float depth_acc = 0;
+    #endif
     int splats_left_to_process = tile_idx_end - tile_idx_start;
     for (int i = 0; i < shared_memory_rounds; i++)
     {
@@ -184,6 +200,9 @@ void main(
             collected_xy_vs[thread_rank] = read_t2_float2(coll_id, xy_vs);
             collected_inv_cov_vs_opacity[thread_rank] = read_t4_float4(coll_id, inv_cov_vs_opacity);
             collected_idx[thread_rank] = coll_id;
+            #endif
+            #if RENDER_DEPTH
+            collected_depth[thread_rank] = depths[coll_id];
             #endif
         }
         GroupMemoryBarrierWithGroupSync();
@@ -249,6 +268,9 @@ void main(
                     thread_active = false;
                     break;
                 }
+                #if RENDER_DEPTH
+                depth_acc += curr_pixel_state.a * gauss_rgba.a * collected_depth[j];
+                #endif
                 curr_pixel_state = new_pixel_state;
             }
         }
@@ -260,6 +282,9 @@ void main(
         int pix_id = pix_coord.y*W+pix_coord.x;
         n_contributors[pix_id] = local_n_contrib;
         final_pixel_state[pix_id] = curr_pixel_state;
+        #if RENDER_DEPTH
+        out_depth[pix_id] = depth_acc;
+        #endif
     }
 }
 
