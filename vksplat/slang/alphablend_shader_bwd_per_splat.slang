@@ -11,9 +11,11 @@
 static const uint MAX_SPLAT_BATCH_SIZE = 128;
 
 
-groupshared float4 pixel_state[PIXEL_BATCH_SIZE];
-groupshared float4 v_pixel_state[PIXEL_BATCH_SIZE];
+groupshared float pixel_T[PIXEL_BATCH_SIZE];
+groupshared float3 v_pixel_rgb[PIXEL_BATCH_SIZE];
+groupshared float v_pixel_T[PIXEL_BATCH_SIZE];
 groupshared int n_contrib_fwd[PIXEL_BATCH_SIZE];
+groupshared int sg_max_contrib[MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE];
 
 layout(binding=0) StructuredBuffer<int32_t> sorted_gauss_idx;
 layout(binding=1) StructuredBuffer<int32_t> tile_ranges;
@@ -44,6 +46,7 @@ void main(
     uint thread_rank = groupThreadID.x;
     uint2 tbound0 = uint2(groupID.x%grid_width, groupID.x/grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT);
 
+    int local_max_contrib = 0;
     [ForceUnroll]
     for (int i = 0; i < TILE_SIZE; i += MAX_SPLAT_BATCH_SIZE) {
         int pix_rank_batch = i + thread_rank;
@@ -54,21 +57,36 @@ void main(
 
         if (is_inside) {
             uint32_t pix_id = pix_coord.y * W + pix_coord.x;
-            pixel_state[pix_rank_batch] = final_pixel_state[pix_id];
-            v_pixel_state[pix_rank_batch] = v_current_pixel_state[pix_id];
-            n_contrib_fwd[pix_rank_batch] = n_contributors[pix_id];
+            pixel_T[pix_rank_batch] = final_pixel_state[pix_id].a;
+            float4 vp = v_current_pixel_state[pix_id];
+            v_pixel_rgb[pix_rank_batch] = vp.rgb;
+            v_pixel_T[pix_rank_batch] = vp.w;
+            int nc = n_contributors[pix_id];
+            n_contrib_fwd[pix_rank_batch] = nc;
+            local_max_contrib = max(local_max_contrib, nc);
         }
         else {
             n_contrib_fwd[pix_rank_batch] = 0;
         }
 
     }
+    int sg_max = WaveActiveMax(local_max_contrib);
+    if (WaveIsFirstLane()) {
+        sg_max_contrib[thread_rank / SUBGROUP_SIZE] = sg_max;
+    }
     GroupMemoryBarrierWithGroupSync();
+    uint lane_id = thread_rank % SUBGROUP_SIZE;
+    int tile_max_n_contrib = WaveActiveMax(
+        (lane_id < (MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE)) ? sg_max_contrib[lane_id] : 0
+    );
 
     uint tile_idx = groupID.y * grid_width + groupID.x;
     uint32_t tile_idx_start = tile_ranges[tile_idx];
     uint32_t tile_idx_end = tile_ranges[tile_idx+1];
+    tile_idx_end = tile_idx_start + min(tile_idx_end - tile_idx_start, uint32_t(max(tile_max_n_contrib, 0)));
     uint32_t num_splats_in_tile = tile_idx_end - tile_idx_start;
+    if (num_splats_in_tile == 0)
+        return;
 
     #ifdef SPLAT_BATCH_SIZE
       #undef SPLAT_BATCH_SIZE
@@ -88,7 +106,7 @@ void main(
         // load splat
         // thread 0 loads last splat, thread 1 loads second last, ...
         int32_t splat_id = -1;
-        Splat_2D_AlphaBlend splat;
+        Splat_2D_AlphaBlend splat = { float4(0, 0, 0, 1), float2(0), float3(0) };
         int32_t progress = batch_idx * SPLAT_BATCH_SIZE + thread_rank;
         int32_t splat_gid = tile_idx_end - progress - 1;
         int32_t splat_tid = splat_gid - tile_idx_start;
@@ -108,32 +126,8 @@ void main(
         float4 v_inv_cov_vs_opacity = float4(0.0);
         float3 v_rgb = float3(0.0);
 
-        float4 current_pixel_state;
-        float4 d_current_pixel_state;
-
         int num_pixels = PIXEL_BATCH_SIZE;
         int num_splats = min(SPLAT_BATCH_SIZE, num_splats_in_tile - batch_idx * SPLAT_BATCH_SIZE);
-
-        // render: s0 last, s1, second last, ...
-        // backward: p first sees s0, then s1, then s2...
-
-        // Example with 5 splats, 4 pixels
-        // i=0   s:    01234
-        //       p: 3210
-        // i=1   s:    01234
-        //       p:  3210
-        // i=2   s:    01234
-        //       p:   3210
-        // i=3   s:    01234
-        //       p:    3210
-        // i=4   s:    01234
-        //       p:     3210
-        // i=5   s:    01234
-        //       p:      3210
-        // i=6   s:    01234
-        //       p:       3210
-        // i=7   s:    01234
-        //       p:        3210
 
         for (int i = 0; i < num_splats + num_pixels - 1; ++i, GroupMemoryBarrierWithGroupSync()) {
 
@@ -154,30 +148,41 @@ void main(
           #endif
 
             uint32_t n_contrib = n_contrib_fwd[pix_rank];
-            // uint32_t n_contrib = (pix_coord.x >= W || pix_coord.y >= H) ? 0 : num_splats_in_tile;
             if (splat_tid < 0 || splat_tid >= n_contrib)
                 continue;
 
-            float2 center_pix_coord = pix_coord;
-            float4 gauss_rgba = evaluate_splat(splat, center_pix_coord);
-            if (gauss_rgba.a <= ALPHA_THRESHOLD)
+            float2 d = float2(pix_coord) - splat.xy_vs;
+            float3 g_inv_cov = splat.inv_cov_vs_opacity.xyz;
+            float g_opacity = splat.inv_cov_vs_opacity.w;
+            float power = -0.5f * (g_inv_cov.x * d.x * d.x + g_inv_cov.z * d.y * d.y + 2.0f * g_inv_cov.y * d.x * d.y);
+            float val = exp(power);
+            float raw_alpha = g_opacity * val;
+            float a = min(ALPHA_BLEND_MAX_OPACITY, raw_alpha);
+            if (a <= ALPHA_THRESHOLD)
                 continue;
-            
-            current_pixel_state = pixel_state[pix_rank];
-            current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
-            pixel_state[pix_rank] = current_pixel_state;
 
-            d_current_pixel_state = v_pixel_state[pix_rank];
-            DifferentialPair<float4> dp_gauss_rgba = diffPair(gauss_rgba);
-            DifferentialPair<float4> dp_current_pixel_state = diffPair(current_pixel_state);
-            bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
-            v_pixel_state[pix_rank] = dp_current_pixel_state.d;
+            float T = pixel_T[pix_rank] / (1.0f - a);
+            pixel_T[pix_rank] = T;
 
-            DifferentialPair<Splat_2D_AlphaBlend> dp_g = diffPair(splat);
-            bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
-            v_xy_vs += dp_g.d.xy_vs;
-            v_inv_cov_vs_opacity += dp_g.d.inv_cov_vs_opacity;
-            v_rgb += dp_g.d.rgb;
+            float3 v_rgb_pix = v_pixel_rgb[pix_rank];
+            float v_T = v_pixel_T[pix_rank];
+            float aT = a * T;
+            float rgbd = dot(v_rgb_pix, splat.rgb);
+            v_pixel_T[pix_rank] = v_T * (1.0f - a) + a * rgbd;
+
+            v_rgb += aT * v_rgb_pix;
+            float v_a = (raw_alpha < ALPHA_BLEND_MAX_OPACITY) ? (T * (rgbd - v_T)) : 0.0f;
+            float v_power = v_a * a;
+            v_inv_cov_vs_opacity += float4(
+                -0.5f * d.x * d.x * v_power,
+                -d.x * d.y * v_power,
+                -0.5f * d.y * d.y * v_power,
+                v_a * val
+            );
+            v_xy_vs += float2(
+                (g_inv_cov.x * d.x + g_inv_cov.y * d.y) * v_power,
+                (g_inv_cov.y * d.x + g_inv_cov.z * d.y) * v_power
+            );
         }
 
       #if USE_EMULATED_F32_ATOMIC

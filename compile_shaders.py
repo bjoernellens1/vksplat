@@ -260,7 +260,7 @@ class ShaderCompiler:
         ], []))
 
         # Alpha Blending
-        tensor_bwd_configs = [(0, 8, 0), (0, 8, 8), (1, 16, 0)]
+        tensor_bwd_configs = [(0, 8, 0), (0, 8, 8), (1, 8, 8)]
         jobs.append(("alphablend_shader.slang", [
             ShaderJob(f"rasterize_forward", {"EXPORT_MODE": forward}),
         ] + [

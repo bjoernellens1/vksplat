@@ -111,7 +111,7 @@ void main(
     uint pixel_batch_rank = groupThreadID.x / SPLAT_BATCH_SIZE;
     uint group_thread_rank = pixel_batch_rank * SPLAT_BATCH_SIZE + thread_rank;
 
-    float4 pixel_state = float4(0.0);
+    float pixel_T = 0.0;
     float4 v_pixel_state = float4(0.0);
     int n_contrib_fwd = 0;
     {
@@ -121,7 +121,7 @@ void main(
 
         if (is_inside) {
             uint32_t pix_id = pix_coord.y * W + pix_coord.x;
-            pixel_state = final_pixel_state[pix_id];
+            pixel_T = final_pixel_state[pix_id].w;
             n_contrib_fwd = n_contributors[pix_id];
             v_pixel_state = v_current_pixel_state[pix_id];
         }
@@ -129,7 +129,22 @@ void main(
 
     uint32_t tile_idx_start = tile_ranges[tile_idx];
     uint32_t tile_idx_end = tile_ranges[tile_idx+1];
+
+    int sg_max_contrib = WaveActiveMax(n_contrib_fwd);
+    if (WaveIsFirstLane()) {
+        collected_idx[groupThreadID.x / SUBGROUP_SIZE] = sg_max_contrib;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint lane_id = groupThreadID.x % SUBGROUP_SIZE;
+    int tile_max_n_contrib = WaveActiveMax(
+        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? collected_idx[lane_id] : 0
+    );
+    GroupMemoryBarrierWithGroupSync();
+
+    tile_idx_end = tile_idx_start + min(tile_idx_end - tile_idx_start, uint32_t(max(tile_max_n_contrib, 0)));
     uint32_t num_splats_in_tile = tile_idx_end - tile_idx_start;
+    if (num_splats_in_tile == 0)
+        return;
 
     const int rounds = ((num_splats_in_tile + SPLAT_BATCH_SIZE - 1) / SPLAT_BATCH_SIZE);
 
@@ -188,7 +203,7 @@ void main(
 
             float3 v_rgb = v_pixel_state.rgb;
             float v_T = v_pixel_state.w;
-            float T = pixel_state.w;
+            float T = pixel_T;
 
             for (int si = 0; si < num_splats; si++) {
                 float a = 0.0;
@@ -207,15 +222,14 @@ void main(
                 T /= 1.0 - a;
                 
                 float3 rgb = collected_rgb[collected_base + si];
-                // float3 rgb = WaveReadLaneAt(splat.rgb, si);
                 
                 float aT = a * T;
                 float v_a = aT * (dot(v_rgb, rgb) - v_T) * float(a < ALPHA_BLEND_MAX_OPACITY);
                 v_T = v_T * (1.0-a) + a * dot(v_rgb, rgb);
-                pixel_state = undo_pixel_state(pixel_state, float4(rgb*a, a));
                 
                 shared_alpha[si][pi] = float2(aT, v_a);
             }
+            pixel_T = T;
             v_pixel_state.w = v_T;
         }
 

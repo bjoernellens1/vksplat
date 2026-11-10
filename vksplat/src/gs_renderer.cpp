@@ -64,7 +64,7 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
         createComputePipeline(pipeline_rasterize_backward[1][i], spirv_paths.at("rasterize_backward_1"));
         createComputePipeline(pipeline_rasterize_backward[2][i], spirv_paths.at("rasterize_backward_2"), 35840);
         createComputePipeline(pipeline_rasterize_backward[3][i], spirv_paths.at("rasterize_backward_3"), 41984);
-        createComputePipeline(pipeline_rasterize_backward[4][i], spirv_paths.at("rasterize_backward_4"), 43008);
+        createComputePipeline(pipeline_rasterize_backward[4][i], spirv_paths.at("rasterize_backward_4"), 35840);
     }
     createComputePipeline(pipeline_cumsum.single_pass, spirv_paths.at("cumsum_single_pass"));
     createComputePipeline(pipeline_cumsum.block_scan, spirv_paths.at("cumsum_block_scan"));
@@ -132,6 +132,17 @@ void VulkanGSRenderer::executeGenerateKeys(
 
     size_t num_elements = buffers.num_splats;
     size_t num_indices = buffers.num_indices;
+
+    // Reset ping-pong parity and pre-reserve sorting buffers with headroom to avoid per-step descriptor updates
+    buffers.is_unsorted_1 = true;
+    if (buffers.sorting_keys_1.deviceBuffer.allocSize < num_indices * sizeof(sortingKey_t)) {
+        size_t reserve = std::max(num_indices + (num_indices >> 1), num_elements * 16);
+        resizeDeviceBuffer(buffers.sorting_keys_1, reserve);
+        resizeDeviceBuffer(buffers.sorting_keys_2, reserve);
+        resizeDeviceBuffer(buffers.sorting_gauss_idx_1, reserve);
+        resizeDeviceBuffer(buffers.sorting_gauss_idx_2, reserve);
+        resizeDeviceBuffer(buffers._sorting_histogram_cumsum, _CEIL_DIV(reserve, 4096) * 256);
+    }
 
     // barrier shouldn't be needed as this is after cumsum and read element
     #if 0
@@ -268,10 +279,10 @@ void VulkanGSRenderer::initRasterizationBackwardScheduler() {
 
     rasterizeBackwardScheduler = ThompsonSamplingScheduler(
         rasterizeBackwardAlternatives.size(),
-        1.0,  // initial_noise_std, in seconds
-        100,  // max_no_update
+        0.0002,  // initial_noise_std, in seconds (0.2 ms, matched to per-step backward latency)
+        200,  // max_no_update
         1000,  // adapt_tau
-        100  // warmup_tau
+        10  // warmup_tau
     );
 
     auto timerCallback = [&](const std::vector<std::pair<size_t, double>>& time_updates) {
@@ -284,7 +295,7 @@ void VulkanGSRenderer::initRasterizationBackwardScheduler() {
                 (RasterBackwardImpl)impl);
             if (alternative != rasterizeBackwardAlternatives.end())
                 rasterizeBackwardScheduler.update(
-                    alternative - rasterizeBackwardAlternatives.begin(), dt);
+                    alternative - rasterizeBackwardAlternatives.begin(), dt / double(count));
         }
     };
     timerCallbacks.push_back(timerCallback);

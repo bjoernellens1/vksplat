@@ -29,19 +29,17 @@ layout(binding=12) RWStructuredBuffer<float4> g_scales_opacs;  // 2*4
 
 typedef vector<float,1> float1;
 
-// "standard" Adam with bias correction
+// "standard" Adam with bias correction (precomputed g1_sc, g2_sc)
 __generic<let dim: int>
 void optimizer_update(
     inout vector<float,dim> x, in vector<float,dim> v,
     inout vector<float,dim> g1, inout vector<float,dim> g2,
-    float step, vector<float,dim> lr
+    float g1_sc, float g2_sc, vector<float,dim> lr
 ) {
     static const float beta_1 = 0.9;
     static const float beta_2 = 0.999;
     static const float eps = 1e-15;
 
-    const float g1_sc = 1.0 / (1.0 - pow(beta_1, step));
-    const float g2_sc = 1.0 / (1.0 - pow(beta_2, step));
     g1 = lerp(g1, v, 1.0-beta_1);
     g2 = lerp(g2, v*v, 1.0-beta_2);
     vector<float,dim> g1_t = g1 * g1_sc;
@@ -94,18 +92,6 @@ void main(
 
     bool is_zero_grad = (tiles_touched[g_idx] == 0);
 
-    // load stuff
-    Camera cam = load_camera(world_view_transform,
-        uniforms.fx, uniforms.fy, uniforms.cx, uniforms.cy, camera_model, uniforms.dist_coeffs,
-        image_height, image_width);
-    Gaussian_3D gauss = {
-        read_mean(g_idx, xyz_ws),
-        read_spherical_harmonics_coeffs(g_idx, sh_coeffs, active_sh),
-        rotations[g_idx],
-        scales_opacs[g_idx].xyz,
-        scales_opacs[g_idx].w
-    };
-
     // backward
     float2 v_out_xy_vs = is_zero_grad ? float2(0) : v_output_xy_vs[g_idx];
     float4 v_out_inv_cov_vs_opac = is_zero_grad ? float4(0) :
@@ -114,24 +100,46 @@ void main(
     float3 v_out_rgb = is_zero_grad ? float3(0) :
       float3(read_t3_float3(g_idx, v_output_rgb));
 
-    Splat_2D_Vertex v_splat = {
-        float3(v_out_xy_vs, v_out_depths),  // xyz_vs
-        v_out_rgb,  // rgb
-        float3(0.0),  // cov_vs
-        v_out_inv_cov_vs_opac,  // inv_cov_vs
-        0.0  // det
-    };
-    DifferentialPair<Gaussian_3D> v_gauss = diffPair(gauss);
-    DifferentialPair<Camera> v_cam = diffPair(cam);
-    bwd_diff(project_gaussian_to_camera)(v_gauss, v_cam, active_sh, v_splat);
+    if (!is_zero_grad) {
+        is_zero_grad = all(v_out_xy_vs == 0.0f) && all(v_out_inv_cov_vs_opac == 0.0f) && all(v_out_rgb == 0.0f);
+    }
 
-    // warn that v_gauss may be NaN when is_zero_grad is True
-    float3 v_xyz_ws = is_zero_grad ? float3(0) : v_gauss.d.xyz_ws;
-    float4 v_rotation = is_zero_grad ? float4(0) : v_gauss.d.rotations;
-    float4 v_scale_opac = is_zero_grad ? float4(0) :
-        float4(v_gauss.d.scales, v_gauss.d.opacities);
+    // load stuff
+    Gaussian_3D gauss = {
+        read_mean(g_idx, xyz_ws),
+        read_spherical_harmonics_coeffs(g_idx, sh_coeffs, active_sh),
+        rotations[g_idx],
+        scales_opacs[g_idx].xyz,
+        scales_opacs[g_idx].w
+    };
+
+    DifferentialPair<Gaussian_3D> v_gauss = diffPair(gauss);
+    float3 v_xyz_ws = float3(0);
+    float4 v_rotation = float4(0);
+    float4 v_scale_opac = float4(0);
+
+    if (!is_zero_grad) {
+        Camera cam = load_camera(world_view_transform,
+            uniforms.fx, uniforms.fy, uniforms.cx, uniforms.cy, camera_model, uniforms.dist_coeffs,
+            image_height, image_width);
+        Splat_2D_Vertex v_splat = {
+            float3(v_out_xy_vs, v_out_depths),  // xyz_vs
+            v_out_rgb,  // rgb
+            float3(0.0),  // cov_vs
+            v_out_inv_cov_vs_opac,  // inv_cov_vs
+            0.0  // det
+        };
+        DifferentialPair<Camera> v_cam = diffPair(cam);
+        bwd_diff(project_gaussian_to_camera)(v_gauss, v_cam, active_sh, v_splat);
+        v_xyz_ws = v_gauss.d.xyz_ws;
+        v_rotation = v_gauss.d.rotations;
+        v_scale_opac = float4(v_gauss.d.scales, v_gauss.d.opacities);
+    }
 
     // optimizers
+    const float f_step = float(uniforms.step);
+    const float g1_sc = 1.0f / (1.0f - pow(0.9f, f_step));
+    const float g2_sc = 1.0f / (1.0f - pow(0.999f, f_step));
 
     uint group_offset = g_idx % GROUP_SIZE;
     uint group_base = g_idx - group_offset;
@@ -145,7 +153,7 @@ void main(
         float3 v = v_xyz_ws;
         float3 g1 = read_mean(g_idx, g_xyz_ws, 2, 0);
         float3 g2 = read_mean(g_idx, g_xyz_ws, 2, 1);
-        optimizer_update(x, v, g1, g2, uniforms.step, uniforms.lr_means);
+        optimizer_update(x, v, g1, g2, g1_sc, g2_sc, uniforms.lr_means);
         write_mean(x, g_idx, xyz_ws);
         write_mean(g1, g_idx, g_xyz_ws, 2, 0);
         write_mean(g2, g_idx, g_xyz_ws, 2, 1);
@@ -157,7 +165,7 @@ void main(
         float4 v = v_rotation; // TODO: should ideally project when NORMALIZE_QUATS_IN_OPTIMIZER is True
         float4 g1 = g_rotations[g1_idx];
         float4 g2 = g_rotations[g2_idx];
-        optimizer_update(x, v, g1, g2, uniforms.step, uniforms.lr_quats);
+        optimizer_update(x, v, g1, g2, g1_sc, g2_sc, uniforms.lr_quats);
         rotations[g_idx] = bool(NORMALIZE_QUATS_IN_OPTIMIZER) ? normalize(x) : x;
         g_rotations[g1_idx] = g1;
         g_rotations[g2_idx] = g2;
@@ -186,7 +194,7 @@ void main(
 
         // update
         float4 lr = float4(float3(uniforms.lr_scales), uniforms.lr_opacities);
-        optimizer_update(u, dLdu, g1, g2, uniforms.step, lr);
+        optimizer_update(u, dLdu, g1, g2, g1_sc, g2_sc, lr);
 
         // map
         x.xyz = exp(u.xyz);  // scale: x = exp(u)
@@ -220,7 +228,7 @@ void main(
         // default optimizer (Adam)
         float4 g1 = g_sh_coeffs_1[bid];
         float4 g2 = g_sh_coeffs_2[bid];
-        optimizer_update(x, v, g1, g2, uniforms.step, lr);
+        optimizer_update(x, v, g1, g2, g1_sc, g2_sc, lr);
         sh_coeffs[bid] = x;
         g_sh_coeffs_1[bid] = g1;
         g_sh_coeffs_2[bid] = g2;

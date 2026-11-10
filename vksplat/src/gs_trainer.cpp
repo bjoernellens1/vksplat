@@ -479,8 +479,8 @@ void VulkanGSTrainer::load_colmap_dataset(
             dataset_train.push_back(std::move(result.first));
     }
 
-    // Copy to device
-    if (config.image_cache_device == TrainerConfig::CacheImage::GPU) {
+    // Copy to device (cache in GPU VRAM when explicitly requested or when dataset fits comfortably)
+    if (config.image_cache_device == TrainerConfig::CacheImage::GPU || dataset_train.size() <= 512) {
         for (auto& im : dataset_train) copyToDevice(im.buffer);
         for (auto& im : dataset_val) copyToDevice(im.buffer);
     }
@@ -797,16 +797,17 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     shader_uniforms[3].f = -config.ssim_lambda / (3.0f * (w-kTwoHalo) * (h-kTwoHalo));  // ssim grad weight
     
     auto& train_image = dataset_train[train_idx].buffer;
-    bool buffer_swapped = false;
     if (train_image.deviceBuffer.buffer == VK_NULL_HANDLE) {
         PerfTimer::Timer<PerfTimer::CopyTrainImageToDevice> timer(this);
         std::swap(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
         copyToDevice(train_image);
-        buffer_swapped = true;
+        std::swap(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
+    } else {
+        copyFromDeviceToDevice(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
     }
     bufferMemoryBarrier({
         { buffers.pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE },
-        { train_image.deviceBuffer, TRANSFER_WRITE },
+        { buffers.ref_image.deviceBuffer, TRANSFER_WRITE },
     }, COMPUTE_SHADER_READ);
 
     PerfTimer::Timer<PerfTimer::ComputeSSIMGradient> timer(this);
@@ -822,7 +823,7 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
         pipeline_ssim_forward,
         {
             buffers.pixel_state.deviceBuffer,
-            train_image.deviceBuffer,
+            buffers.ref_image.deviceBuffer,
             resizeDeviceBuffer(ssim_map, 12*num_pixels),
         }
     );
@@ -836,14 +837,11 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
         pipeline_ssim_backward,
         {
             buffers.pixel_state.deviceBuffer,
-            train_image.deviceBuffer,
+            buffers.ref_image.deviceBuffer,
             ssim_map.deviceBuffer,
             resizeDeviceBuffer(buffers.v_pixel_state, 4*num_pixels),
         }
     );
-
-    if (buffer_swapped)
-        std::swap(train_image.deviceBuffer, buffers.ref_image.deviceBuffer);
 }
 
 

@@ -155,24 +155,20 @@ void main(
     int splats_left_to_process = tile_idx_end - tile_idx_start;
     for (int i = 0; i < shared_memory_rounds; i++)
     {
-        // break if thread_active is false for all, doesn't seem to speed up
-        // equivalent to CUDA `if (__syncthreads_count(thread_active) == 0) break;`
-        uint subgroup_idx = thread_rank / SUBGROUP_SIZE;
-        uint32_t thread_active_u = uint32_t(WaveActiveAnyTrue(thread_active));
-        if (WaveIsFirstLane())
-            collected_idx[subgroup_idx] = thread_active_u;
-        GroupMemoryBarrierWithGroupSync();
-        for (int s = 1; s < TILE_SIZE/SUBGROUP_SIZE; s <<= 1) {
-            if (thread_rank < TILE_SIZE/SUBGROUP_SIZE) {
-                thread_active_u += collected_idx[(thread_rank+s)%TILE_SIZE];
-                collected_idx[thread_rank] = thread_active_u;
-            }
+        if (i > 0) {
+            uint subgroup_idx = thread_rank / SUBGROUP_SIZE;
+            uint lane_id = thread_rank % SUBGROUP_SIZE;
+            uint32_t thread_active_u = uint32_t(WaveActiveAnyTrue(thread_active));
+            if (WaveIsFirstLane())
+                collected_idx[subgroup_idx] = thread_active_u;
             GroupMemoryBarrierWithGroupSync();
+            bool any_tile_active = WaveActiveAnyTrue(
+                (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? (collected_idx[lane_id] != 0) : false
+            );
+            GroupMemoryBarrierWithGroupSync();
+            if (!any_tile_active)
+                break;
         }
-        if (SUBGROUP_SIZE*SUBGROUP_SIZE >= TILE_SIZE)
-            GroupMemoryBarrierWithGroupSync();
-        if (collected_idx[0] == 0)
-            break;
 
         // Collectively fetch per-Gaussian data from global to shared
         int splat_pointer_offset = i * TILE_SIZE + thread_rank;

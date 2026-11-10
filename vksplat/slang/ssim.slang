@@ -105,31 +105,46 @@ void ssimForward(
     uint pixX = dispatchThreadID.x;
     uint pixY = dispatchThreadID.y;
     uint pixId = pixY * imageWidth + pixX;
-    
+    const uint numPixels = imageWidth * imageHeight;
+
+    const uint tileSize = SHARED_Y * SHARED_X;
+    const uint threads = BLOCK_X * BLOCK_Y;
+    const uint tileStartY = groupID.y * BLOCK_Y;
+    const uint tileStartX = groupID.x * BLOCK_X;
+    const uint baseTid = groupThreadID.y * BLOCK_X + groupThreadID.x;
+
+    // Preload 3-channel halo tile from global memory once per workgroup (eliminates 2/3 of global reads)
+    float3 pre1[3];
+    float3 pre2[3];
+    [ForceUnroll]
+    for (uint s = 0; s < 3; ++s) {
+        uint tid = s * threads + baseTid;
+        if (tid < tileSize) {
+            uint localY = tid / SHARED_X;
+            uint localX = tid % SHARED_X;
+            int gy = int(tileStartY + localY) - int(HALO);
+            int gx = int(tileStartX + localX) - int(HALO);
+            float alpha;
+            float3 v1 = getPixelValue(img1Buffer, gx, gy, imageWidth, imageHeight);
+            float3 v2 = getPixelValue(img2Buffer, gx, gy, imageWidth, imageHeight, alpha);
+            pre1[s] = v1 * alpha;
+            pre2[s] = v2 * alpha;
+        } else {
+            pre1[s] = float3(0.0f);
+            pre2[s] = float3(0.0f);
+        }
+    }
+
     for (uint ci = 0; ci < numChannels; ++ci)
     {
-        // Load tile for forward pass
-        uint tileSize = SHARED_Y * SHARED_X;
-        uint threads = BLOCK_X * BLOCK_Y;
-        uint steps = (tileSize + threads - 1) / threads;
-        
-        uint tileStartY = groupID.y * BLOCK_Y;
-        uint tileStartX = groupID.x * BLOCK_X;
-        
-        for (uint s = 0; s < steps; ++s) {
-            uint tid = s * threads + (groupThreadID.y * BLOCK_X + groupThreadID.x);
+        [ForceUnroll]
+        for (uint s = 0; s < 3; ++s) {
+            uint tid = s * threads + baseTid;
             if (tid < tileSize) {
                 uint localY = tid / SHARED_X;
                 uint localX = tid % SHARED_X;
-                int gy = int(tileStartY + localY) - int(HALO);
-                int gx = int(tileStartX + localX) - int(HALO);
-                
-                float alpha;
-                float val1 = getPixelValue(img1Buffer, gx, gy, imageWidth, imageHeight)[ci];
-                float val2 = getPixelValue(img2Buffer, gx, gy, imageWidth, imageHeight, alpha)[ci];
-                
-                sTile[localY][localX][0] = val1 * alpha;
-                sTile[localY][localX][1] = val2 * alpha;
+                sTile[localY][localX][0] = pre1[s][ci];
+                sTile[localY][localX][1] = pre2[s][ci];
             }
         }
         
@@ -172,9 +187,7 @@ void ssimForward(
         xconv[ly][groupThreadID.x][3] = float(sumY2);
         xconv[ly][groupThreadID.x][4] = float(sumXY);
         
-        GroupMemoryBarrierWithGroupSync();
-        
-        // Possibly handle second row in same subgroup
+        // Handle second row in same subgroup without redundant intermediate barrier
         int ly2 = ly + BLOCK_Y;
         if (ly2 < CONV_Y) {
             sumX = 0.f; sumX2 = 0.f; sumY = 0.f; sumY2 = 0.f; sumXY  = 0.f;
@@ -261,8 +274,8 @@ void ssimForward(
             dMdsigma1Sq = (-C_ * D_) / (A * B * B);
             dMdsigma12 = (2.0f * C_) / (A * B);
 
-            ssimMapBuffer[pixId*numChannels+ci] = float4(
-                float4(outSSIM, dMdmu1, dMdsigma1Sq, dMdsigma12)
+            ssimMapBuffer[ci * numPixels + pixId] = float4(
+                outSSIM, dMdmu1, dMdsigma1Sq, dMdsigma12
             );
         }
 
@@ -286,29 +299,38 @@ void ssimBackward(
     uint pixX = dispatchThreadID.x;
     uint pixY = dispatchThreadID.y;
     uint pixId = pixY * imageWidth + pixX;
-    
+    const uint numPixels = imageWidth * imageHeight;
+
+    const uint tileSize = SHARED_Y * SHARED_X;
+    const uint totalThreads = BLOCK_X * BLOCK_Y;
+    const uint startY = groupID.y * BLOCK_Y;
+    const uint startX = groupID.x * BLOCK_X;
+    const uint tid = groupThreadID.y * BLOCK_X + groupThreadID.x;
+
+    float3 p1_rgb = float3(0.0f);
+    float3 p2_rgb = float3(0.0f);
+    if (pixX < imageWidth && pixY < imageHeight) {
+        float alpha;
+        p1_rgb = getPixelValue(img1Buffer, int(pixX), int(pixY), imageWidth, imageHeight);
+        p2_rgb = getPixelValue(img2Buffer, int(pixX), int(pixY), imageWidth, imageHeight, alpha);
+        p1_rgb *= alpha;
+        p2_rgb *= alpha;
+    }
+    float3 dLdpix_rgb = float3(0.0f);
+
     for (uint ci = 0; ci < numChannels; ++ci) {
-        
-        // Load and fuse multiplication
-        uint startY = groupID.y * BLOCK_Y;
-        uint startX = groupID.x * BLOCK_X;
-        
-        uint tid = groupThreadID.y * BLOCK_X + groupThreadID.x;
-        uint totalThreads = BLOCK_X * BLOCK_Y;
-
-        int subgroup_id = tid / SUBGROUP_SIZE;
-        int lane_id = tid % SUBGROUP_SIZE;
-        int num_subgroups = (totalThreads + SUBGROUP_SIZE - 1) / SUBGROUP_SIZE;
-
-        for (int row = subgroup_id; row < SHARED_Y; row += num_subgroups) {
-            for (uint col = lane_id; col < SHARED_X; col += totalThreads) {
+        [ForceUnroll]
+        for (uint s = 0; s < 3; ++s) {
+            uint idx = s * totalThreads + tid;
+            if (idx < tileSize) {
+                uint row = idx / SHARED_X;
+                uint col = idx % SHARED_X;
                 int gy = int(startY + row) - int(HALO);
                 int gx = int(startX + col) - int(HALO);
                 
                 float4 forwardReturns =
-                    // (gx >= 0 && gx < int(imageWidth) && gy >= 0 && gy < int(imageHeight)) ?
                     (gx >= int(HALO) && gx < int(imageWidth-HALO) && gy >= int(HALO) && gy < int(imageHeight-HALO)) ?
-                    ssimMapBuffer[(gy*imageWidth+gx)*numChannels+ci] : float4(0,0,0,0);
+                    ssimMapBuffer[ci * numPixels + (gy * imageWidth + gx)] : float4(0,0,0,0);
                 
                 sData[0][row][col] = forwardReturns.y;
                 sData[1][row][col] = forwardReturns.z;
@@ -322,6 +344,7 @@ void ssimBackward(
         uint ly = groupThreadID.y;
         uint lx = groupThreadID.x + HALO;
         
+        [ForceUnroll]
         for (uint pass = 0; pass < 2; ++pass) {
             uint yy = ly + pass * BLOCK_Y;
             if (yy < CONV_Y) {
@@ -368,20 +391,19 @@ void ssimBackward(
             sum1 += sScratch[ly][lx][1] * wc;
             sum2 += sScratch[ly][lx][2] * wc;
             
-            float alpha;
-            float p1 = float(getPixelValue(img1Buffer, pixX, pixY, imageWidth, imageHeight)[ci]);
-            float p2 = float(getPixelValue(img2Buffer, pixX, pixY, imageWidth, imageHeight, alpha)[ci]);
-            p1 *= alpha; p2 *= alpha;
+            float p1 = p1_rgb[ci];
+            float p2 = p2_rgb[ci];
             float g_l1 = sign(p1 - p2) * gradWeightL1;
             float g_ssim = (sum0 + (2.0f * p1) * sum1 + p2 * sum2) * gradWeightSSIM;
             float clampDerivative = (p1 > 0.0f) ? 1.0f : 0.0f;
-            float dLdpix = (g_l1 + g_ssim) * clampDerivative;
-            
-            if (ci == 0) dLdimg1Buffer[pixId] = float4(float4(dLdpix, 0, 0, 0));
-            else if (ci == 1) dLdimg1Buffer[pixId].y = float(dLdpix);
-            else if (ci == 2) dLdimg1Buffer[pixId].z = float(dLdpix);
+            dLdpix_rgb[ci] = (g_l1 + g_ssim) * clampDerivative;
         }
         
-        GroupMemoryBarrierWithGroupSync();
+        if (ci + 1 < numChannels)
+            GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (pixX < imageWidth && pixY < imageHeight) {
+        dLdimg1Buffer[pixId] = float4(dLdpix_rgb, 0.0f);
     }
 }

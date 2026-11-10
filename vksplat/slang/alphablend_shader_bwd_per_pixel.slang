@@ -52,13 +52,13 @@ void main(
     // Load the final pixel state.
     bool is_inside = (pix_coord.x < W && pix_coord.y < H);
     uint32_t block_size = TILE_HEIGHT * TILE_WIDTH;
-    const int rounds = ((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
+    int rounds = ((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
 
     int splats_left_to_process = tile_idx_end - tile_idx_start;
     uint32_t current_splat_offset = tile_idx_end - tile_idx_start;
 
-    float4 current_pixel_state;
-    int32_t n_contrib_fwd;
+    float4 current_pixel_state = float4(0.0);
+    int32_t n_contrib_fwd = 0;
     if (is_inside) {
         uint32_t pix_id = pix_coord.y * W + pix_coord.x;
         current_pixel_state = final_pixel_state[pix_id];
@@ -66,22 +66,43 @@ void main(
         d_current_pixel_state = v_current_pixel_state[pix_id];
     }
 
+    // Subgroup-first early contributor bound (ported from eligsir-native 06_alpha_backward:m5_subgroup_first)
+    int32_t subgroup_max_n_contrib = WaveActiveMax(is_inside ? n_contrib_fwd : 0);
+    uint subgroup_idx = thread_rank / SUBGROUP_SIZE;
+    uint lane_id = thread_rank % SUBGROUP_SIZE;
+    if (WaveIsFirstLane()) {
+        subgroup_shared[subgroup_idx] = float(subgroup_max_n_contrib);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    int32_t tile_max_n_contrib = int32_t(WaveActiveMax(
+        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? subgroup_shared[lane_id] : 0.0f
+    ));
+    tile_idx_end = tile_idx_start + uint32_t(min(int32_t(tile_idx_end - tile_idx_start), max(tile_max_n_contrib, 0)));
+    rounds = int((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
+    splats_left_to_process = int(tile_idx_end - tile_idx_start);
+    current_splat_offset = tile_idx_end - tile_idx_start;
+
     float2 center_pix_coord = pix_coord;
 
     for (int i = 0; i < rounds; i++)
     {
         // Collectively fetch per-Gaussian data from global to shared
-        int progress = i * block_size + thread_rank;
-        if (tile_idx_start + progress < tile_idx_end)
+        int progress = i * int(block_size) + int(thread_rank);
+        if (tile_idx_start + uint32_t(progress) < tile_idx_end)
         {
-            uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_end - progress - 1]);
+            uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_end - uint32_t(progress) - 1]);
             collected_idx[thread_rank] = coll_id;
             collected_splats[thread_rank] = load_splat_alphablend(coll_id, xy_vs, inv_cov_vs_opacity, rgb);
         }
         GroupMemoryBarrierWithGroupSync();
 
-        for (int j = 0; j < min(block_size, splats_left_to_process); j++)
+        int batch_count = min(int(block_size), splats_left_to_process);
+        for (int j = 0; j < batch_count; j++)
         {
+            current_splat_offset--;
+            if (int32_t(current_splat_offset) >= subgroup_max_n_contrib)
+                continue;
+
             uint32_t g_idx = collected_idx[j];
             DifferentialPair<Splat_2D_AlphaBlend> dp_g;
             #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
@@ -90,32 +111,33 @@ void main(
                 float3 d_rgb = float3(0.0);
             #endif
 
-            if (is_inside) {
-                current_splat_offset--;
-                if (current_splat_offset < n_contrib_fwd) {
-
+            bool active = false;
+            if (is_inside && int32_t(current_splat_offset) < n_contrib_fwd) {
                 Splat_2D_AlphaBlend g = collected_splats[j];
 
                 float4 gauss_rgba = evaluate_splat(g, center_pix_coord);
                 if (gauss_rgba.a >= ALPHA_THRESHOLD) {
+                    active = true;
+                    // Undo pixel state
+                    current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
 
-                // Undo pixel state
-                current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
+                    // Back-prop automatically through blending and gaussian evaluation.
+                    dp_g = diffPair(g);
+                    DifferentialPair<float4> dp_gauss_rgba = diffPair(gauss_rgba);
+                    DifferentialPair<float4> dp_current_pixel_state = diffPair(current_pixel_state);
 
-                // Back-prop automatically through blending and gaussian evaluation.
-                dp_g = diffPair(g);
-                DifferentialPair<float4> dp_gauss_rgba = diffPair(gauss_rgba);
-                DifferentialPair<float4> dp_current_pixel_state = diffPair(current_pixel_state);
-
-                bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
-                d_current_pixel_state = dp_current_pixel_state.getDifferential();
-                bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
-                d_xy_vs = dp_g.d.xy_vs;
-                d_inv_cov_vs_opacity = dp_g.d.inv_cov_vs_opacity;
-                d_rgb = dp_g.d.rgb;
-
-                }}
+                    bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
+                    d_current_pixel_state = dp_current_pixel_state.getDifferential();
+                    bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
+                    d_xy_vs = dp_g.d.xy_vs;
+                    d_inv_cov_vs_opacity = dp_g.d.inv_cov_vs_opacity;
+                    d_rgb = dp_g.d.rgb;
+                }
             }
+
+            // Skip all 9 subgroup reductions and atomics if no lane in this subgroup contributed to splat j
+            if (!WaveActiveAnyTrue(active))
+                continue;
 
             // add back
         #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
@@ -147,8 +169,7 @@ void main(
             subgroupSumF32(temp_c1, float(d_rgb.y));
             subgroupSumF32(temp_c2, float(d_rgb.z));
           #if SUBGROUP_REDUCE_BEFORE_ATOMIC
-            // if (WaveIsFirstLane()) {
-            if (thread_rank % SUBGROUP_SIZE == 0) {
+            if (WaveIsFirstLane()) {
           #else
             if (true) {
           #endif
@@ -172,6 +193,8 @@ void main(
 
         #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
         }
-        splats_left_to_process -= block_size;
+        splats_left_to_process -= int(block_size);
+        if (i + 1 < rounds)
+            GroupMemoryBarrierWithGroupSync();
     }
 }
