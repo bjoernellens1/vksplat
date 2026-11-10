@@ -91,7 +91,7 @@ def main():
     sparse.mkdir(parents=True);images.mkdir();masks.mkdir()
     camera_lines=["# PINHOLE camera for each frame"]
     image_lines=["# COLMAP images: 2 lines per frame"]
-    seed_pts=[];seed_rgb=[];used_seed_ids=[]
+    seed_pts=[];seed_rgb=[];seed_img_ids=[];used_seed_ids=[]
     for j,idx in enumerate(ids,1):
         key=f"frame_{idx:06d}"
         record=meta[key]
@@ -134,18 +134,20 @@ def main():
             pts,cols=seed_from_depth(d,rgb_depth,valid_depth,K_depth,pose,
                          args.pixel_step,args.depth_scale,args.max_depth)
             if len(pts):
-                seed_pts.append(pts);seed_rgb.append(cols);used_seed_ids.append(idx)
+                seed_pts.append(pts);seed_rgb.append(cols)
+                seed_img_ids.append(np.full(len(pts), j, dtype=np.int32))
+                used_seed_ids.append(idx)
     if not seed_pts:raise ValueError("No valid depth points in selected train frames")
-    xyz=np.concatenate(seed_pts);colors=np.concatenate(seed_rgb)
+    xyz=np.concatenate(seed_pts);colors=np.concatenate(seed_rgb);img_ids=np.concatenate(seed_img_ids)
     if len(xyz)>args.max_points:
         choice=np.random.default_rng(0).choice(len(xyz),args.max_points,replace=False)
-        xyz=xyz[choice];colors=colors[choice]
+        xyz=xyz[choice];colors=colors[choice];img_ids=img_ids[choice]
     (sparse/"cameras.txt").write_text("\n".join(camera_lines)+"\n")
     (sparse/"images.txt").write_text("\n".join(image_lines)+"\n")
     with (sparse/"points3D.txt").open("w") as f:
-        f.write("# ID XYZ RGB ERROR\n")
-        for i,(p,c) in enumerate(zip(xyz,colors),1):
-            f.write(f"{i} {p[0]:.9g} {p[1]:.9g} {p[2]:.9g} {int(c[0])} {int(c[1])} {int(c[2])} 0\n")
+        f.write("# ID XYZ RGB ERROR TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        for i,(p,c,im_id) in enumerate(zip(xyz,colors,img_ids),1):
+            f.write(f"{i} {p[0]:.9g} {p[1]:.9g} {p[2]:.9g} {int(c[0])} {int(c[1])} {int(c[2])} 0 {int(im_id)} 0\n")
     manifest=dict(schema_version="1.0.0",mode="measured",oracle_privileged=False,
         scene=str(scene),dataset=str(out),frame_indices=ids,seed_frame_indices=used_seed_ids,
         frame_selection={"start":args.start_frame,"end":args.end_frame,

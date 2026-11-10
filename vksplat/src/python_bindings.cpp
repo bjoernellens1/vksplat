@@ -248,7 +248,24 @@ public:
         );
         train_meta["device"] = trainer.get_device_info();
         train_meta["num_anchored_splats"] = trainer.get_num_anchored_splats();
+        const auto& gids = trainer.get_splat_group_ids();
+        train_meta["splat_group_ids"] = py::array_t<int32_t>(
+            {gids.size()},
+            {sizeof(int32_t)},
+            gids.data()
+        );
         return train_meta;
+    }
+
+    py::array_t<int32_t> get_splat_group_ids() {
+        const auto& gids = trainer.get_splat_group_ids();
+        return py::array_t<int32_t>({gids.size()}, {sizeof(int32_t)}, gids.data());
+    }
+    void set_selective_freeze_unfrozen(bool unfrozen) {
+        trainer.set_selective_freeze_unfrozen(unfrozen);
+    }
+    void reset_anchored_snapshot(size_t new_num_anchored) {
+        trainer.reset_anchored_snapshot(new_num_anchored);
     }
 
     size_t num_train() { return trainer.num_train(); }
@@ -669,12 +686,16 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_timing_breakdown", &VkSplat::get_timing_breakdown, "Get timing for each step since start")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file")
+        .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
+        .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
+        .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
         .def("cleanup", &VkSplat::cleanup, "Cleanup Vulkan resources")
         .DEF_BUFFER_ARRAY(xyz_ws, float, 3, (size_t)-1, "mean")
         .DEF_BUFFER_ARRAY(sh_coeffs, float, 16, 3, "sh")
         .DEF_BUFFER_ARRAY(rotations, float, 4)
         .DEF_BUFFER_0(scales, scales_opacs, float, 4, (size_t)-1, "", 3, 0)
         .DEF_BUFFER_0(opacities, scales_opacs, float, 4, (size_t)-1, "", 1, 3)
+        .DEF_ARRAY(scales_opacs, float)
         .DEF_BUFFER_ARRAY(tiles_touched, int32_t, (size_t)(-1))
         .DEF_BUFFER_ARRAY(rect_tile_space, int64_t, (size_t)(-1))
         .DEF_BUFFER_ARRAY(radii, int32_t, (size_t)(-1))

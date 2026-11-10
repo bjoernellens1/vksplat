@@ -157,6 +157,20 @@ public:
 
     size_t get_num_anchored_splats() const { return num_anchored_splats; }
     bool is_selective_freeze_unfrozen() const { return selective_freeze_unfrozen; }
+    const std::vector<int32_t>& get_splat_group_ids() const { return splat_group_ids; }
+    void set_selective_freeze_unfrozen(bool unfrozen) {
+        selective_freeze_unfrozen = unfrozen;
+        if (!unfrozen) {
+            anchored_xyz_snapshot_valid = false;
+        }
+    }
+    void reset_anchored_snapshot(size_t new_num_anchored) {
+        num_anchored_splats = new_num_anchored;
+        anchored_xyz_snapshot_valid = false;
+        if (num_anchored_splats > 0) {
+            resizeDeviceBuffer(anchored_xyz_ws, 3 * num_anchored_splats);
+        }
+    }
 
 private:
     std::default_random_engine rng;
@@ -170,6 +184,7 @@ private:
     bool anchored_xyz_snapshot_valid = false;
     bool selective_freeze_unfrozen = false;
     float pre_freeze_grad_ema = 0.0f;
+    std::vector<int32_t> splat_group_ids;
     Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);

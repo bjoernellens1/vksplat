@@ -208,6 +208,7 @@ void VulkanGSTrainer::load_colmap_dataset(
     float world_to_normalized_scale = 1.0f;
     if (init_reference_count == 0) {
         dataparser_transform = ColmapReader::normalize_world_space(c2w_poses, points);
+        world_to_normalized_scale = glm::length(glm::vec3(dataparser_transform[0]));
     } else {
         if (init_reference_count < 4 || init_reference_count > numPoints)
             throw std::runtime_error("init_reference_count must be between 4 and num_points");
@@ -224,6 +225,9 @@ void VulkanGSTrainer::load_colmap_dataset(
         printf("Controlled initialization: reference=%zu, added=%zu, world_to_normalized=%g\n",
                init_reference_count, numPoints - init_reference_count, world_to_normalized_scale);
     }
+    const glm::mat3 rot_world_to_norm = glm::mat3(dataparser_transform) /
+        std::max(world_to_normalized_scale, 1e-8f);
+    const glm::quat q_dp = glm::normalize(glm::quat_cast(rot_world_to_norm));
 
     const unsigned int numThreads = std::thread::hardware_concurrency();
 
@@ -375,14 +379,17 @@ void VulkanGSTrainer::load_colmap_dataset(
 
         std::string mask_path = "";
         if (config.mask_dir != "") {
+            std::string mask_dir_prefix = config.mask_dir;
+            if (mask_dir_prefix.back() != '/')
+                mask_dir_prefix += "/";
             std::vector<std::string> possible_mask_paths = {
-                config.mask_dir + rawImage.name + ".png", // colmap convention
-                config.mask_dir + rawImage.name + ".PNG",
+                mask_dir_prefix + rawImage.name + ".png", // colmap convention
+                mask_dir_prefix + rawImage.name + ".PNG",
             };
             if (rawImage.name.rfind('.') != std::string::npos)
                 possible_mask_paths.insert(possible_mask_paths.end(), {
-                    config.mask_dir + rawImage.name.substr(0, rawImage.name.rfind('.')) + ".png",
-                    config.mask_dir + rawImage.name.substr(0, rawImage.name.rfind('.')) + ".PNG",
+                    mask_dir_prefix + rawImage.name.substr(0, rawImage.name.rfind('.')) + ".png",
+                    mask_dir_prefix + rawImage.name.substr(0, rawImage.name.rfind('.')) + ".PNG",
                 });
             for (std::string temp_path : possible_mask_paths)
                 if (std::filesystem::exists(temp_path)) {
@@ -597,16 +604,55 @@ void VulkanGSTrainer::load_colmap_dataset(
                config.init_surface_mode,config.init_normal_scale_ratio);
     }
 
+    auto resolveDatasetFile = [&](const std::string& fname) -> std::string {
+        std::string p = config.dataset_dir + fname;
+        if (!std::filesystem::exists(p) && !config.dataset_dir.empty() &&
+            config.dataset_dir.back() != '/') {
+            p = config.dataset_dir + "/" + fname;
+        }
+        return p;
+    };
+
+    std::vector<glm::vec3> prior_scales_m;
+    std::vector<glm::vec4> prior_quats_wxyz;
+    std::vector<float> prior_opacities;
+    {
+        std::string scales_path = resolveDatasetFile("prior_scales_m.bin");
+        if (std::filesystem::exists(scales_path)) {
+            std::ifstream f(scales_path, std::ios::binary);
+            prior_scales_m.resize(numPoints, glm::vec3(0.0f));
+            if (!f.read(reinterpret_cast<char*>(prior_scales_m.data()),
+                        static_cast<std::streamsize>(numPoints * sizeof(glm::vec3)))) {
+                prior_scales_m.clear();
+            }
+        }
+        std::string quats_path = resolveDatasetFile("prior_quats_wxyz.bin");
+        if (std::filesystem::exists(quats_path)) {
+            std::ifstream f(quats_path, std::ios::binary);
+            prior_quats_wxyz.resize(numPoints, glm::vec4(0.0f));
+            if (!f.read(reinterpret_cast<char*>(prior_quats_wxyz.data()),
+                        static_cast<std::streamsize>(numPoints * sizeof(glm::vec4)))) {
+                prior_quats_wxyz.clear();
+            }
+        }
+        std::string opacs_path = resolveDatasetFile("prior_opacities.bin");
+        if (std::filesystem::exists(opacs_path)) {
+            std::ifstream f(opacs_path, std::ios::binary);
+            prior_opacities.resize(numPoints, 0.0f);
+            if (!f.read(reinterpret_cast<char*>(prior_opacities.data()),
+                        static_cast<std::streamsize>(numPoints * sizeof(float)))) {
+                prior_opacities.clear();
+            }
+        }
+    }
+
     for (size_t pointIdx = 0; pointIdx < numPoints; pointIdx++) {
 
         // position
         xyz_ws[pointIdx] = points[pointIdx];
 
-        // quaternion
-        glm::vec4 quat = glm::normalize(glm::vec4(unit_normal(rng), unit_normal(rng), unit_normal(rng), unit_normal(rng)));  // per Nerfstudio (uses a different parameterization)
-        // glm::vec4 quat = glm::vec4(unit_uniform(rng), unit_uniform(rng), unit_uniform(rng), unit_uniform(rng));  // per GSplat
-        // quat = glm::vec4(1, 0, 0, 0);  // per Inria
-        // Anisotropic control: identical eigenvalues, different rotation only.
+        // quaternion (w, x, y, z) matching Slang quat_to_rotmat
+        glm::vec4 quat = glm::normalize(glm::vec4(unit_normal(rng), unit_normal(rng), unit_normal(rng), unit_normal(rng)));
         float scale=config.init_scale * dist_avg[pointIdx];
         float opac=config.init_opacity;
         glm::vec3 radii(scale);
@@ -620,7 +666,29 @@ void VulkanGSTrainer::load_colmap_dataset(
                 const auto t=glm::normalize(glm::cross(ref,n));
                 const auto b=glm::normalize(glm::cross(n,t));
                 const glm::quat q=glm::quat_cast(glm::mat3(t,b,n));
-                quat=glm::vec4(q.x,q.y,q.z,q.w);
+                quat=glm::vec4(q.w,q.x,q.y,q.z);
+            }
+        }
+        if (!prior_scales_m.empty()) {
+            const glm::vec3 ps = prior_scales_m[pointIdx];
+            if (ps.x > 0.0f && ps.y > 0.0f && ps.z > 0.0f &&
+                std::isfinite(ps.x) && std::isfinite(ps.y) && std::isfinite(ps.z)) {
+                radii = ps * world_to_normalized_scale;
+            }
+        }
+        if (!prior_quats_wxyz.empty()) {
+            const glm::vec4 pq = prior_quats_wxyz[pointIdx];
+            const float pq_norm2 = glm::dot(pq, pq);
+            if (pq_norm2 > 1e-8f && std::isfinite(pq_norm2)) {
+                const glm::quat q_world = glm::normalize(glm::quat(pq.x, pq.y, pq.z, pq.w));
+                const glm::quat q_norm = glm::normalize(q_dp * q_world);
+                quat = glm::vec4(q_norm.w, q_norm.x, q_norm.y, q_norm.z);
+            }
+        }
+        if (!prior_opacities.empty()) {
+            const float po = prior_opacities[pointIdx];
+            if (po > 0.0f && std::isfinite(po)) {
+                opac = glm::clamp(po, 0.005f, 0.995f);
             }
         }
         rotations[pointIdx]=quat;
@@ -638,17 +706,15 @@ void VulkanGSTrainer::load_colmap_dataset(
     anchored_xyz_snapshot_valid = false;
     selective_freeze_unfrozen = false;
     pre_freeze_grad_ema = 0.0f;
+    splat_group_ids.assign(numPoints, -1);
     if (config.selective_plane_freeze) {
-        std::string group_bin_path = config.dataset_dir + "plane_group_ids.bin";
-        if (!std::filesystem::exists(group_bin_path) && !config.dataset_dir.empty() &&
-            config.dataset_dir.back() != '/') {
-            group_bin_path = config.dataset_dir + "/plane_group_ids.bin";
-        }
+        std::string group_bin_path = resolveDatasetFile("plane_group_ids.bin");
         if (std::filesystem::exists(group_bin_path)) {
             std::ifstream gfile(group_bin_path, std::ios::binary);
             std::vector<int32_t> group_ids(numPoints, -1);
             if (gfile.read(reinterpret_cast<char*>(group_ids.data()),
                            static_cast<std::streamsize>(numPoints * sizeof(int32_t)))) {
+                splat_group_ids = group_ids;
                 std::vector<size_t> anchored_idx;
                 std::vector<size_t> unanchored_idx;
                 anchored_idx.reserve(numPoints);
@@ -691,11 +757,13 @@ void VulkanGSTrainer::load_colmap_dataset(
                     std::vector<glm::vec3> new_sh(kNumSH * numPoints);
                     std::vector<glm::vec4> new_rot(numPoints);
                     std::vector<glm::vec4> new_so(numPoints);
+                    std::vector<int32_t> new_gids(numPoints, -1);
                     for (size_t dst = 0; dst < numPoints; ++dst) {
                         size_t src = perm[dst];
                         new_xyz[dst] = xyz_ws[src];
                         new_rot[dst] = rotations[src];
                         new_so[dst] = scales_opacs[src];
+                        new_gids[dst] = group_ids[src];
                         for (int k = 0; k < kNumSH; ++k)
                             new_sh[kNumSH * dst + k] = sh_coeffs[kNumSH * src + k];
                     }
@@ -703,6 +771,7 @@ void VulkanGSTrainer::load_colmap_dataset(
                     std::memcpy(sh_coeffs, new_sh.data(), kNumSH * numPoints * sizeof(glm::vec3));
                     std::memcpy(rotations, new_rot.data(), numPoints * sizeof(glm::vec4));
                     std::memcpy(scales_opacs, new_so.data(), numPoints * sizeof(glm::vec4));
+                    splat_group_ids = std::move(new_gids);
                 }
                 printf("Selective plane freeze loaded: %zu / %zu anchored planar splats\n",
                        num_anchored_splats, numPoints);
@@ -1070,7 +1139,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             if (config.selective_plane_freeze && num_anchored_splats > 0 &&
-                num_anchored_splats <= num_splats && !selective_freeze_unfrozen) {
+                num_anchored_splats <= num_splats) {
                 bufferMemoryBarrier({
                     { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
@@ -1188,7 +1257,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             }
         );
         if (config.selective_plane_freeze && num_anchored_splats > 0 &&
-            num_anchored_splats <= num_splats && !selective_freeze_unfrozen) {
+            num_anchored_splats <= num_splats) {
             bufferMemoryBarrier({
                 { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, TRANSFER_WRITE);
@@ -1658,12 +1727,15 @@ void VulkanGSTrainer::writePLY(std::string filename, VulkanGSPipelineBuffers& bu
     copyFromDevice(buffers.scales_opacs);
     buffers.undoReorderSH(buffers.sh_coeffs, buffers.num_splats);
 
+    std::vector<float> ply_scales_opacs(buffers.scales_opacs.begin(),
+                                        buffers.scales_opacs.begin() + 4 * num_splats);
     for (size_t i = 0; i < num_splats; i++) {
-        float* p = &buffers.scales_opacs[4*i];
-        p[0] = logf(p[0]);
-        p[1] = logf(p[1]);
-        p[2] = logf(p[2]);
-        p[3] = logf(p[3] / (1.0f - p[3]));
+        float* p = &ply_scales_opacs[4*i];
+        p[0] = logf(std::max(p[0], 1e-8f));
+        p[1] = logf(std::max(p[1], 1e-8f));
+        p[2] = logf(std::max(p[2], 1e-8f));
+        float opa = std::clamp(p[3], 1e-6f, 1.0f - 1e-6f);
+        p[3] = logf(opa / (1.0f - opa));
     }
 
     FILE* fp = fopen(filename.c_str(), "wb");
@@ -1684,7 +1756,7 @@ void VulkanGSTrainer::writePLY(std::string filename, VulkanGSPipelineBuffers& bu
             // [i if i < 3 else (i%3)*15+(i//3)+2 for i in range(48)]
             { 0, 1, 2, 3, 18, 33, 4, 19, 34, 5, 20, 35, 6, 21, 36, 7, 22, 37, 8, 23, 38, 9, 24, 39, 10, 25, 40, 11, 26, 41, 12, 27, 42, 13, 28, 43, 14, 29, 44, 15, 30, 45, 16, 31, 46, 17, 32, 47 }
         },
-        { 4, buffers.scales_opacs.data(), { "opacity", "scale_0", "scale_1", "scale_2" }, { 1, 2, 3, 0 } },
+        { 4, ply_scales_opacs.data(), { "opacity", "scale_0", "scale_1", "scale_2" }, { 1, 2, 3, 0 } },
         { 4, buffers.rotations.data(), { "rot_0", "rot_1", "rot_2", "rot_3" }, { 0, 1, 2, 3 } },
     });
     std::vector<int> offsets = { 0 };
@@ -1713,4 +1785,5 @@ void VulkanGSTrainer::writePLY(std::string filename, VulkanGSPipelineBuffers& bu
     }
 
     fclose(fp);
+    buffers.reorderSH(buffers.sh_coeffs);
 }
