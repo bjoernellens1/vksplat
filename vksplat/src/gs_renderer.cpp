@@ -208,13 +208,16 @@ void VulkanGSRenderer::executeRasterizeForward(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
-    if (buffers.num_indices == 0)
-        return;
-
     PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
     DEVICE_GUARD;
 
     size_t num_pixels = uniforms.image_height * uniforms.image_width;
+
+    if (buffers.num_indices == 0) {
+        clearDeviceBuffer(buffers.pixel_state, 4 * num_pixels);
+        clearDeviceBuffer(buffers.n_contributors, num_pixels);
+        return;
+    }
 
     bufferMemoryBarrier({
         { buffers.sorted_gauss_idx().deviceBuffer, COMPUTE_SHADER_WRITE },

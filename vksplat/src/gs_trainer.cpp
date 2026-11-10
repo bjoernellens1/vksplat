@@ -1423,32 +1423,49 @@ void VulkanGSTrainer::executeMCMCPostBackward(
         bufferMemoryBarrier({
             { buffers.mcmc_sample_probs.deviceBuffer, COMPUTE_SHADER_WRITE },
         }, COMPUTE_SHADER_READ);
-        executeCumsum(
-            buffers,
-            buffers.mcmc_sample_probs,
-            buffers.mcmc_sample_probs_cumsum
-        );
+        int32_t total_prob_reloc = executeSum(buffers, buffers.mcmc_sample_probs);
+        int32_t num_relocate = 0;
+        if (total_prob_reloc > 0) {
+            executeCumsum(
+                buffers,
+                buffers.mcmc_sample_probs,
+                buffers.mcmc_sample_probs_cumsum
+            );
 
-        // 3) Compute relocation index map
-        clearDeviceBuffer(buffers.mcmc_n_idx_buffer, num_splats);
-        bufferMemoryBarrier({
-            { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-            { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
-        }, COMPUTE_SHADER_READ_WRITE);
-        executeCompute(
-            {{num_splats, kGroupSize}},
-            &uniforms, 4*sizeof(Uniform32_t),
-            pipeline_mcmc.compute_relocation_index_map,
-            {
-                buffers.mcmc_sample_probs.deviceBuffer,
-                buffers.mcmc_sample_probs_cumsum.deviceBuffer,
-                resizeDeviceBuffer(buffers.mcmc_index_map, num_splats),
-                buffers.mcmc_n_idx_buffer.deviceBuffer,
-            }
-        );
+            // 3) Compute relocation index map
+            clearDeviceBuffer(buffers.mcmc_n_idx_buffer, num_splats);
+            bufferMemoryBarrier({
+                { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+                { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+            executeCompute(
+                {{num_splats, kGroupSize}},
+                &uniforms, 4*sizeof(Uniform32_t),
+                pipeline_mcmc.compute_relocation_index_map,
+                {
+                    buffers.mcmc_sample_probs.deviceBuffer,
+                    buffers.mcmc_sample_probs_cumsum.deviceBuffer,
+                    resizeDeviceBuffer(buffers.mcmc_index_map, num_splats),
+                    buffers.mcmc_n_idx_buffer.deviceBuffer,
+                }
+            );
 
-        // (optional) get number of relocated Gaussians for printing
-        int32_t num_relocate = executeSum(buffers, buffers.mcmc_n_idx_buffer);
+            num_relocate = executeSum(buffers, buffers.mcmc_n_idx_buffer);
+        }
+
+        // Preserve pre-relocation group_ids/entity_ids and optionally snapshot protected structural groups
+        std::vector<float> saved_xyz, saved_sh, saved_rot, saved_so;
+        const bool protect_groups = config.mcmc_protect_structural_groups && !splat_group_ids.empty();
+        if (protect_groups) {
+            copyFromDevice(buffers.xyz_ws);
+            copyFromDevice(buffers.sh_coeffs);
+            copyFromDevice(buffers.rotations);
+            copyFromDevice(buffers.scales_opacs);
+            saved_xyz = buffers.xyz_ws;
+            saved_sh = buffers.sh_coeffs;
+            saved_rot = buffers.rotations;
+            saved_so = buffers.scales_opacs;
+        }
 
         if (num_relocate > 0) {
 
@@ -1489,6 +1506,29 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }
             );
 
+            // MC-1: Update splat_group_ids and splat_entity_ids for relocated dead splats
+            if (!splat_group_ids.empty()) {
+                copyFromDevice(buffers.mcmc_index_map);
+                if (splat_group_ids.size() < num_splats)
+                    splat_group_ids.resize(num_splats, -1);
+                if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
+                    splat_entity_ids.resize(num_splats, -1);
+                std::vector<int32_t> old_gids = splat_group_ids;
+                std::vector<int32_t> old_eids = splat_entity_ids;
+                for (size_t i = 0; i < num_splats && i < buffers.mcmc_index_map.size(); ++i) {
+                    int32_t src = buffers.mcmc_index_map[i];
+                    if (src >= 0 && (size_t)src < num_splats && (size_t)src != i) {
+                        if (protect_groups && old_gids[i] >= 0) {
+                            continue;
+                        }
+                        splat_group_ids[i] = old_gids[src];
+                        if (!splat_entity_ids.empty()) {
+                            splat_entity_ids[i] = old_eids[src];
+                        }
+                    }
+                }
+            }
+            mcmc_relocated_count += (size_t)num_relocate;
         }
 
         // Add more GS */
@@ -1516,67 +1556,108 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             bufferMemoryBarrier({
                 { buffers.mcmc_sample_probs.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, COMPUTE_SHADER_READ);
-            executeCumsum(
-                buffers,
-                buffers.mcmc_sample_probs,
-                buffers.mcmc_sample_probs_cumsum
-            );
+            int32_t total_prob_add = executeSum(buffers, buffers.mcmc_sample_probs);
+            if (total_prob_add > 0) {
+                executeCumsum(
+                    buffers,
+                    buffers.mcmc_sample_probs,
+                    buffers.mcmc_sample_probs_cumsum
+                );
 
-            // 3) [dN] Compute add index map
-            clearDeviceBuffer(buffers.mcmc_n_idx_buffer, num_splats);
-            bufferMemoryBarrier({
-                { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-                { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
-            }, COMPUTE_SHADER_READ_WRITE);
-            executeCompute(
-                {{num_add, kGroupSize}},
-                &uniforms, 4*sizeof(Uniform32_t),
-                pipeline_mcmc.compute_add_index_map,
-                {
-                    buffers.mcmc_sample_probs_cumsum.deviceBuffer,
-                    resizeDeviceBuffer(buffers.mcmc_index_map, num_add),
-                    buffers.mcmc_n_idx_buffer.deviceBuffer,
+                // 3) [dN] Compute add index map
+                clearDeviceBuffer(buffers.mcmc_n_idx_buffer, num_splats);
+                bufferMemoryBarrier({
+                    { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+                    { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ_WRITE);
+                executeCompute(
+                    {{num_add, kGroupSize}},
+                    &uniforms, 4*sizeof(Uniform32_t),
+                    pipeline_mcmc.compute_add_index_map,
+                    {
+                        buffers.mcmc_sample_probs_cumsum.deviceBuffer,
+                        resizeDeviceBuffer(buffers.mcmc_index_map, num_add),
+                        buffers.mcmc_n_idx_buffer.deviceBuffer,
+                    }
+                );
+
+                // 4) [N] Compute attributes for Gaussians added to
+                bufferMemoryBarrier({
+                    { buffers.mcmc_n_idx_buffer.deviceBuffer, COMPUTE_SHADER_WRITE },
+                }, COMPUTE_SHADER_READ);
+                executeCompute(
+                    {{num_splats, kGroupSizeSparse}},
+                    &uniforms, 4*sizeof(Uniform32_t),
+                    pipeline_mcmc.compute_add,
+                    {
+                        buffers.mcmc_n_idx_buffer.deviceBuffer,
+                        buffers.scales_opacs.deviceBuffer,
+                    }
+                );
+
+                // 5) [dN] Update attributes for Gaussians added from
+                size_t alloc_size = num_splats;
+                if (config.strategy == TrainerConfig::Strategy::MCMC)
+                    alloc_size = std::max(alloc_size, (size_t)config.cap_max);
+                barrierAllGaussParams(buffers);
+                executeCompute(
+                    {{num_add, kGroupSize}},
+                    &uniforms, 4*sizeof(Uniform32_t),
+                    pipeline_mcmc.update_add,
+                    {
+                        buffers.mcmc_index_map.deviceBuffer,
+                        resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3*alloc_size, false),
+                        resizeAndCopyDeviceBuffer(buffers.sh_coeffs, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
+                        resizeAndCopyDeviceBuffer(buffers.rotations, 4*alloc_size, false),
+                        resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4*alloc_size, false),
+                        resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 3*2*alloc_size, false),
+                        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
+                        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
+                        resizeAndCopyDeviceBuffer(buffers.g_rotations, 4*2*alloc_size, false),
+                        resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 4*2*alloc_size, false),
+                    }
+                );
+
+                if (!splat_group_ids.empty()) {
+                    copyFromDevice(buffers.mcmc_index_map);
+                    if (splat_group_ids.size() < num_splats)
+                        splat_group_ids.resize(num_splats, -1);
+                    splat_group_ids.resize(new_num_splats, -1);
+                    if (!splat_entity_ids.empty())
+                        splat_entity_ids.resize(new_num_splats, -1);
+                    for (size_t k = 0; k < num_add && k < buffers.mcmc_index_map.size(); ++k) {
+                        int32_t src = buffers.mcmc_index_map[k];
+                        if (src >= 0 && (size_t)src < num_splats) {
+                            splat_group_ids[num_splats + k] = splat_group_ids[src];
+                            if (!splat_entity_ids.empty()) {
+                                splat_entity_ids[num_splats + k] = splat_entity_ids[src];
+                            }
+                        }
+                    }
                 }
-            );
+                buffers.num_splats = new_num_splats;
+                mcmc_added_count += num_add;
+            } else {
+                num_add = 0;
+            }
+        }
 
-            // 4) [N] Compute attributes for Gaussians added to
-            bufferMemoryBarrier({
-                { buffers.mcmc_n_idx_buffer.deviceBuffer, COMPUTE_SHADER_WRITE },
-            }, COMPUTE_SHADER_READ);
-            executeCompute(
-                {{num_splats, kGroupSizeSparse}},
-                &uniforms, 4*sizeof(Uniform32_t),
-                pipeline_mcmc.compute_add,
-                {
-                    buffers.mcmc_n_idx_buffer.deviceBuffer,
-                    buffers.scales_opacs.deviceBuffer,
+        // MC-2: Restore protected structural group splats if mcmc_protect_structural_groups is enabled
+        if (protect_groups && !saved_xyz.empty()) {
+            copyFromDevice(buffers.xyz_ws);
+            copyFromDevice(buffers.sh_coeffs);
+            copyFromDevice(buffers.rotations);
+            copyFromDevice(buffers.scales_opacs);
+            for (size_t i = 0; i < num_splats && i < splat_group_ids.size(); ++i) {
+                if (splat_group_ids[i] >= 0) {
+                    for (int c = 0; c < 3; ++c) buffers.xyz_ws[3 * i + c] = saved_xyz[3 * i + c];
+                    for (int c = 0; c < 4; ++c) buffers.rotations[4 * i + c] = saved_rot[4 * i + c];
+                    for (int c = 0; c < 4; ++c) buffers.scales_opacs[4 * i + c] = saved_so[4 * i + c];
                 }
-            );
-
-            // 5) [dN] Update attributes for Gaussians added from
-            size_t alloc_size = num_splats;
-            if (config.strategy == TrainerConfig::Strategy::MCMC)
-                alloc_size = std::max(alloc_size, (size_t)config.cap_max);
-            barrierAllGaussParams(buffers);
-            executeCompute(
-                {{num_add, kGroupSize}},
-                &uniforms, 4*sizeof(Uniform32_t),
-                pipeline_mcmc.update_add,
-                {
-                    buffers.mcmc_index_map.deviceBuffer,
-                    resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3*alloc_size, false),
-                    resizeAndCopyDeviceBuffer(buffers.sh_coeffs, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
-                    resizeAndCopyDeviceBuffer(buffers.rotations, 4*alloc_size, false),
-                    resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4*alloc_size, false),
-                    resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 3*2*alloc_size, false),
-                    resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
-                    resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), false),
-                    resizeAndCopyDeviceBuffer(buffers.g_rotations, 4*2*alloc_size, false),
-                    resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 4*2*alloc_size, false),
-                }
-            );
-
-            buffers.num_splats = new_num_splats;
+            }
+            copyToDevice(buffers.xyz_ws);
+            copyToDevice(buffers.rotations);
+            copyToDevice(buffers.scales_opacs);
         }
 
         printf("\n%d relocate, %d add -> %d splats\n", num_relocate, (int)num_add, (int)buffers.num_splats);
@@ -1585,12 +1666,18 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     }
 
   #if 1
-    if (step % config.refine_every == 0) {
+    if (step % config.refine_every == 0 && !(config.mcmc_protect_structural_groups && !splat_group_ids.empty())) {
         executeMortonSorting(renderer_uniforms, buffers);
     }
   #endif
 
-    // inject noise
+    // inject noise (snapshot & restore protected structural group means if mcmc_protect_structural_groups is enabled)
+    std::vector<float> pre_noise_xyz;
+    if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
+        copyFromDevice(buffers.xyz_ws);
+        pre_noise_xyz = buffers.xyz_ws;
+    }
+    uniforms[0].u = (uint32_t)buffers.num_splats;
     uniforms[1].u = uniforms[2].u;  // seed
     uniforms[2].u = renderer_uniforms.image_width;
     uniforms[3].u = renderer_uniforms.image_height;
@@ -1601,7 +1688,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
         { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
     executeCompute(
-        {{num_splats, kGroupSize}},
+        {{buffers.num_splats, kGroupSize}},
         &uniforms, 5*sizeof(Uniform32_t),
         pipeline_mcmc.inject_noise,
         {
@@ -1611,6 +1698,17 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             buffers.scales_opacs.deviceBuffer,
         }
     );
+    if (config.mcmc_protect_structural_groups && !pre_noise_xyz.empty()) {
+        copyFromDevice(buffers.xyz_ws);
+        for (size_t i = 0; i < buffers.num_splats && i < splat_group_ids.size(); ++i) {
+            if (splat_group_ids[i] >= 0 && 3 * i + 2 < pre_noise_xyz.size()) {
+                buffers.xyz_ws[3 * i + 0] = pre_noise_xyz[3 * i + 0];
+                buffers.xyz_ws[3 * i + 1] = pre_noise_xyz[3 * i + 1];
+                buffers.xyz_ws[3 * i + 2] = pre_noise_xyz[3 * i + 2];
+            }
+        }
+        copyToDevice(buffers.xyz_ws);
+    }
 
 }
 
@@ -1714,6 +1812,36 @@ void VulkanGSTrainer::executeMortonSorting(
     applyIndex(buffers.default_grad, 2*2);
     barrierAllGaussParams(buffers);
 
+    // MC-1: Permute splat_group_ids and splat_entity_ids to match Morton-sorted order
+    if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+        copyFromDevice(buffers.sorted_gauss_idx());
+        const auto& idx_buf = buffers.sorted_gauss_idx();
+        if (!splat_group_ids.empty()) {
+            if (splat_group_ids.size() < num_splats)
+                splat_group_ids.resize(num_splats, -1);
+            std::vector<int32_t> new_gids(num_splats, -1);
+            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
+                int32_t src = idx_buf[i];
+                if (src >= 0 && (size_t)src < splat_group_ids.size()) {
+                    new_gids[i] = splat_group_ids[src];
+                }
+            }
+            splat_group_ids = std::move(new_gids);
+        }
+        if (!splat_entity_ids.empty()) {
+            if (splat_entity_ids.size() < num_splats)
+                splat_entity_ids.resize(num_splats, -1);
+            std::vector<int32_t> new_eids(num_splats, -1);
+            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
+                int32_t src = idx_buf[i];
+                if (src >= 0 && (size_t)src < splat_entity_ids.size()) {
+                    new_eids[i] = splat_entity_ids[src];
+                }
+            }
+            splat_entity_ids = std::move(new_eids);
+        }
+    }
+
 }
 
 
@@ -1786,4 +1914,184 @@ void VulkanGSTrainer::writePLY(std::string filename, VulkanGSPipelineBuffers& bu
 
     fclose(fp);
     buffers.reorderSH(buffers.sh_coeffs);
+}
+
+size_t VulkanGSTrainer::append_train_image_from_memory(
+    const std::string& image_name,
+    const uint8_t* rgba_pixels,
+    int h,
+    int w,
+    float fx,
+    float fy,
+    float cx,
+    float cy,
+    const float* c2w_world_row_major
+) {
+    HOST_GUARD;
+    Camera camera{};
+    camera.model = Camera::PINHOLE;
+    camera.h = h;
+    camera.w = w;
+    camera.fx = fx;
+    camera.fy = fy;
+    camera.cx = cx;
+    camera.cy = cy;
+
+    // Convert row-major 4x4 c2w_world to column-major glm::mat4
+    glm::mat4 c2w_world(1.0f);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            c2w_world[c][r] = c2w_world_row_major[4 * r + c];
+
+    // Apply dataparser_transform exactly as ColmapReader::normalize_world_space does:
+    // scale translation, rotate camera basis
+    const float scale = glm::length(glm::vec3(dataparser_transform[0]));
+    const glm::mat3 rot_dp = glm::mat3(dataparser_transform) / std::max(scale, 1e-8f);
+    const glm::vec3 trans_dp = glm::vec3(dataparser_transform[3]);
+    glm::mat4 c2w_norm(1.0f);
+    glm::mat3 R_norm = rot_dp * glm::mat3(c2w_world);
+    glm::vec3 t_norm = glm::mat3(dataparser_transform) * glm::vec3(c2w_world[3]) + trans_dp;
+    c2w_norm[0] = glm::vec4(R_norm[0], 0.0f);
+    c2w_norm[1] = glm::vec4(R_norm[1], 0.0f);
+    c2w_norm[2] = glm::vec4(R_norm[2], 0.0f);
+    c2w_norm[3] = glm::vec4(t_norm, 1.0f);
+    camera.world_view_transform = glm::inverse(c2w_norm);
+
+    DatasetImage image;
+    image.image_path = image_name;
+    image.mask_path = "";
+    image.camera = camera;
+    const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
+    image.buffer.resize(n_bytes);
+    image.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
+    copyToDevice(image.buffer);
+
+    dataset_train.push_back(std::move(image));
+    return dataset_train.size() - 1;
+}
+
+void VulkanGSTrainer::replace_train_image_from_memory(
+    size_t train_idx,
+    const std::string& image_name,
+    const uint8_t* rgba_pixels,
+    int h,
+    int w,
+    float fx,
+    float fy,
+    float cx,
+    float cy,
+    const float* c2w_world_row_major
+) {
+    HOST_GUARD;
+    if (train_idx >= dataset_train.size()) {
+        throw std::runtime_error("replace_train_image_from_memory: train_idx out of range");
+    }
+    auto& slot = dataset_train[train_idx];
+    slot.image_path = image_name;
+    slot.camera.model = Camera::PINHOLE;
+    slot.camera.h = h;
+    slot.camera.w = w;
+    slot.camera.fx = fx;
+    slot.camera.fy = fy;
+    slot.camera.cx = cx;
+    slot.camera.cy = cy;
+
+    glm::mat4 c2w_world(1.0f);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            c2w_world[c][r] = c2w_world_row_major[4 * r + c];
+
+    const float scale = glm::length(glm::vec3(dataparser_transform[0]));
+    const glm::mat3 rot_dp = glm::mat3(dataparser_transform) / std::max(scale, 1e-8f);
+    const glm::vec3 trans_dp = glm::vec3(dataparser_transform[3]);
+    glm::mat4 c2w_norm(1.0f);
+    glm::mat3 R_norm = rot_dp * glm::mat3(c2w_world);
+    glm::vec3 t_norm = glm::mat3(dataparser_transform) * glm::vec3(c2w_world[3]) + trans_dp;
+    c2w_norm[0] = glm::vec4(R_norm[0], 0.0f);
+    c2w_norm[1] = glm::vec4(R_norm[1], 0.0f);
+    c2w_norm[2] = glm::vec4(R_norm[2], 0.0f);
+    c2w_norm[3] = glm::vec4(t_norm, 1.0f);
+    slot.camera.world_view_transform = glm::inverse(c2w_norm);
+
+    const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
+    slot.buffer.resize(n_bytes);
+    slot.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
+    copyToDevice(slot.buffer);
+}
+
+size_t VulkanGSTrainer::append_splats_preserving_optimizer(
+    VulkanGSPipelineBuffers& buffers,
+    const float* new_xyz_norm,
+    const float* new_sh_coeffs,
+    const float* new_rotations,
+    const float* new_scales,
+    const float* new_opacities,
+    const int32_t* new_group_ids,
+    size_t n_add
+) {
+    HOST_GUARD;
+    if (n_add == 0)
+        return buffers.num_splats;
+
+    const size_t old_n = buffers.num_splats;
+    const size_t new_n = old_n + n_add;
+    const size_t kNumSH = 16;
+
+    // 1. Pull current active Gaussian parameters from GPU to host
+    copyFromDevice(buffers.xyz_ws);
+    copyFromDevice(buffers.sh_coeffs);
+    copyFromDevice(buffers.rotations);
+    copyFromDevice(buffers.scales_opacs);
+    buffers.undoReorderSH(buffers.sh_coeffs, old_n);
+
+    // 2. Append new parameters on host
+    buffers.xyz_ws.resize(3 * new_n);
+    std::memcpy(buffers.xyz_ws.data() + 3 * old_n, new_xyz_norm, 3 * n_add * sizeof(float));
+
+    buffers.sh_coeffs.resize(kNumSH * 3 * new_n);
+    std::memcpy(buffers.sh_coeffs.data() + kNumSH * 3 * old_n, new_sh_coeffs, kNumSH * 3 * n_add * sizeof(float));
+    buffers.reorderSH(buffers.sh_coeffs);
+
+    buffers.rotations.resize(4 * new_n);
+    std::memcpy(buffers.rotations.data() + 4 * old_n, new_rotations, 4 * n_add * sizeof(float));
+
+    buffers.scales_opacs.resize(4 * new_n);
+    for (size_t i = 0; i < n_add; ++i) {
+        float* dst = buffers.scales_opacs.data() + 4 * (old_n + i);
+        dst[0] = new_scales[3 * i + 0];
+        dst[1] = new_scales[3 * i + 1];
+        dst[2] = new_scales[3 * i + 2];
+        dst[3] = new_opacities[i];
+    }
+
+    if (splat_group_ids.size() < old_n) {
+        splat_group_ids.resize(old_n, -1);
+    }
+    splat_group_ids.resize(new_n, -1);
+    if (new_group_ids != nullptr) {
+        std::memcpy(splat_group_ids.data() + old_n, new_group_ids, n_add * sizeof(int32_t));
+    }
+
+    // 3. Copy updated Gaussian parameters to device
+    copyToDevice(buffers.xyz_ws);
+    copyToDevice(buffers.sh_coeffs);
+    copyToDevice(buffers.rotations);
+    copyToDevice(buffers.scales_opacs);
+
+    // 4. Grow Adam optimizer state buffers on device WITHOUT resetting existing splats' moments
+    {
+        DEVICE_GUARD;
+        barrierAllGaussParams(buffers);
+        resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 2 * 3 * new_n, true);
+        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
+        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
+        resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * new_n, true);
+        resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * new_n, true);
+        resizeAndCopyDeviceBuffer(buffers.default_grad, 2 * new_n, true);
+        resizeAndCopyDeviceBuffer(buffers.default_radii, new_n, true);
+        buffers.num_splats = new_n;
+        barrierAllGaussParams(buffers);
+    }
+
+    return buffers.num_splats;
 }

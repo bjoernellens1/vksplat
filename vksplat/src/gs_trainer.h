@@ -92,6 +92,7 @@ struct TrainerConfig {
     float min_opacity;
     float grow_factor;
     int cap_max;
+    bool mcmc_protect_structural_groups = false;
 };
 
 
@@ -158,6 +159,9 @@ public:
     size_t get_num_anchored_splats() const { return num_anchored_splats; }
     bool is_selective_freeze_unfrozen() const { return selective_freeze_unfrozen; }
     const std::vector<int32_t>& get_splat_group_ids() const { return splat_group_ids; }
+    const std::vector<int32_t>& get_splat_entity_ids() const { return splat_entity_ids; }
+    size_t get_mcmc_relocated_count() const { return mcmc_relocated_count; }
+    size_t get_mcmc_added_count() const { return mcmc_added_count; }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         selective_freeze_unfrozen = unfrozen;
         if (!unfrozen) {
@@ -171,6 +175,47 @@ public:
             resizeDeviceBuffer(anchored_xyz_ws, 3 * num_anchored_splats);
         }
     }
+    void set_splat_group_ids(const std::vector<int32_t>& gids) {
+        splat_group_ids = gids;
+    }
+    void set_splat_entity_ids(const std::vector<int32_t>& eids) {
+        splat_entity_ids = eids;
+    }
+
+    // CSE-0: Streaming frame and optimizer-preserving splat append APIs
+    size_t append_train_image_from_memory(
+        const std::string& image_name,
+        const uint8_t* rgba_pixels,
+        int h,
+        int w,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        const float* c2w_world_row_major
+    );
+    void replace_train_image_from_memory(
+        size_t train_idx,
+        const std::string& image_name,
+        const uint8_t* rgba_pixels,
+        int h,
+        int w,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        const float* c2w_world_row_major
+    );
+    size_t append_splats_preserving_optimizer(
+        VulkanGSPipelineBuffers& buffers,
+        const float* new_xyz_norm,
+        const float* new_sh_coeffs,
+        const float* new_rotations,
+        const float* new_scales,
+        const float* new_opacities,
+        const int32_t* new_group_ids,
+        size_t n_add
+    );
 
 private:
     std::default_random_engine rng;
@@ -185,6 +230,9 @@ private:
     bool selective_freeze_unfrozen = false;
     float pre_freeze_grad_ema = 0.0f;
     std::vector<int32_t> splat_group_ids;
+    std::vector<int32_t> splat_entity_ids;
+    size_t mcmc_relocated_count = 0;
+    size_t mcmc_added_count = 0;
     Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);

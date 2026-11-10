@@ -54,6 +54,9 @@ public:
         }
         else if (n2 == (size_t)(-1)) {
             typedef std::array<py::ssize_t, 2> dim2;
+            if (reorder == "mean" || n1 == 3 || n1 == 4) {
+                n0 = std::min(n0, buffers.num_splats);
+            }
             if (n1_actual == (size_t)-1)
                 n1_actual = n1;
             return py::array_t<To>(
@@ -64,11 +67,18 @@ public:
         }
         else {
             typedef std::array<py::ssize_t, 3> dim3;
-            return py::array_t<To>(
+            if (reorder == "sh") {
+                n0 = std::min(n0, buffers.num_splats);
+            }
+            py::array_t<To> res(
                 dim3({ (py::ssize_t)n0, (py::ssize_t)n1, (py::ssize_t)n2 }),
                 dim3({ (py::ssize_t)(n1*n2*sizeof(To)), (py::ssize_t)(n2*sizeof(To)), sizeof(To) }),
                 sizeof(Ti) == sizeof(To) ? (To*)buffer.data() : toFloat(buffer.data())
             );
+            if (reorder == "sh") {
+                buffers.reorderSH(buffer);
+            }
+            return res;
         }
     }
 
@@ -232,6 +242,8 @@ public:
         config.min_opacity = train_config["min_opacity"].cast<float>();
         config.grow_factor = train_config["grow_factor"].cast<float>();
         config.cap_max = train_config["cap_max"].cast<int>();
+        config.mcmc_protect_structural_groups = train_config.contains(py::str("mcmc_protect_structural_groups"))
+            ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
 
         // load dataset
         trainer.load_colmap_dataset(config, buffers);
@@ -261,11 +273,182 @@ public:
         const auto& gids = trainer.get_splat_group_ids();
         return py::array_t<int32_t>({gids.size()}, {sizeof(int32_t)}, gids.data());
     }
+    py::array_t<int32_t> get_splat_entity_ids() {
+        const auto& eids = trainer.get_splat_entity_ids();
+        return py::array_t<int32_t>({eids.size()}, {sizeof(int32_t)}, eids.data());
+    }
+    py::dict get_mcmc_stats() {
+        py::dict st;
+        st["relocated_count"] = trainer.get_mcmc_relocated_count();
+        st["added_count"] = trainer.get_mcmc_added_count();
+        st["num_splats"] = buffers.num_splats;
+        st["cap_max"] = config.cap_max;
+        st["mcmc_protect_structural_groups"] = config.mcmc_protect_structural_groups;
+        return st;
+    }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         trainer.set_selective_freeze_unfrozen(unfrozen);
     }
     void reset_anchored_snapshot(size_t new_num_anchored) {
         trainer.reset_anchored_snapshot(new_num_anchored);
+    }
+    void set_splat_group_ids(py::array_t<int32_t> gids_arr) {
+        auto buf = gids_arr.request();
+        std::vector<int32_t> vec((int32_t*)buf.ptr, (int32_t*)buf.ptr + buf.size);
+        trainer.set_splat_group_ids(vec);
+    }
+    void set_splat_entity_ids(py::array_t<int32_t> eids_arr) {
+        auto buf = eids_arr.request();
+        std::vector<int32_t> vec((int32_t*)buf.ptr, (int32_t*)buf.ptr + buf.size);
+        trainer.set_splat_entity_ids(vec);
+    }
+
+    size_t append_train_frame(
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_rgba,
+        py::array_t<float, py::array::c_style | py::array::forcecast> c2w_world,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        std::string image_name = "stream_frame.png"
+    ) {
+        auto img_buf = image_rgba.request();
+        if (img_buf.ndim != 3 || (img_buf.shape[2] != 4 && img_buf.shape[2] != 3))
+            throw std::runtime_error("image_rgba must be (H, W, 4) or (H, W, 3) uint8 array");
+        int h = (int)img_buf.shape[0];
+        int w = (int)img_buf.shape[1];
+        std::vector<uint8_t> rgba_vec;
+        const uint8_t* rgba_ptr = static_cast<const uint8_t*>(img_buf.ptr);
+        if (img_buf.shape[2] == 3) {
+            rgba_vec.resize((size_t)h * (size_t)w * 4, 255u);
+            for (size_t i = 0; i < (size_t)h * (size_t)w; ++i) {
+                rgba_vec[4 * i + 0] = rgba_ptr[3 * i + 0];
+                rgba_vec[4 * i + 1] = rgba_ptr[3 * i + 1];
+                rgba_vec[4 * i + 2] = rgba_ptr[3 * i + 2];
+            }
+            rgba_ptr = rgba_vec.data();
+        }
+        auto pose_buf = c2w_world.request();
+        if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
+            throw std::runtime_error("c2w_world must be (4, 4) float32 array");
+        return trainer.append_train_image_from_memory(
+            image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
+        );
+    }
+
+    void replace_train_frame(
+        size_t train_idx,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_rgba,
+        py::array_t<float, py::array::c_style | py::array::forcecast> c2w_world,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        std::string image_name = "stream_frame.png"
+    ) {
+        auto img_buf = image_rgba.request();
+        if (img_buf.ndim != 3 || (img_buf.shape[2] != 4 && img_buf.shape[2] != 3))
+            throw std::runtime_error("image_rgba must be (H, W, 4) or (H, W, 3) uint8 array");
+        int h = (int)img_buf.shape[0];
+        int w = (int)img_buf.shape[1];
+        std::vector<uint8_t> rgba_vec;
+        const uint8_t* rgba_ptr = static_cast<const uint8_t*>(img_buf.ptr);
+        if (img_buf.shape[2] == 3) {
+            rgba_vec.resize((size_t)h * (size_t)w * 4, 255u);
+            for (size_t i = 0; i < (size_t)h * (size_t)w; ++i) {
+                rgba_vec[4 * i + 0] = rgba_ptr[3 * i + 0];
+                rgba_vec[4 * i + 1] = rgba_ptr[3 * i + 1];
+                rgba_vec[4 * i + 2] = rgba_ptr[3 * i + 2];
+            }
+            rgba_ptr = rgba_vec.data();
+        }
+        auto pose_buf = c2w_world.request();
+        if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
+            throw std::runtime_error("c2w_world must be (4, 4) float32 array");
+        trainer.replace_train_image_from_memory(
+            train_idx, image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
+        );
+    }
+
+    size_t append_splats_preserving_optimizer(
+        py::array_t<float, py::array::c_style | py::array::forcecast> xyz_ws,
+        py::array_t<float, py::array::c_style | py::array::forcecast> sh_coeffs,
+        py::array_t<float, py::array::c_style | py::array::forcecast> rotations,
+        py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+        py::array_t<float, py::array::c_style | py::array::forcecast> opacities,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> group_ids
+    ) {
+        auto xyz_buf = xyz_ws.request();
+        auto sh_buf = sh_coeffs.request();
+        auto rot_buf = rotations.request();
+        auto scale_buf = scales.request();
+        auto opac_buf = opacities.request();
+        auto gid_buf = group_ids.request();
+        size_t n_add = (size_t)xyz_buf.shape[0];
+        if (n_add == 0)
+            return buffers.num_splats;
+        if (xyz_buf.ndim != 2 || xyz_buf.shape[1] != 3)
+            throw std::runtime_error("xyz_ws must be (M, 3)");
+        if (sh_buf.ndim != 3 || (size_t)sh_buf.shape[0] != n_add || sh_buf.shape[1] != 16 || sh_buf.shape[2] != 3)
+            throw std::runtime_error("sh_coeffs must be (M, 16, 3)");
+        if (rot_buf.ndim != 2 || (size_t)rot_buf.shape[0] != n_add || rot_buf.shape[1] != 4)
+            throw std::runtime_error("rotations must be (M, 4)");
+        if (scale_buf.ndim != 2 || (size_t)scale_buf.shape[0] != n_add || scale_buf.shape[1] != 3)
+            throw std::runtime_error("scales must be (M, 3)");
+        if ((size_t)opac_buf.size != n_add)
+            throw std::runtime_error("opacities must have M elements");
+        const int32_t* gid_ptr = (gid_buf.size == (py::ssize_t)n_add) ? static_cast<const int32_t*>(gid_buf.ptr) : nullptr;
+        return trainer.append_splats_preserving_optimizer(
+            buffers,
+            static_cast<const float*>(xyz_buf.ptr),
+            static_cast<const float*>(sh_buf.ptr),
+            static_cast<const float*>(rot_buf.ptr),
+            static_cast<const float*>(scale_buf.ptr),
+            static_cast<const float*>(opac_buf.ptr),
+            gid_ptr,
+            n_add
+        );
+    }
+
+    py::dict snapshot_optimizer_state() {
+        py::dict snap;
+        snap["num_splats"] = buffers.num_splats;
+        snap["xyz_ws"] = buffer_to_array<float, float>(buffers.xyz_ws, 3, (size_t)-1, "mean");
+        snap["sh_coeffs"] = buffer_to_array<float, float>(buffers.sh_coeffs, 16, 3, "sh");
+        snap["rotations"] = buffer_to_array<float, float>(buffers.rotations, 4);
+        snap["scales_opacs"] = buffer_to_array<float, float>(buffers.scales_opacs, 4);
+        snap["splat_group_ids"] = get_splat_group_ids();
+        if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.size() > 0) {
+            snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws);
+            snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1);
+            snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2);
+            snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations);
+            snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs);
+        }
+        return snap;
+    }
+
+    void restore_optimizer_state(py::dict snap) {
+        size_t n = snap["num_splats"].cast<size_t>();
+        buffers.num_splats = n;
+        array_to_buffer(snap["xyz_ws"].cast<py::array_t<float>>(), buffers.xyz_ws);
+        auto sh_arr = snap["sh_coeffs"].cast<py::array_t<float>>();
+        auto sh_buf = sh_arr.request();
+        buffers.sh_coeffs.assign((float*)sh_buf.ptr, (float*)sh_buf.ptr + sh_buf.size);
+        buffers.reorderSH(buffers.sh_coeffs);
+        trainer.copyToDevice(buffers.sh_coeffs);
+        array_to_buffer(snap["rotations"].cast<py::array_t<float>>(), buffers.rotations);
+        array_to_buffer(snap["scales_opacs"].cast<py::array_t<float>>(), buffers.scales_opacs);
+        if (snap.contains(py::str("splat_group_ids"))) {
+            set_splat_group_ids(snap["splat_group_ids"].cast<py::array_t<int32_t>>());
+        }
+        if (snap.contains(py::str("g_xyz_ws"))) {
+            array_to_buffer(snap["g_xyz_ws"].cast<py::array_t<float>>(), buffers.g_xyz_ws);
+            array_to_buffer(snap["g_sh_coeffs_1"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_1);
+            array_to_buffer(snap["g_sh_coeffs_2"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_2);
+            array_to_buffer(snap["g_rotations"].cast<py::array_t<float>>(), buffers.g_rotations);
+            array_to_buffer(snap["g_scales_opacs"].cast<py::array_t<float>>(), buffers.g_scales_opacs);
+        }
     }
 
     size_t num_train() { return trainer.num_train(); }
@@ -687,8 +870,20 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file")
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
+        .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
+        .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
+        .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
+        .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
         .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
         .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
+        .def("append_train_frame", &VkSplat::append_train_frame, "Append a streaming RGB training frame and camera pose without resetting optimizer",
+             py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
+        .def("replace_train_frame", &VkSplat::replace_train_frame, "Replace an existing training frame slot in-place",
+             py::arg("train_idx"), py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
+        .def("append_splats_preserving_optimizer", &VkSplat::append_splats_preserving_optimizer, "Append new Gaussians while preserving Adam optimizer state of existing splats",
+             py::arg("xyz_ws"), py::arg("sh_coeffs"), py::arg("rotations"), py::arg("scales"), py::arg("opacities"), py::arg("group_ids"))
+        .def("snapshot_optimizer_state", &VkSplat::snapshot_optimizer_state, "Take a non-destructive snapshot of Gaussian parameters and Adam optimizer state")
+        .def("restore_optimizer_state", &VkSplat::restore_optimizer_state, "Restore a non-destructive snapshot of Gaussian parameters and Adam optimizer state", py::arg("snap"))
         .def("cleanup", &VkSplat::cleanup, "Cleanup Vulkan resources")
         .DEF_BUFFER_ARRAY(xyz_ws, float, 3, (size_t)-1, "mean")
         .DEF_BUFFER_ARRAY(sh_coeffs, float, 16, 3, "sh")
