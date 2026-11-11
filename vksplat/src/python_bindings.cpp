@@ -418,12 +418,19 @@ public:
         snap["rotations"] = buffer_to_array<float, float>(buffers.rotations, 4);
         snap["scales_opacs"] = buffer_to_array<float, float>(buffers.scales_opacs, 4);
         snap["splat_group_ids"] = get_splat_group_ids();
+        snap["splat_entity_ids"] = get_splat_entity_ids();
         if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.size() > 0) {
             snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws);
             snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1);
             snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2);
             snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations);
             snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs);
+        }
+        if (buffers.default_grad.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_grad.size() > 0) {
+            snap["default_grad"] = buffer_to_array<float, float>(buffers.default_grad);
+        }
+        if (buffers.default_radii.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_radii.size() > 0) {
+            snap["default_radii"] = buffer_to_array<float, float>(buffers.default_radii);
         }
         return snap;
     }
@@ -442,12 +449,21 @@ public:
         if (snap.contains(py::str("splat_group_ids"))) {
             set_splat_group_ids(snap["splat_group_ids"].cast<py::array_t<int32_t>>());
         }
+        if (snap.contains(py::str("splat_entity_ids"))) {
+            set_splat_entity_ids(snap["splat_entity_ids"].cast<py::array_t<int32_t>>());
+        }
         if (snap.contains(py::str("g_xyz_ws"))) {
             array_to_buffer(snap["g_xyz_ws"].cast<py::array_t<float>>(), buffers.g_xyz_ws);
             array_to_buffer(snap["g_sh_coeffs_1"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_1);
             array_to_buffer(snap["g_sh_coeffs_2"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_2);
             array_to_buffer(snap["g_rotations"].cast<py::array_t<float>>(), buffers.g_rotations);
             array_to_buffer(snap["g_scales_opacs"].cast<py::array_t<float>>(), buffers.g_scales_opacs);
+        }
+        if (snap.contains(py::str("default_grad"))) {
+            array_to_buffer(snap["default_grad"].cast<py::array_t<float>>(), buffers.default_grad);
+        }
+        if (snap.contains(py::str("default_radii"))) {
+            array_to_buffer(snap["default_radii"].cast<py::array_t<float>>(), buffers.default_radii);
         }
     }
 
