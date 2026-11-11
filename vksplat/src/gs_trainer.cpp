@@ -1180,6 +1180,10 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             resizeAndCopyDeviceBuffer(buffers.default_radii, new_num_splats, false);
             buffers.num_splats = new_num_splats;
             barrierAllGaussParams(buffers);
+            if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
+                splat_group_ids.resize(num_splats, -1);
+            if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
+                splat_entity_ids.resize(num_splats, -1);
         }
 
         if (num_dupli > 0) {
@@ -1210,6 +1214,27 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+                copyFromDevice(buffers._temp_indices);
+                if (!splat_group_ids.empty()) {
+                    size_t base_n = splat_group_ids.size();
+                    splat_group_ids.resize(base_n + num_dupli, -1);
+                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_group_ids[base_n + k] = splat_group_ids[src];
+                    }
+                }
+                if (!splat_entity_ids.empty()) {
+                    size_t base_n = splat_entity_ids.size();
+                    splat_entity_ids.resize(base_n + num_dupli, -1);
+                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_entity_ids[base_n + k] = splat_entity_ids[src];
+                    }
+                }
+            }
         }
 
         if (num_split > 0) {
@@ -1240,6 +1265,27 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+                copyFromDevice(buffers._temp_indices);
+                if (!splat_group_ids.empty()) {
+                    size_t base_n = splat_group_ids.size();
+                    splat_group_ids.resize(base_n + num_split, -1);
+                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_group_ids[base_n + k] = splat_group_ids[src];
+                    }
+                }
+                if (!splat_entity_ids.empty()) {
+                    size_t base_n = splat_entity_ids.size();
+                    splat_entity_ids.resize(base_n + num_split, -1);
+                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_entity_ids[base_n + k] = splat_entity_ids[src];
+                    }
+                }
+            }
         }
 
         // prune GS
@@ -1272,11 +1318,52 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, COMPUTE_SHADER_READ);
         }
+        if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
+            copyFromDevice(buffers.default_keep_mask);
+            bool modified_keep = false;
+            for (size_t i = 0; i < num_splats && i < splat_group_ids.size() && i < buffers.default_keep_mask.size(); ++i) {
+                if (splat_group_ids[i] >= 0 && buffers.default_keep_mask[i] == 0) {
+                    buffers.default_keep_mask[i] = 1;
+                    modified_keep = true;
+                }
+            }
+            if (modified_keep) {
+                copyToDevice(buffers.default_keep_mask);
+                bufferMemoryBarrier({
+                    { buffers.default_keep_mask.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ);
+            }
+        }
 
         int num_keep = executeSum(buffers, buffers.default_keep_mask);
         int num_prune = (int)num_splats - num_keep;
 
         if (num_prune > 0) {
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+                copyFromDevice(buffers.default_keep_mask);
+                if (!splat_group_ids.empty()) {
+                    std::vector<int32_t> kept_gids;
+                    kept_gids.reserve(num_keep);
+                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
+                        if (buffers.default_keep_mask[i]) {
+                            kept_gids.push_back(i < splat_group_ids.size() ? splat_group_ids[i] : -1);
+                        }
+                    }
+                    kept_gids.resize(num_keep, -1);
+                    splat_group_ids = std::move(kept_gids);
+                }
+                if (!splat_entity_ids.empty()) {
+                    std::vector<int32_t> kept_eids;
+                    kept_eids.reserve(num_keep);
+                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
+                        if (buffers.default_keep_mask[i]) {
+                            kept_eids.push_back(i < splat_entity_ids.size() ? splat_entity_ids[i] : -1);
+                        }
+                    }
+                    kept_eids.resize(num_keep, -1);
+                    splat_entity_ids = std::move(kept_eids);
+                }
+            }
             executeCumsum(buffers, buffers.default_keep_mask, buffers._temp_indices);
             
             enum PruneType {
