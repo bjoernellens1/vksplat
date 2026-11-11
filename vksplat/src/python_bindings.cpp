@@ -303,6 +303,14 @@ public:
         trainer.set_splat_entity_ids(vec);
     }
 
+    void clear_train_frames() {
+        trainer.clear_train_images();
+    }
+
+    void clear_val_frames() {
+        trainer.clear_val_images();
+    }
+
     size_t append_train_frame(
         py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_rgba,
         py::array_t<float, py::array::c_style | py::array::forcecast> c2w_world,
@@ -332,6 +340,39 @@ public:
         if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
             throw std::runtime_error("c2w_world must be (4, 4) float32 array");
         return trainer.append_train_image_from_memory(
+            image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
+        );
+    }
+
+    size_t append_val_frame(
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> image_rgba,
+        py::array_t<float, py::array::c_style | py::array::forcecast> c2w_world,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        std::string image_name = "val_frame.png"
+    ) {
+        auto img_buf = image_rgba.request();
+        if (img_buf.ndim != 3 || (img_buf.shape[2] != 4 && img_buf.shape[2] != 3))
+            throw std::runtime_error("image_rgba must be (H, W, 4) or (H, W, 3) uint8 array");
+        int h = (int)img_buf.shape[0];
+        int w = (int)img_buf.shape[1];
+        std::vector<uint8_t> rgba_vec;
+        const uint8_t* rgba_ptr = static_cast<const uint8_t*>(img_buf.ptr);
+        if (img_buf.shape[2] == 3) {
+            rgba_vec.resize((size_t)h * (size_t)w * 4, 255u);
+            for (size_t i = 0; i < (size_t)h * (size_t)w; ++i) {
+                rgba_vec[4 * i + 0] = rgba_ptr[3 * i + 0];
+                rgba_vec[4 * i + 1] = rgba_ptr[3 * i + 1];
+                rgba_vec[4 * i + 2] = rgba_ptr[3 * i + 2];
+            }
+            rgba_ptr = rgba_vec.data();
+        }
+        auto pose_buf = c2w_world.request();
+        if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
+            throw std::runtime_error("c2w_world must be (4, 4) float32 array");
+        return trainer.append_val_image_from_memory(
             image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
         );
     }
@@ -892,8 +933,12 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
         .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
         .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
+        .def("clear_train_frames", &VkSplat::clear_train_frames, "Clear all loaded training frames")
+        .def("clear_val_frames", &VkSplat::clear_val_frames, "Clear all loaded validation frames")
         .def("append_train_frame", &VkSplat::append_train_frame, "Append a streaming RGB training frame and camera pose without resetting optimizer",
              py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
+        .def("append_val_frame", &VkSplat::append_val_frame, "Append an evaluator-only validation RGB frame and camera pose",
+             py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "val_frame.png")
         .def("replace_train_frame", &VkSplat::replace_train_frame, "Replace an existing training frame slot in-place",
              py::arg("train_idx"), py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
         .def("append_splats_preserving_optimizer", &VkSplat::append_splats_preserving_optimizer, "Append new Gaussians while preserving Adam optimizer state of existing splats",

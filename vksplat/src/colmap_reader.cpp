@@ -481,7 +481,10 @@ glm::mat4 similarity_from_cameras(const std::vector<glm::mat4>& c2w, bool strict
     
     // (2) Recenter the scene
     glm::vec3 translate;
-    if (center_method == "focus") {
+    if (poss.size() == 1) {
+        // Single initial frame-0 camera: place focus 2.0m ahead of camera along its forward ray
+        translate = -(poss[0] + 2.0f * fwds[0]);
+    } else if (center_method == "focus") {
         // find the closest point to the origin for each camera's center ray
         std::vector<glm::vec3> nearest_points;
         for (size_t i = 0; i < poss.size(); ++i) {
@@ -503,9 +506,11 @@ glm::mat4 similarity_from_cameras(const std::vector<glm::mat4>& c2w, bool strict
     
     float scale;
     if (strict_scaling) {
-        scale = 1.0f / *std::max_element(distances.begin(), distances.end());
+        float max_d = *std::max_element(distances.begin(), distances.end());
+        scale = (max_d > 1e-4f) ? (1.0f / max_d) : 0.5f;
     } else {
-        scale = 1.0f / median(distances);
+        float med_d = median(distances);
+        scale = (med_d > 1e-4f) ? (1.0f / med_d) : 0.5f;
     }
     
     // Create transformation matrix
@@ -586,6 +591,9 @@ glm::mat4 ColmapReader::normalize_world_space(
     glm::mat4 T1 = similarity_from_cameras(camtoworlds);
     camtoworlds = transform_cameras(T1, camtoworlds);
     points = transform_points(T1, points);
+    if (camtoworlds.size() <= 1) {
+        return T1;
+    }
 
     // Step 2: Align principal axes
     glm::mat4 T2 = align_principal_axes(points);

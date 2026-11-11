@@ -183,7 +183,20 @@ public:
     }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
+    void clear_train_images();
+    void clear_val_images();
     size_t append_train_image_from_memory(
+        const std::string& image_name,
+        const uint8_t* rgba_pixels,
+        int h,
+        int w,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        const float* c2w_world_row_major
+    );
+    size_t append_val_image_from_memory(
         const std::string& image_name,
         const uint8_t* rgba_pixels,
         int h,

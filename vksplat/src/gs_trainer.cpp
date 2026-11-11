@@ -509,6 +509,7 @@ void VulkanGSTrainer::load_colmap_dataset(
         float dist = glm::distance(pos, scene_center);
         scene_scale = fmax(scene_scale, dist);
     }
+    scene_scale = fmax(scene_scale, 1.0f);
     scene_scale *= 1.1f;  // apple-to-apple with Inria/GSplat
     scene_scale *= config.global_scale;
     printf("Scene scale: %f\n", scene_scale);
@@ -1916,6 +1917,22 @@ void VulkanGSTrainer::writePLY(std::string filename, VulkanGSPipelineBuffers& bu
     buffers.reorderSH(buffers.sh_coeffs);
 }
 
+void VulkanGSTrainer::clear_train_images() {
+    HOST_GUARD;
+    for (auto& img : dataset_train) {
+        destroyBuffer(img.buffer.deviceBuffer);
+    }
+    dataset_train.clear();
+}
+
+void VulkanGSTrainer::clear_val_images() {
+    HOST_GUARD;
+    for (auto& img : dataset_val) {
+        destroyBuffer(img.buffer.deviceBuffer);
+    }
+    dataset_val.clear();
+}
+
 size_t VulkanGSTrainer::append_train_image_from_memory(
     const std::string& image_name,
     const uint8_t* rgba_pixels,
@@ -1968,6 +1985,57 @@ size_t VulkanGSTrainer::append_train_image_from_memory(
 
     dataset_train.push_back(std::move(image));
     return dataset_train.size() - 1;
+}
+
+size_t VulkanGSTrainer::append_val_image_from_memory(
+    const std::string& image_name,
+    const uint8_t* rgba_pixels,
+    int h,
+    int w,
+    float fx,
+    float fy,
+    float cx,
+    float cy,
+    const float* c2w_world_row_major
+) {
+    HOST_GUARD;
+    Camera camera{};
+    camera.model = Camera::PINHOLE;
+    camera.h = h;
+    camera.w = w;
+    camera.fx = fx;
+    camera.fy = fy;
+    camera.cx = cx;
+    camera.cy = cy;
+
+    glm::mat4 c2w_world(1.0f);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            c2w_world[c][r] = c2w_world_row_major[4 * r + c];
+
+    const float scale = glm::length(glm::vec3(dataparser_transform[0]));
+    const glm::mat3 rot_dp = glm::mat3(dataparser_transform) / std::max(scale, 1e-8f);
+    const glm::vec3 trans_dp = glm::vec3(dataparser_transform[3]);
+    glm::mat4 c2w_norm(1.0f);
+    glm::mat3 R_norm = rot_dp * glm::mat3(c2w_world);
+    glm::vec3 t_norm = glm::mat3(dataparser_transform) * glm::vec3(c2w_world[3]) + trans_dp;
+    c2w_norm[0] = glm::vec4(R_norm[0], 0.0f);
+    c2w_norm[1] = glm::vec4(R_norm[1], 0.0f);
+    c2w_norm[2] = glm::vec4(R_norm[2], 0.0f);
+    c2w_norm[3] = glm::vec4(t_norm, 1.0f);
+    camera.world_view_transform = glm::inverse(c2w_norm);
+
+    DatasetImage image;
+    image.image_path = image_name;
+    image.mask_path = "";
+    image.camera = camera;
+    const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
+    image.buffer.resize(n_bytes);
+    image.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
+    copyToDevice(image.buffer);
+
+    dataset_val.push_back(std::move(image));
+    return dataset_val.size() - 1;
 }
 
 void VulkanGSTrainer::replace_train_image_from_memory(
