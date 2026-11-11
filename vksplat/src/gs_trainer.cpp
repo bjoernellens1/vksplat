@@ -442,7 +442,7 @@ void VulkanGSTrainer::load_colmap_dataset(
             fflush(stdout);
         }
 
-        bool isValidation = (imageIdx % config.eval_interval == 0);
+        bool isValidation = (numImages > 1) && (imageIdx % config.eval_interval == 0);
         
         return std::make_pair(std::move(image), isValidation);
     };
