@@ -40,6 +40,10 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     float lr_sh_dc;
     float lr_sh_rest;
     float world_view_transform[16];
+    uint32_t num_groups;
+    uint32_t protect_locked_groups;
+    uint32_t _pad_opt0;
+    uint32_t _pad_opt1;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -988,6 +992,11 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.lr_sh_rest = config.features_rest_lr * ws_boost;
     for (size_t i = 0; i < 16; i++)
         shaderUniforms.world_view_transform[i] = uniforms.world_view_transform[i];
+    ensureGroupBuffersOnDevice(buffers, num_splats);
+    shaderUniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+    shaderUniforms.protect_locked_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
+    shaderUniforms._pad_opt0 = 0u;
+    shaderUniforms._pad_opt1 = 0u;
 
     // execute compute
     size_t alloc_size = num_splats;
@@ -1011,6 +1020,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16*3*_CEIL_ROUND(alloc_size,SH_REORDER_SIZE), true),
             resizeAndCopyDeviceBuffer(buffers.g_rotations, 2*4*alloc_size, true),
             resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2*4*alloc_size, true),
+            buffers.group_ids.deviceBuffer,
+            buffers.group_state.deviceBuffer,
         }
     );
 

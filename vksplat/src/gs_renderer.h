@@ -21,6 +21,10 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float cy;
     float dist_coeffs[4];
     float world_view_transform[16];
+    float sparse_tile_grad_thresh;
+    float _pad_tile0;
+    float _pad_tile1;
+    float _pad_tile2;
 });
 
 

@@ -23,6 +23,8 @@ layout(binding=9) RWStructuredBuffer<float4> g_sh_coeffs_1;  // 16*3
 layout(binding=10) RWStructuredBuffer<float4> g_sh_coeffs_2;  // 16*3
 layout(binding=11) RWStructuredBuffer<float4> g_rotations;  // 2*4
 layout(binding=12) RWStructuredBuffer<float4> g_scales_opacs;  // 2*4
+layout(binding=13) StructuredBuffer<int32_t> group_ids;
+layout(binding=14) StructuredBuffer<uint32_t> group_state;
 
 
 // Adam optimizer
@@ -67,6 +69,10 @@ struct ShaderUniforms {
     float lr_sh_dc;
     float lr_sh_rest;
     float4x4 world_view_transform;
+    uint32_t num_groups;
+    uint32_t protect_locked_groups;
+    uint32_t _pad_opt0;
+    uint32_t _pad_opt1;
 };
 
 
@@ -89,6 +95,11 @@ void main(
     
     if (g_idx >= uniforms.num_splats)
         return;
+    if (uniforms.protect_locked_groups != 0u) {
+        int32_t gid = group_ids[g_idx];
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 2u)
+            return;
+    }
 
     bool is_zero_grad = (tiles_touched[g_idx] == 0);
 

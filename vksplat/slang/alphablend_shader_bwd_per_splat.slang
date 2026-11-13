@@ -47,6 +47,7 @@ void main(
     uint2 tbound0 = uint2(groupID.x%grid_width, groupID.x/grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT);
 
     int local_max_contrib = 0;
+    float local_max_grad = 0.0f;
     [ForceUnroll]
     for (int i = 0; i < TILE_SIZE; i += MAX_SPLAT_BATCH_SIZE) {
         int pix_rank_batch = i + thread_rank;
@@ -64,6 +65,7 @@ void main(
             int nc = n_contributors[pix_id];
             n_contrib_fwd[pix_rank_batch] = nc;
             local_max_contrib = max(local_max_contrib, nc);
+            local_max_grad = max(local_max_grad, max(max(abs(vp.x), abs(vp.y)), abs(vp.z)));
         }
         else {
             n_contrib_fwd[pix_rank_batch] = 0;
@@ -79,6 +81,17 @@ void main(
     int tile_max_n_contrib = WaveActiveMax(
         (lane_id < (MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE)) ? sg_max_contrib[lane_id] : 0
     );
+    GroupMemoryBarrierWithGroupSync();
+    float sg_grad = WaveActiveMax(local_max_grad);
+    if (WaveIsFirstLane()) {
+        sg_max_contrib[thread_rank / SUBGROUP_SIZE] = asint(sg_grad);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float tile_max_grad = WaveActiveMax(
+        (lane_id < (MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE)) ? asfloat(sg_max_contrib[lane_id]) : 0.0f
+    );
+    if (uniforms.sparse_tile_grad_thresh > 0.0f && tile_max_grad <= uniforms.sparse_tile_grad_thresh)
+        return;
 
     uint tile_idx = groupID.y * grid_width + groupID.x;
     uint32_t tile_idx_start = tile_ranges[tile_idx];

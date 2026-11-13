@@ -140,6 +140,18 @@ void main(
         (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? collected_idx[lane_id] : 0
     );
     GroupMemoryBarrierWithGroupSync();
+    float local_grad_mag = max(max(abs(v_pixel_state.x), abs(v_pixel_state.y)), abs(v_pixel_state.z));
+    float sg_max_grad = WaveActiveMax(local_grad_mag);
+    if (WaveIsFirstLane()) {
+        collected_idx[groupThreadID.x / SUBGROUP_SIZE] = asint(sg_max_grad);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float tile_max_grad = WaveActiveMax(
+        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? asfloat(collected_idx[lane_id]) : 0.0f
+    );
+    GroupMemoryBarrierWithGroupSync();
+    if (uniforms.sparse_tile_grad_thresh > 0.0f && tile_max_grad <= uniforms.sparse_tile_grad_thresh)
+        return;
 
     tile_idx_end = tile_idx_start + min(tile_idx_end - tile_idx_start, uint32_t(max(tile_max_n_contrib, 0)));
     uint32_t num_splats_in_tile = tile_idx_end - tile_idx_start;

@@ -59,11 +59,13 @@ void main(
 
     float4 current_pixel_state = float4(0.0);
     int32_t n_contrib_fwd = 0;
+    float local_grad_mag = 0.0f;
     if (is_inside) {
         uint32_t pix_id = pix_coord.y * W + pix_coord.x;
         current_pixel_state = final_pixel_state[pix_id];
         n_contrib_fwd = n_contributors[pix_id];
         d_current_pixel_state = v_current_pixel_state[pix_id];
+        local_grad_mag = max(max(abs(d_current_pixel_state.x), abs(d_current_pixel_state.y)), abs(d_current_pixel_state.z));
     }
 
     // Subgroup-first early contributor bound (ported from eligsir-native 06_alpha_backward:m5_subgroup_first)
@@ -77,6 +79,18 @@ void main(
     int32_t tile_max_n_contrib = int32_t(WaveActiveMax(
         (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? subgroup_shared[lane_id] : 0.0f
     ));
+    GroupMemoryBarrierWithGroupSync();
+    float subgroup_max_grad = WaveActiveMax(local_grad_mag);
+    if (WaveIsFirstLane()) {
+        subgroup_shared[subgroup_idx] = subgroup_max_grad;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float tile_max_grad = WaveActiveMax(
+        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? subgroup_shared[lane_id] : 0.0f
+    );
+    if (uniforms.sparse_tile_grad_thresh > 0.0f && tile_max_grad <= uniforms.sparse_tile_grad_thresh) {
+        return;
+    }
     tile_idx_end = tile_idx_start + uint32_t(min(int32_t(tile_idx_end - tile_idx_start), max(tile_max_n_contrib, 0)));
     rounds = int((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
     splats_left_to_process = int(tile_idx_end - tile_idx_start);

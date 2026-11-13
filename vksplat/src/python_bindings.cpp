@@ -245,6 +245,8 @@ public:
         config.cap_max = train_config["cap_max"].cast<int>();
         config.mcmc_protect_structural_groups = train_config.contains(py::str("mcmc_protect_structural_groups"))
             ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
+        config.sparse_tile_grad_thresh = train_config.contains(py::str("sparse_tile_grad_thresh"))
+            ? train_config["sparse_tile_grad_thresh"].cast<float>() : 0.0f;
 
         // load dataset
         trainer.load_colmap_dataset(config, buffers);
@@ -889,6 +891,7 @@ public:
             ? std::min(step / kShDegreeInterval, config.max_sh_degree_override)
             : std::min(step / kShDegreeInterval, 3);
         uniforms.step = step;
+        uniforms.sparse_tile_grad_thresh = config.sparse_tile_grad_thresh;
 
         auto deviceGuard = DeviceGuard(&trainer);
 

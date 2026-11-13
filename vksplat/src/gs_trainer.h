@@ -93,6 +93,7 @@ struct TrainerConfig {
     float grow_factor;
     int cap_max;
     bool mcmc_protect_structural_groups = false;
+    float sparse_tile_grad_thresh = 0.0f;
 };
 
 
@@ -255,7 +256,7 @@ private:
 
     _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);
     _ComputePipeline pipeline_ssim_backward = _ComputePipeline(4);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(13);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(15);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
         _ComputePipeline compute_grow_mask = _ComputePipeline(5);
