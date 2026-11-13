@@ -12,6 +12,8 @@
 #define MCMC_PHASE_ComputeAdd 21
 #define MCMC_PHASE_UpdateAdd 22
 
+#define MCMC_PHASE_MaskRetractedGroup 30
+
 #ifndef MCMC_PHASE
 #define MCMC_PHASE -1
 #endif
@@ -25,6 +27,7 @@ struct InjectNoiseUniforms {
     uint32_t image_width;
     uint32_t image_height;
     float noise_lr;
+    uint32_t protect_structural_groups;
 };
 
 struct Uniforms {
@@ -32,6 +35,12 @@ struct Uniforms {
     uint32_t num_add;
     uint32_t seed;
     float min_opacity;
+    uint32_t protect_structural_groups;
+};
+
+struct MaskGroupUniforms {
+    uint32_t array_size;
+    uint32_t num_groups;
 };
 
 
@@ -43,6 +52,7 @@ layout(binding=0) StructuredBuffer<int32_t> radii;  // (N,)
 layout(binding=1) StructuredBuffer<float4> rotations;  // (N, 4)
 layout(binding=2) RWStructuredBuffer<float> means;  // (N, 3)
 layout(binding=3) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
+layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
 
 #define injectNoise main
 
@@ -60,6 +70,8 @@ void injectNoise(
     const uint32_t num_splats = uniforms.array_size;
     const uint32_t tid = thread_id.x;
     if (tid >= num_splats)
+        return;
+    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0)
         return;
     
     float4 quat = normalize(rotations[tid]);
@@ -85,6 +97,7 @@ void injectNoise(
 
 layout(binding=0) StructuredBuffer<float4> scales_opacs;  // (N,)
 layout(binding=1) RWStructuredBuffer<uint32_t> sample_probs;  // (N,)
+layout(binding=2) StructuredBuffer<int32_t> group_ids;  // (N,)
 #define computeProbabilities main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -96,6 +109,11 @@ void computeProbabilities(
     const uint32_t tid = thread_id.x;
     if (tid >= num_splats)
         return;
+
+    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0) {
+        sample_probs[tid] = 0;
+        return;
+    }
 
     float opac = scales_opacs[tid].w;
     opac = clamp(opac, 1e-6, 1-1e-6);
@@ -173,6 +191,7 @@ layout(binding=0) StructuredBuffer<uint32_t> sample_probs;  // (N,)
 layout(binding=1) StructuredBuffer<uint32_t> sample_probs_cumsum;  // (N,)
 layout(binding=2) RWStructuredBuffer<uint32_t> index_map;  // (N,)
 layout(binding=3) RWByteAddressBuffer n_idx_buffer;  // (N,)
+layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
 #define computeRelocationIndexMap main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -184,6 +203,11 @@ void computeRelocationIndexMap(
     const uint32_t tid = thread_id.x;
     if (tid >= array_size)
         return;
+
+    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0) {
+        index_map[tid] = tid;
+        return;
+    }
     
     uint32_t prob = sample_probs[tid];
 
@@ -464,5 +488,31 @@ void updateAdd(
 }
 
 #endif  // MCMC_PHASE == MCMC_PHASE_UpdateAdd
+
+
+#if MCMC_PHASE == MCMC_PHASE_MaskRetractedGroup
+
+layout(binding=0) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=1) StructuredBuffer<uint32_t> group_state;  // (G,) 1=ACTIVE, 2=LOCKED, 3=RETRACTED
+layout(binding=2) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
+
+#define maskRetractedGroup main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void maskRetractedGroup(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform MaskGroupUniforms uniforms
+) {
+    const uint32_t tid = thread_id.x;
+    if (tid >= uniforms.array_size)
+        return;
+
+    int32_t gid = group_ids[tid];
+    if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u) {
+        scales_opacs[tid].w = 0.0;
+    }
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_MaskRetractedGroup
 
 

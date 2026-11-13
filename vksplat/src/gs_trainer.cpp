@@ -126,6 +126,7 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_mcmc.compute_add_index_map, spirv_paths.at("mcmc_compute_add_index_map"));
     createComputePipeline(pipeline_mcmc.compute_add, spirv_paths.at("mcmc_compute_add"));
     createComputePipeline(pipeline_mcmc.update_add, spirv_paths.at("mcmc_update_add"));
+    createComputePipeline(pipeline_mcmc.mask_retracted_group, spirv_paths.at("mcmc_mask_retracted_group"));
     createComputePipeline(pipeline_morton_sort.compute_stats, spirv_paths.at("morton_sort_compute_stats"));
     createComputePipeline(pipeline_morton_sort.generate_keys, spirv_paths.at("morton_sort_generate_keys"));
     createComputePipeline(pipeline_morton_sort.apply_indices, spirv_paths.at("morton_sort_apply_indices"));
@@ -786,6 +787,9 @@ void VulkanGSTrainer::load_colmap_dataset(
     copyToDevice(buffers.sh_coeffs);
     copyToDevice(buffers.rotations);
     copyToDevice(buffers.scales_opacs);
+    buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+    copyToDevice(buffers.group_ids);
+    syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
     if (num_anchored_splats > 0) {
         resizeDeviceBuffer(anchored_xyz_ws, 3 * num_anchored_splats);
     }
@@ -1472,18 +1476,21 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     VulkanGSPipelineBuffers& buffers,
     int step
 ) {
-    PerfTimer::Timer<PerfTimer::MCMCPostBackward> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::MCMCPostBackward> timer(this);
 
     const size_t kGroupSize = 256;
     const size_t kGroupSizeSparse = 64;
     size_t num_splats = buffers.num_splats;
 
-    Uniform32_t uniforms[5];
+    Uniform32_t uniforms[6];
     uniforms[0].u = (uint32_t)num_splats;
     uniforms[1].u = 0;  // num_add
     uniforms[2].u = std::uniform_int_distribution<uint32_t>()(rng);
     uniforms[3].f = config.min_opacity;
+    uniforms[4].u = config.mcmc_protect_structural_groups ? 1u : 0u;
+
+    ensureGroupBuffersOnDevice(buffers, num_splats);
 
     // refinement
     if (
@@ -1496,14 +1503,16 @@ void VulkanGSTrainer::executeMCMCPostBackward(
         // 1) Compute relocation probabilities for all Gaussians
         bufferMemoryBarrier({
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ);
         executeCompute(
             {{num_splats, kGroupSize}},
-            &uniforms, 4*sizeof(Uniform32_t),
+            &uniforms, 5*sizeof(Uniform32_t),
             pipeline_mcmc.compute_probs,
             {
                 buffers.scales_opacs.deviceBuffer,
                 resizeDeviceBuffer(buffers.mcmc_sample_probs, num_splats),
+                buffers.group_ids.deviceBuffer,
             }
         );
 
@@ -1525,35 +1534,25 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             bufferMemoryBarrier({
                 { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
                 { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
+                { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ_WRITE);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 4*sizeof(Uniform32_t),
+                &uniforms, 5*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation_index_map,
                 {
                     buffers.mcmc_sample_probs.deviceBuffer,
                     buffers.mcmc_sample_probs_cumsum.deviceBuffer,
                     resizeDeviceBuffer(buffers.mcmc_index_map, num_splats),
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
+                    buffers.group_ids.deviceBuffer,
                 }
             );
 
             num_relocate = executeSum(buffers, buffers.mcmc_n_idx_buffer);
         }
 
-        // Preserve pre-relocation group_ids/entity_ids and optionally snapshot protected structural groups
-        std::vector<float> saved_xyz, saved_sh, saved_rot, saved_so;
         const bool protect_groups = config.mcmc_protect_structural_groups && !splat_group_ids.empty();
-        if (protect_groups) {
-            copyFromDevice(buffers.xyz_ws);
-            copyFromDevice(buffers.sh_coeffs);
-            copyFromDevice(buffers.rotations);
-            copyFromDevice(buffers.scales_opacs);
-            saved_xyz = buffers.xyz_ws;
-            saved_sh = buffers.sh_coeffs;
-            saved_rot = buffers.rotations;
-            saved_so = buffers.scales_opacs;
-        }
 
         if (num_relocate > 0) {
 
@@ -1561,7 +1560,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 4*sizeof(Uniform32_t),
+                &uniforms, 5*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation,
                 {
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -1578,7 +1577,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 4*sizeof(Uniform32_t),
+                &uniforms, 5*sizeof(Uniform32_t),
                 pipeline_mcmc.update_relocation,
                 {
                     buffers.mcmc_index_map.deviceBuffer,
@@ -1615,6 +1614,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                         }
                     }
                 }
+                buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+                copyToDevice(buffers.group_ids);
             }
             mcmc_relocated_count += (size_t)num_relocate;
         }
@@ -1629,14 +1630,16 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             // 1) Compute relocation probabilities for all Gaussians
             bufferMemoryBarrier({
                 { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 4*sizeof(Uniform32_t),
+                &uniforms, 5*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_probs,
                 {
                     buffers.scales_opacs.deviceBuffer,
                     buffers.mcmc_sample_probs.deviceBuffer,
+                    buffers.group_ids.deviceBuffer,
                 }
             );
 
@@ -1660,7 +1663,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ_WRITE);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 4*sizeof(Uniform32_t),
+                    &uniforms, 5*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add_index_map,
                     {
                         buffers.mcmc_sample_probs_cumsum.deviceBuffer,
@@ -1675,7 +1678,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ);
                 executeCompute(
                     {{num_splats, kGroupSizeSparse}},
-                    &uniforms, 4*sizeof(Uniform32_t),
+                    &uniforms, 5*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add,
                     {
                         buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -1690,7 +1693,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 barrierAllGaussParams(buffers);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 4*sizeof(Uniform32_t),
+                    &uniforms, 5*sizeof(Uniform32_t),
                     pipeline_mcmc.update_add,
                     {
                         buffers.mcmc_index_map.deviceBuffer,
@@ -1706,6 +1709,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     }
                 );
 
+                resizeAndCopyDeviceBuffer(buffers.group_ids, alloc_size, false);
                 if (!splat_group_ids.empty()) {
                     copyFromDevice(buffers.mcmc_index_map);
                     if (splat_group_ids.size() < num_splats)
@@ -1722,30 +1726,26 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                             }
                         }
                     }
+                    uploadDeviceSlice(
+                        buffers.group_ids.deviceBuffer,
+                        num_splats * sizeof(int32_t),
+                        splat_group_ids.data() + num_splats,
+                        num_add * sizeof(int32_t)
+                    );
+                } else {
+                    std::vector<int32_t> neg_ones(num_add, -1);
+                    uploadDeviceSlice(
+                        buffers.group_ids.deviceBuffer,
+                        num_splats * sizeof(int32_t),
+                        neg_ones.data(),
+                        num_add * sizeof(int32_t)
+                    );
                 }
                 buffers.num_splats = new_num_splats;
                 mcmc_added_count += num_add;
             } else {
                 num_add = 0;
             }
-        }
-
-        // MC-2: Restore protected structural group splats if mcmc_protect_structural_groups is enabled
-        if (protect_groups && !saved_xyz.empty()) {
-            copyFromDevice(buffers.xyz_ws);
-            copyFromDevice(buffers.sh_coeffs);
-            copyFromDevice(buffers.rotations);
-            copyFromDevice(buffers.scales_opacs);
-            for (size_t i = 0; i < num_splats && i < splat_group_ids.size(); ++i) {
-                if (splat_group_ids[i] >= 0) {
-                    for (int c = 0; c < 3; ++c) buffers.xyz_ws[3 * i + c] = saved_xyz[3 * i + c];
-                    for (int c = 0; c < 4; ++c) buffers.rotations[4 * i + c] = saved_rot[4 * i + c];
-                    for (int c = 0; c < 4; ++c) buffers.scales_opacs[4 * i + c] = saved_so[4 * i + c];
-                }
-            }
-            copyToDevice(buffers.xyz_ws);
-            copyToDevice(buffers.rotations);
-            copyToDevice(buffers.scales_opacs);
         }
 
         printf("\n%d relocate, %d add -> %d splats\n", num_relocate, (int)num_add, (int)buffers.num_splats);
@@ -1759,44 +1759,31 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     }
   #endif
 
-    // inject noise (snapshot & restore protected structural group means if mcmc_protect_structural_groups is enabled)
-    std::vector<float> pre_noise_xyz;
-    if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
-        copyFromDevice(buffers.xyz_ws);
-        pre_noise_xyz = buffers.xyz_ws;
-    }
+    // inject noise (structural group protection handled directly on GPU via group_ids)
     uniforms[0].u = (uint32_t)buffers.num_splats;
     uniforms[1].u = uniforms[2].u;  // seed
     uniforms[2].u = renderer_uniforms.image_width;
     uniforms[3].u = renderer_uniforms.image_height;
     uniforms[4].f = config.noise_lr * config.get_means_lr(step, scene_scale);
+    uniforms[5].u = config.mcmc_protect_structural_groups ? 1u : 0u;
     bufferMemoryBarrier({
         { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
     executeCompute(
         {{buffers.num_splats, kGroupSize}},
-        &uniforms, 5*sizeof(Uniform32_t),
+        &uniforms, 6*sizeof(Uniform32_t),
         pipeline_mcmc.inject_noise,
         {
             buffers.radii.deviceBuffer,
             buffers.rotations.deviceBuffer,
             buffers.xyz_ws.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
+            buffers.group_ids.deviceBuffer,
         }
     );
-    if (config.mcmc_protect_structural_groups && !pre_noise_xyz.empty()) {
-        copyFromDevice(buffers.xyz_ws);
-        for (size_t i = 0; i < buffers.num_splats && i < splat_group_ids.size(); ++i) {
-            if (splat_group_ids[i] >= 0 && 3 * i + 2 < pre_noise_xyz.size()) {
-                buffers.xyz_ws[3 * i + 0] = pre_noise_xyz[3 * i + 0];
-                buffers.xyz_ws[3 * i + 1] = pre_noise_xyz[3 * i + 1];
-                buffers.xyz_ws[3 * i + 2] = pre_noise_xyz[3 * i + 2];
-            }
-        }
-        copyToDevice(buffers.xyz_ws);
-    }
 
 }
 
@@ -1915,6 +1902,8 @@ void VulkanGSTrainer::executeMortonSorting(
                 }
             }
             splat_group_ids = std::move(new_gids);
+            buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+            copyToDevice(buffers.group_ids);
         }
         if (!splat_entity_ids.empty()) {
             if (splat_entity_ids.size() < num_splats)
@@ -2174,6 +2163,134 @@ void VulkanGSTrainer::replace_train_image_from_memory(
     copyToDevice(slot.buffer);
 }
 
+void VulkanGSTrainer::syncGroupStateSize(
+    VulkanGSPipelineBuffers& buffers,
+    const int32_t* gids,
+    size_t count
+) {
+    int32_t max_gid = -1;
+    if (gids != nullptr) {
+        for (size_t i = 0; i < count; ++i) {
+            if (gids[i] > max_gid)
+                max_gid = gids[i];
+        }
+    }
+    size_t required = (max_gid >= 0) ? (size_t)(max_gid + 1) : 1;
+    size_t old_dev_count = buffers.group_state.deviceSize();
+    if (buffers.group_state.deviceBuffer.buffer == VK_NULL_HANDLE || old_dev_count < required) {
+        resizeAndCopyDeviceBuffer(buffers.group_state, required, false);
+        size_t grow_count = required - old_dev_count;
+        std::vector<uint32_t> ones(grow_count, 1u);
+        uploadDeviceSlice(
+            buffers.group_state.deviceBuffer,
+            old_dev_count * sizeof(uint32_t),
+            ones.data(),
+            grow_count * sizeof(uint32_t)
+        );
+        if (buffers.group_state.size() < required)
+            buffers.group_state.resize(required, 1u);
+    }
+}
+
+void VulkanGSTrainer::ensureGroupBuffersOnDevice(
+    VulkanGSPipelineBuffers& buffers,
+    size_t num_splats
+) {
+    if (num_splats > 0 && (buffers.group_ids.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        buffers.group_ids.deviceBuffer.size < num_splats * sizeof(int32_t))) {
+        size_t old_dev_count = buffers.group_ids.deviceSize();
+        if (!splat_group_ids.empty()) {
+            if (splat_group_ids.size() < num_splats)
+                splat_group_ids.resize(num_splats, -1);
+            buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+            copyToDevice(buffers.group_ids);
+        } else {
+            resizeAndCopyDeviceBuffer(buffers.group_ids, num_splats, false);
+            if (num_splats > old_dev_count) {
+                std::vector<int32_t> neg_ones(num_splats - old_dev_count, -1);
+                uploadDeviceSlice(
+                    buffers.group_ids.deviceBuffer,
+                    old_dev_count * sizeof(int32_t),
+                    neg_ones.data(),
+                    neg_ones.size() * sizeof(int32_t)
+                );
+            }
+        }
+    } else if (num_splats == 0 && buffers.group_ids.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        buffers.group_ids.assign(1, -1);
+        copyToDevice(buffers.group_ids);
+    }
+    syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
+}
+
+void VulkanGSTrainer::set_group_state(
+    VulkanGSPipelineBuffers& buffers,
+    int32_t group_id,
+    uint32_t state
+) {
+    if (group_id < 0)
+        throw std::invalid_argument("group_id must be >= 0");
+    HOST_GUARD;
+    size_t required = static_cast<size_t>(group_id) + 1;
+    size_t old_dev_count = buffers.group_state.deviceSize();
+    if (buffers.group_state.deviceBuffer.buffer == VK_NULL_HANDLE || old_dev_count < required) {
+        resizeAndCopyDeviceBuffer(buffers.group_state, required, false);
+        size_t grow_count = required - old_dev_count;
+        std::vector<uint32_t> ones(grow_count, 1u);
+        uploadDeviceSlice(
+            buffers.group_state.deviceBuffer,
+            old_dev_count * sizeof(uint32_t),
+            ones.data(),
+            grow_count * sizeof(uint32_t)
+        );
+    }
+    if (buffers.group_state.size() < required)
+        buffers.group_state.resize(required, 1u);
+    buffers.group_state[group_id] = state;
+    uploadDeviceSlice(
+        buffers.group_state.deviceBuffer,
+        static_cast<size_t>(group_id) * sizeof(uint32_t),
+        &state,
+        sizeof(uint32_t)
+    );
+}
+
+void VulkanGSTrainer::retract_group_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    int32_t group_id
+) {
+    set_group_state(buffers, group_id, 3u);
+    if (buffers.num_splats == 0)
+        return;
+
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+
+    DEVICE_GUARD;
+    const size_t kGroupSize = 256;
+    Uniform32_t uniforms[2];
+    uniforms[0].u = static_cast<uint32_t>(buffers.num_splats);
+    uniforms[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+
+    bufferMemoryBarrier({
+        { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+    executeCompute(
+        {{buffers.num_splats, kGroupSize}},
+        &uniforms, 2 * sizeof(Uniform32_t),
+        pipeline_mcmc.mask_retracted_group,
+        {
+            buffers.group_ids.deviceBuffer,
+            buffers.group_state.deviceBuffer,
+            buffers.scales_opacs.deviceBuffer,
+        }
+    );
+    bufferMemoryBarrier({
+        { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+}
+
 size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     VulkanGSPipelineBuffers& buffers,
     const float* new_xyz_norm,
@@ -2192,46 +2309,70 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     const size_t new_n = old_n + n_add;
     const size_t kNumSH = 16;
 
-    // 1. Pull current active Gaussian parameters from GPU to host
-    copyFromDevice(buffers.xyz_ws);
-    copyFromDevice(buffers.sh_coeffs);
-    copyFromDevice(buffers.rotations);
-    copyFromDevice(buffers.scales_opacs);
-    buffers.undoReorderSH(buffers.sh_coeffs, old_n);
+    ensureGroupBuffersOnDevice(buffers, old_n);
 
-    // 2. Append new parameters on host
-    buffers.xyz_ws.resize(3 * new_n);
-    std::memcpy(buffers.xyz_ws.data() + 3 * old_n, new_xyz_norm, 3 * n_add * sizeof(float));
+    // 1. Resize parameter buffers directly on device (device-to-device copy, no host readback)
+    resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3 * new_n, false);
+    resizeAndCopyDeviceBuffer(buffers.sh_coeffs, kNumSH * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), false);
+    resizeAndCopyDeviceBuffer(buffers.rotations, 4 * new_n, false);
+    resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4 * new_n, false);
+    resizeAndCopyDeviceBuffer(buffers.group_ids, new_n, false);
 
-    buffers.sh_coeffs.resize(kNumSH * 3 * new_n);
-    std::memcpy(buffers.sh_coeffs.data() + kNumSH * 3 * old_n, new_sh_coeffs, kNumSH * 3 * n_add * sizeof(float));
-    buffers.reorderSH(buffers.sh_coeffs);
+    // 2. Upload ONLY the k newly appended splats
+    uploadDeviceSlice(buffers.xyz_ws.deviceBuffer, 3 * old_n * sizeof(float), new_xyz_norm, 3 * n_add * sizeof(float));
+    uploadDeviceSlice(buffers.rotations.deviceBuffer, 4 * old_n * sizeof(float), new_rotations, 4 * n_add * sizeof(float));
 
-    buffers.rotations.resize(4 * new_n);
-    std::memcpy(buffers.rotations.data() + 4 * old_n, new_rotations, 4 * n_add * sizeof(float));
-
-    buffers.scales_opacs.resize(4 * new_n);
+    std::vector<float> new_so(4 * n_add);
     for (size_t i = 0; i < n_add; ++i) {
-        float* dst = buffers.scales_opacs.data() + 4 * (old_n + i);
-        dst[0] = new_scales[3 * i + 0];
-        dst[1] = new_scales[3 * i + 1];
-        dst[2] = new_scales[3 * i + 2];
-        dst[3] = new_opacities[i];
+        new_so[4 * i + 0] = new_scales[3 * i + 0];
+        new_so[4 * i + 1] = new_scales[3 * i + 1];
+        new_so[4 * i + 2] = new_scales[3 * i + 2];
+        new_so[4 * i + 3] = new_opacities[i];
     }
+    uploadDeviceSlice(buffers.scales_opacs.deviceBuffer, 4 * old_n * sizeof(float), new_so.data(), 4 * n_add * sizeof(float));
+
+    std::vector<int32_t> add_gids(n_add, -1);
+    if (new_group_ids != nullptr) {
+        std::memcpy(add_gids.data(), new_group_ids, n_add * sizeof(int32_t));
+    }
+    uploadDeviceSlice(buffers.group_ids.deviceBuffer, old_n * sizeof(int32_t), add_gids.data(), n_add * sizeof(int32_t));
 
     if (splat_group_ids.size() < old_n) {
         splat_group_ids.resize(old_n, -1);
     }
     splat_group_ids.resize(new_n, -1);
-    if (new_group_ids != nullptr) {
-        std::memcpy(splat_group_ids.data() + old_n, new_group_ids, n_add * sizeof(int32_t));
-    }
+    std::memcpy(splat_group_ids.data() + old_n, add_gids.data(), n_add * sizeof(int32_t));
+    syncGroupStateSize(buffers, add_gids.data(), n_add);
 
-    // 3. Copy updated Gaussian parameters to device
-    copyToDevice(buffers.xyz_ws);
-    copyToDevice(buffers.sh_coeffs);
-    copyToDevice(buffers.rotations);
-    copyToDevice(buffers.scales_opacs);
+    // 3. Reorder & upload SH coefficients for ONLY the new splats (plus partial tail block if old_n % SH_REORDER_SIZE != 0)
+    const size_t tail_count = (SH_REORDER_SIZE > 1) ? (old_n % SH_REORDER_SIZE) : 0;
+    const size_t aligned_old_n = old_n - tail_count;
+    Buffer<float> sh_stage;
+    if (tail_count == 0) {
+        sh_stage.assign(new_sh_coeffs, new_sh_coeffs + kNumSH * 3 * n_add);
+    } else {
+        sh_stage.resize(kNumSH * 3 * SH_REORDER_SIZE);
+        downloadDeviceSlice(
+            buffers.sh_coeffs.deviceBuffer,
+            kNumSH * 3 * aligned_old_n * sizeof(float),
+            sh_stage.data(),
+            kNumSH * 3 * SH_REORDER_SIZE * sizeof(float)
+        );
+        buffers.undoReorderSH(sh_stage, tail_count);
+        sh_stage.resize(kNumSH * 3 * (tail_count + n_add));
+        std::memcpy(
+            sh_stage.data() + kNumSH * 3 * tail_count,
+            new_sh_coeffs,
+            kNumSH * 3 * n_add * sizeof(float)
+        );
+    }
+    buffers.reorderSH(sh_stage);
+    uploadDeviceSlice(
+        buffers.sh_coeffs.deviceBuffer,
+        kNumSH * 3 * aligned_old_n * sizeof(float),
+        sh_stage.data(),
+        sh_stage.byteLength()
+    );
 
     // 4. Grow Adam optimizer state buffers on device WITHOUT resetting existing splats' moments
     {

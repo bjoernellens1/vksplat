@@ -230,6 +230,11 @@ public:
         size_t n_add
     );
 
+    void ensureGroupBuffersOnDevice(VulkanGSPipelineBuffers& buffers, size_t num_splats);
+    void syncGroupStateSize(VulkanGSPipelineBuffers& buffers, const int32_t* gids, size_t count);
+    void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
+    void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
+
 private:
     std::default_random_engine rng;
 
@@ -263,14 +268,15 @@ private:
         _ComputePipeline reset_opa = _ComputePipeline(2);
     } pipeline_default;
     struct _MCMCComputePipeline {
-        _ComputePipeline inject_noise = _ComputePipeline(4);
-        _ComputePipeline compute_probs = _ComputePipeline(2);
-        _ComputePipeline compute_relocation_index_map = _ComputePipeline(4);
+        _ComputePipeline inject_noise = _ComputePipeline(5);
+        _ComputePipeline compute_probs = _ComputePipeline(3);
+        _ComputePipeline compute_relocation_index_map = _ComputePipeline(5);
         _ComputePipeline compute_relocation = _ComputePipeline(7);
         _ComputePipeline update_relocation = _ComputePipeline(10);
         _ComputePipeline compute_add_index_map = _ComputePipeline(3);
         _ComputePipeline compute_add = _ComputePipeline(2);
         _ComputePipeline update_add = _ComputePipeline(10);
+        _ComputePipeline mask_retracted_group = _ComputePipeline(3);
     } pipeline_mcmc;
     struct _MortonSortComputePipeline {
         _ComputePipeline compute_stats = _ComputePipeline(2);

@@ -38,6 +38,8 @@ public:
     template<typename T> _VulkanBuffer& resizeAndCopyDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool clear);
     template<typename T> _VulkanBuffer& copyToDevice(Buffer<T>& buffer);
     template<typename T> void copyFromDevice(Buffer<T>& buffer);
+    void uploadDeviceSlice(_VulkanBuffer& deviceBuffer, size_t dst_byte_offset, const void* src_data, size_t byte_size);
+    void downloadDeviceSlice(const _VulkanBuffer& deviceBuffer, size_t src_byte_offset, void* dst_data, size_t byte_size);
     void copyFromDeviceToDevice(const _VulkanBuffer& src, _VulkanBuffer& dst);
     template<typename T> void copyFromDeviceToDevice(const Buffer<T>& src, Buffer<T>& dst);
     template<typename T> T readElement(const _VulkanBuffer& buffer, size_t index);

@@ -136,6 +136,7 @@ public:
             "mcmc_compute_add_index_map",
             "mcmc_compute_add",
             "mcmc_update_add",
+            "mcmc_mask_retracted_group",
             "morton_sort_compute_stats",
             "morton_sort_generate_keys",
             "morton_sort_apply_indices",
@@ -296,6 +297,79 @@ public:
         auto buf = gids_arr.request();
         std::vector<int32_t> vec((int32_t*)buf.ptr, (int32_t*)buf.ptr + buf.size);
         trainer.set_splat_group_ids(vec);
+        buffers.group_ids.assign(vec.begin(), vec.end());
+        if (!buffers.group_ids.empty()) {
+            trainer.copyToDevice(buffers.group_ids);
+        }
+        trainer.syncGroupStateSize(buffers, vec.data(), vec.size());
+    }
+    void set_group_state(int32_t group_id, uint32_t state) {
+        trainer.set_group_state(buffers, group_id, state);
+    }
+    void retract_group_sparse(int32_t group_id) {
+        trainer.retract_group_sparse(buffers, group_id);
+    }
+
+    void set_sh_coeffs_reordered(
+        py::array_t<float, py::array::c_style | py::array::forcecast> sh_logical
+    ) {
+        auto sh_buf = sh_logical.request();
+        if (sh_buf.ndim != 3 || (size_t)sh_buf.shape[0] != buffers.num_splats ||
+            sh_buf.shape[1] != 16 || sh_buf.shape[2] != 3) {
+            throw std::runtime_error("sh_coeffs must be (N, 16, 3) matching num_splats");
+        }
+        if (buffers.num_splats == 0)
+            return;
+        const float* ptr = static_cast<const float*>(sh_buf.ptr);
+        buffers.sh_coeffs.assign(ptr, ptr + sh_buf.size);
+        buffers.reorderSH(buffers.sh_coeffs);
+        trainer.copyToDevice(buffers.sh_coeffs);
+    }
+
+    py::array_t<float> get_scales_opacities_packed() {
+        return buffer_to_array<float, float>(buffers.scales_opacs, 4);
+    }
+
+    py::array_t<float> get_sh_dc() {
+        size_t n = buffers.num_splats;
+        py::array_t<float> out({(py::ssize_t)n, (py::ssize_t)3});
+        if (n == 0)
+            return out;
+        float* dst = static_cast<float*>(out.request().ptr);
+        static constexpr size_t kShDim = 12;
+        if (SH_REORDER_SIZE <= 1) {
+            for (size_t i = 0; i < n; ++i) {
+                float rgb[3];
+                trainer.downloadDeviceSlice(
+                    buffers.sh_coeffs.deviceBuffer,
+                    i * kShDim * 4 * sizeof(float),
+                    rgb,
+                    3 * sizeof(float)
+                );
+                dst[3 * i + 0] = rgb[0];
+                dst[3 * i + 1] = rgb[1];
+                dst[3 * i + 2] = rgb[2];
+            }
+            return out;
+        }
+        size_t num_blocks = _CEIL_DIV(n, SH_REORDER_SIZE);
+        std::vector<float> block_dc(SH_REORDER_SIZE * 4);
+        for (size_t g = 0; g < num_blocks; ++g) {
+            size_t base = g * SH_REORDER_SIZE;
+            size_t count = std::min<size_t>(SH_REORDER_SIZE, n - base);
+            trainer.downloadDeviceSlice(
+                buffers.sh_coeffs.deviceBuffer,
+                g * kShDim * SH_REORDER_SIZE * 4 * sizeof(float),
+                block_dc.data(),
+                SH_REORDER_SIZE * 4 * sizeof(float)
+            );
+            for (size_t k = 0; k < count; ++k) {
+                dst[3 * (base + k) + 0] = block_dc[4 * k + 0];
+                dst[3 * (base + k) + 1] = block_dc[4 * k + 1];
+                dst[3 * (base + k) + 2] = block_dc[4 * k + 2];
+            }
+        }
+        return out;
     }
     void set_splat_entity_ids(py::array_t<int32_t> eids_arr) {
         auto buf = eids_arr.request();
@@ -827,6 +901,12 @@ public:
 
     }
 
+    void train_steps(const std::vector<int>& indices, int first_step) {
+        for (size_t i = 0; i < indices.size(); ++i) {
+            train_step(static_cast<size_t>(indices[i]), first_step + static_cast<int>(i));
+        }
+    }
+
     void render_train(size_t idx) {
         trainer.get_train_camera(idx, uniforms);
         forward();
@@ -906,28 +986,41 @@ PYBIND11_MODULE(vksplat, m) {
         .def("set_pixel_state_grad", &VkSplat::set_pixel_state_grad, "Set gradient of output pixels",
              py::arg("v_pixel_state"))
         .def("projection_forward", &VkSplat::projection_forward,
-             "Execute the forward projection trainer")
+             "Execute the forward projection trainer", py::call_guard<py::gil_scoped_release>())
         .def("process_tiles", &VkSplat::process_tiles,
-             "Process tiles")
+             "Process tiles", py::call_guard<py::gil_scoped_release>())
         .def("rasterize_forward", &VkSplat::rasterize_forward,
-             "Execute the forward rasterization trainer")
+             "Execute the forward rasterization trainer", py::call_guard<py::gil_scoped_release>())
         .def("rasterize_backward", &VkSplat::rasterize_backward,
-             "Execute the backward rasterization trainer")
-        .def("forward", &VkSplat::forward, "Execute forward all the way")
-        .def("compute_pixel_loss_grad", &VkSplat::compute_pixel_loss_grad, "Execute compute gradient of pixel loss")
-        .def("set_train_image", &VkSplat::set_train_image, "Train on the give image for one step.")
-        .def("train_step", &VkSplat::train_step, "Train on the give image for one step.")
-        .def("render_train", &VkSplat::render_train, "Render the train camera pose to buffer.")
-        .def("render_val", &VkSplat::render_val, "Render the eval camera pose to buffer.")
+             "Execute the backward rasterization trainer", py::call_guard<py::gil_scoped_release>())
+        .def("forward", &VkSplat::forward, "Execute forward all the way", py::call_guard<py::gil_scoped_release>())
+        .def("compute_pixel_loss_grad", &VkSplat::compute_pixel_loss_grad,
+             "Execute compute gradient of pixel loss", py::call_guard<py::gil_scoped_release>())
+        .def("set_train_image", &VkSplat::set_train_image,
+             "Train on the give image for one step.", py::call_guard<py::gil_scoped_release>())
+        .def("train_step", &VkSplat::train_step,
+             "Train on the give image for one step.", py::call_guard<py::gil_scoped_release>())
+        .def("train_steps", &VkSplat::train_steps,
+             "Run a sequence of training steps without re-acquiring the GIL",
+             py::arg("indices"), py::arg("first_step"), py::call_guard<py::gil_scoped_release>())
+        .def("render_train", &VkSplat::render_train,
+             "Render the train camera pose to buffer.", py::call_guard<py::gil_scoped_release>())
+        .def("render_val", &VkSplat::render_val,
+             "Render the eval camera pose to buffer.", py::call_guard<py::gil_scoped_release>())
         .def("post_backward_step", &VkSplat::post_backward_step,
-             "Run this after each step for densification.")
+             "Run this after each step for densification.", py::call_guard<py::gil_scoped_release>())
         .def("get_vram_usage", &VkSplat::get_vram_usage, "Get VRAM Usage")
         .def("get_peak_vram_usage", &VkSplat::get_peak_vram_usage, "Get peak VRAM Usage")
         .def("get_timing_breakdown", &VkSplat::get_timing_breakdown, "Get timing for each step since start")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
-        .def("write_ply", &VkSplat::write_ply, "Save PLY file")
+        .def("write_ply", &VkSplat::write_ply, "Save PLY file", py::call_guard<py::gil_scoped_release>())
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
         .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
+        .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (1=ACTIVE, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
+        .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
+        .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))
+        .def("get_scales_opacities_packed", &VkSplat::get_scales_opacities_packed, "Read packed (N, 4) scales+opacities in a single device transfer")
+        .def("get_sh_dc", &VkSplat::get_sh_dc, "Read only the (N, 3) DC band from reordered sh_coeffs on device")
         .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
         .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")

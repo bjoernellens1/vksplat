@@ -369,6 +369,68 @@ void VulkanGSPipeline::copyFromDevice(Buffer<T>& buffer) {
 }
 
 
+void VulkanGSPipeline::uploadDeviceSlice(
+    _VulkanBuffer& deviceBuffer,
+    size_t dst_byte_offset,
+    const void* src_data,
+    size_t byte_size
+) {
+    if (byte_size == 0)
+        return;
+    if (deviceBuffer.buffer == VK_NULL_HANDLE || dst_byte_offset + byte_size > deviceBuffer.size)
+        _THROW_ERROR("uploadDeviceSlice out of bounds");
+
+    allocStagingBuffer(byte_size);
+    std::lock_guard<std::mutex> lock(stager.mutex);
+
+    {
+        HOST_GUARD;
+        void* temp;
+        vkMapMemory(device, stager.memory, 0, byte_size, 0, &temp);
+        memcpy(temp, src_data, byte_size);
+        vkUnmapMemory(device, stager.memory);
+    }
+    {
+        DEVICE_GUARD;
+        VkBufferCopy copy_region = {};
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = dst_byte_offset;
+        copy_region.size = byte_size;
+        vkCmdCopyBuffer(command_buffer, stager.buffer, deviceBuffer.buffer, 1, &copy_region);
+    }
+}
+
+
+void VulkanGSPipeline::downloadDeviceSlice(
+    const _VulkanBuffer& deviceBuffer,
+    size_t src_byte_offset,
+    void* dst_data,
+    size_t byte_size
+) {
+    if (byte_size == 0)
+        return;
+    if (deviceBuffer.buffer == VK_NULL_HANDLE || src_byte_offset + byte_size > deviceBuffer.size)
+        _THROW_ERROR("downloadDeviceSlice out of bounds");
+
+    allocStagingBuffer(byte_size);
+    std::lock_guard<std::mutex> lock(stager.mutex);
+
+    {
+        DEVICE_GUARD;
+        VkBufferCopy copy_region = {};
+        copy_region.srcOffset = src_byte_offset;
+        copy_region.dstOffset = 0;
+        copy_region.size = byte_size;
+        vkCmdCopyBuffer(command_buffer, deviceBuffer.buffer, stager.buffer, 1, &copy_region);
+    }
+    HOST_GUARD;
+    void* temp;
+    vkMapMemory(device, stager.memory, 0, byte_size, 0, &temp);
+    memcpy(dst_data, temp, byte_size);
+    vkUnmapMemory(device, stager.memory);
+}
+
+
 void VulkanGSPipeline::copyFromDeviceToDevice(const _VulkanBuffer& srcBuffer, _VulkanBuffer& dstBuffer) {
     
     if (srcBuffer.buffer == VK_NULL_HANDLE || srcBuffer.size == 0)
@@ -713,6 +775,7 @@ void VulkanGSPipelineBuffers::assignScalesOpacs(
 _INSTANTIATE_BUFFER(uint8_t)
 _INSTANTIATE_BUFFER(float)
 _INSTANTIATE_BUFFER(int32_t)
+_INSTANTIATE_BUFFER(uint32_t)
 _INSTANTIATE_BUFFER(int64_t)
 
 #undef _INSTANTIATE_BUFFER
