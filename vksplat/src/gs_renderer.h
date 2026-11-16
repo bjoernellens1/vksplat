@@ -21,7 +21,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float cy;
     float dist_coeffs[4];
     float world_view_transform[16];
-    float sparse_tile_grad_thresh;
+    uint32_t use_tile_list;  // 1: backward kernels run over the compacted active-tile list
     float _pad_tile0;
     float _pad_tile1;
     float _pad_tile2;
@@ -72,6 +72,17 @@ public:
     int sampleBackwardImpl();  // scheduler pick (RasterBackwardImpl as int) for the next backward pass
     void setBackwardPinAfter(size_t updates);
 
+    // ---- sparse tile backward ----
+    // Per-tile residual -> quantile threshold -> halo dilation -> compacted tile list + indirect arguments,
+    // all on the GPU (sparse_tiles.slang). The raster-backward and SSIM-backward kernels then run over the
+    // listed tiles only. Must be called after the forward render and before both backward kernels.
+    void executeSelectSparseTiles(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers,
+                                  float quantile, int halo);
+    // Grow the tile-sized scratch buffers; call outside a command batch.
+    void ensureSparseTileBuffers(size_t num_tiles);
+    // Tiles dispatched by sparse backward passes so far (device counter; reads back, never call mid-step).
+    uint64_t sparseTilesDispatched();
+
 private:
     enum class RasterBackwardImpl {
         PerPixel = 0,
@@ -109,17 +120,25 @@ protected:
     _ComputePipeline pipeline_projection_forward = _ComputePipeline(11);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
     _ComputePipeline pipeline_step_gate = _ComputePipeline(4);
+    _ComputePipeline pipeline_sparse_residual = _ComputePipeline(3);
+    _ComputePipeline pipeline_sparse_select = _ComputePipeline(6);
+    _VulkanBuffer sparse_residual, sparse_mask, sparse_active_tiles;  // (tiles,) uint32
+    _VulkanBuffer sparse_args;      // one VkDispatchIndirectCommand
+    _VulkanBuffer sparse_counters;  // [0]: tiles dispatched by sparse backward passes (wraps at 2^32)
+    size_t sparse_capacity = 0;
+    uint32_t sparse_counter_last = 0;
+    uint64_t sparse_counter_total = 0;
     _ComputePipeline pipeline_compute_tile_ranges[2] = {
         _ComputePipeline(3),
         _ComputePipeline(3)
     };
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
-        _ComputePipelinePair(11),  // per pixel
-        _ComputePipelinePair(11),  // per splat
-        _ComputePipelinePair(11),  // tensor
-        _ComputePipelinePair(11),  // tensor
-        _ComputePipelinePair(11),  // tensor
+        _ComputePipelinePair(12),  // per pixel
+        _ComputePipelinePair(12),  // per splat
+        _ComputePipelinePair(12),  // tensor
+        _ComputePipelinePair(12),  // tensor
+        _ComputePipelinePair(12),  // tensor
     };
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);

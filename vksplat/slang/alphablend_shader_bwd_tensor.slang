@@ -89,6 +89,7 @@ layout(binding=7) StructuredBuffer<float4> v_current_pixel_state;
 layout(binding=8) RWByteAddressBuffer out_v_xy_vs;
 layout(binding=9) RWByteAddressBuffer out_v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer out_v_rgb;
+layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
 
 
 [shader("compute")]
@@ -102,7 +103,7 @@ void main(
     const uint32_t W = uniforms.image_width;
     const uint grid_width = uniforms.grid_width;
 
-    uint tile_idx = groupID.x;
+    uint tile_idx = uniforms.use_tile_list != 0 ? active_tiles[groupID.x] : groupID.x;
     uint2 tbound0 = uint2(tile_idx%grid_width, tile_idx/grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT);
     float2 tile_center = tbound0 + uint2(TILE_WIDTH, TILE_HEIGHT) / 2;
 
@@ -140,19 +141,6 @@ void main(
         (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? collected_idx[lane_id] : 0
     );
     GroupMemoryBarrierWithGroupSync();
-    float local_grad_mag = max(max(abs(v_pixel_state.x), abs(v_pixel_state.y)), abs(v_pixel_state.z));
-    float sg_max_grad = WaveActiveMax(local_grad_mag);
-    if (WaveIsFirstLane()) {
-        collected_idx[groupThreadID.x / SUBGROUP_SIZE] = asint(sg_max_grad);
-    }
-    GroupMemoryBarrierWithGroupSync();
-    float tile_max_grad = WaveActiveMax(
-        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? asfloat(collected_idx[lane_id]) : 0.0f
-    );
-    GroupMemoryBarrierWithGroupSync();
-    if (uniforms.sparse_tile_grad_thresh > 0.0f && tile_max_grad <= uniforms.sparse_tile_grad_thresh)
-        return;
-
     tile_idx_end = tile_idx_start + min(tile_idx_end - tile_idx_start, uint32_t(max(tile_max_n_contrib, 0)));
     uint32_t num_splats_in_tile = tile_idx_end - tile_idx_start;
     if (num_splats_in_tile == 0)

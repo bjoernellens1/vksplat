@@ -909,7 +909,8 @@ void VulkanGSPipeline::executeCompute(
     const void* uniformsPtr, size_t uniformSize,
     _ComputePipeline &pipeline,
     const std::vector<_VulkanBuffer> &buffers,
-    int gate_slot
+    int gate_slot,
+    const _VulkanBuffer* indirect
 ) {
     if (uniformSize > MAX_UNIFORM_SIZE)
         _THROW_ERROR("Maximum uniform size exceeded");
@@ -935,6 +936,11 @@ void VulkanGSPipeline::executeCompute(
         );
     }
     
+    if (indirect) {
+        vkCmdDispatchIndirect(command_buffer, indirect->buffer, 0);
+        return;
+    }
+
     // Dispatch compute shader
     while (dims.size() < 3)
         dims.push_back({1, 1});

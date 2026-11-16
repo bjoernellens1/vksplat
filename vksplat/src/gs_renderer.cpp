@@ -23,6 +23,9 @@ VulkanGSRenderer::~VulkanGSRenderer() {
 }
 
 void VulkanGSRenderer::cleanup() {
+    for (auto* b : {&sparse_residual, &sparse_mask, &sparse_active_tiles, &sparse_args, &sparse_counters})
+        destroyBuffer(*b);
+    sparse_capacity = 0;
     VulkanGSPipeline::cleanup();
 }
 
@@ -59,6 +62,15 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
     createComputePipeline(pipeline_generate_keys, spirv_paths.at("generate_keys"));
     createComputePipeline(pipeline_step_gate, spirv_paths.at("step_gate"));
     createGateBuffers();
+    createComputePipeline(pipeline_sparse_residual, spirv_paths.at("sparse_tile_residual"));
+    createComputePipeline(pipeline_sparse_select, spirv_paths.at("sparse_tile_select"));
+    createBuffer(4 * sizeof(uint32_t), sparse_args);
+    createBuffer(sizeof(uint32_t), sparse_counters);
+    {
+        DEVICE_GUARD;
+        vkCmdFillBuffer(command_buffer, sparse_counters.buffer, 0, sizeof(uint32_t), 0);
+    }
+    ensureSparseTileBuffers(1);
     for (int i = 0; i < 2; ++i) {
         createComputePipeline(pipeline_compute_tile_ranges[i], spirv_paths.at("compute_tile_ranges"));
         createComputePipeline(pipeline_rasterize_forward[i], spirv_paths.at("rasterize_forward"));
@@ -362,8 +374,17 @@ void VulkanGSRenderer::executeRasterizeBackward(
         dims = {{(int)uniforms.image_width, TILE_WIDTH}, {(int)uniforms.image_height, TILE_HEIGHT}};
     else
         dims = {{uniforms.grid_width*uniforms.grid_height, 1}};
-    PerfTimer::work_counters.backward_dispatches++;
-    PerfTimer::work_counters.backward_tiles_dispatched += (uint64_t)uniforms.grid_width * uniforms.grid_height;
+    const bool sparse = uniforms.use_tile_list != 0;
+    {
+        auto& w = PerfTimer::work_counters;
+        const uint64_t grid_tiles = (uint64_t)uniforms.grid_width * uniforms.grid_height;
+        w.backward_dispatches++;
+        w.backward_tiles_total += grid_tiles;
+        if (sparse)
+            w.backward_sparse_passes++;
+        else
+            w.backward_tiles_dispatched += grid_tiles;  // sparse passes are counted on the GPU
+    }
 
     executeCompute(
         dims,
@@ -384,8 +405,10 @@ void VulkanGSRenderer::executeRasterizeBackward(
             buffers.v_xy_vs.deviceBuffer,
             buffers.v_inv_cov_vs_opacity.deviceBuffer,
             buffers.v_rgb.deviceBuffer,
+            sparse_active_tiles,
         },
-        GATE_RASTER_BWD
+        GATE_RASTER_BWD,
+        sparse ? &sparse_args : nullptr
     );
 
 }
@@ -842,6 +865,77 @@ VulkanGSRenderer::GateResult VulkanGSRenderer::gateResult() const {
     for (uint32_t i = 0; i < kGateMaxSteps; i++)
         r.isects[i] = gate_host_status[4 + i];
     return r;
+}
+
+void VulkanGSRenderer::ensureSparseTileBuffers(size_t num_tiles) {
+    if (num_tiles <= sparse_capacity)
+        return;
+    if (commandBatchInProgress)
+        _THROW_ERROR("sparse tile buffers must be grown outside a command batch");
+    for (auto* b : {&sparse_residual, &sparse_mask, &sparse_active_tiles}) {
+        destroyBuffer(*b);
+        createBuffer(num_tiles * sizeof(uint32_t), *b);
+    }
+    sparse_capacity = num_tiles;
+}
+
+void VulkanGSRenderer::executeSelectSparseTiles(
+    const VulkanGSRendererUniforms& uniforms,
+    VulkanGSPipelineBuffers& buffers,
+    float quantile,
+    int halo
+) {
+    PerfTimer::Timer<PerfTimer::SelectSparseTiles> timer(this);
+    DEVICE_GUARD;
+    const uint32_t num_tiles = uniforms.grid_width * uniforms.grid_height;
+    if (num_tiles > sparse_capacity)
+        _THROW_ERROR("sparse tile buffers too small for this image");
+
+    const uint32_t residual_uniforms[4] = {uniforms.image_width, uniforms.image_height, uniforms.grid_width, 0};
+    executeCompute(
+        {{uniforms.grid_width, 1}, {uniforms.grid_height, 1}},
+        residual_uniforms, sizeof(residual_uniforms),
+        pipeline_sparse_residual,
+        { buffers.pixel_state.deviceBuffer, buffers.ref_image.deviceBuffer, sparse_residual }
+    );
+    fullBarrier();
+
+    struct { uint32_t num_tiles, grid_width, keep, full, halo, args_offset, gate_ok_index, pad; } select_uniforms = {};
+    select_uniforms.num_tiles = num_tiles;
+    select_uniforms.grid_width = uniforms.grid_width;
+    select_uniforms.keep = std::max<uint32_t>(1, (uint32_t)std::ceil((1.0 - (double)quantile) * num_tiles));
+    select_uniforms.full = 0;
+    select_uniforms.halo = (uint32_t)std::max(halo, 0);
+    select_uniforms.args_offset = 0;
+    select_uniforms.gate_ok_index = gate_active ? (gate_step * kGateSlots + GATE_RASTER_BWD) * 4 : 0xffffffffu;
+    executeCompute(
+        {{1, 1}},
+        &select_uniforms, sizeof(select_uniforms),
+        pipeline_sparse_select,
+        { sparse_residual, sparse_mask, sparse_active_tiles, sparse_args, gate_args, sparse_counters }
+    );
+    {  // list, arguments and counter: read by the SSIM and raster backward kernels (indirect arguments included)
+        VkMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
+}
+
+uint64_t VulkanGSRenderer::sparseTilesDispatched() {
+    if (commandBatchInProgress)
+        _THROW_ERROR("sparseTilesDispatched called inside a command batch");
+    // a diagnostic readback, not part of any step: keep fence_waits_total a measure of the step path
+    auto& fences = PerfTimer::work_counters.fence_waits_total;
+    const uint64_t fences_before = fences;
+    const uint32_t now = (uint32_t)readElement<int32_t>(sparse_counters, 0);
+    fences = fences_before;
+    sparse_counter_total += (uint32_t)(now - sparse_counter_last);
+    sparse_counter_last = now;
+    return sparse_counter_total;
 }
 
 int VulkanGSRenderer::sampleBackwardImpl() {

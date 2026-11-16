@@ -23,6 +23,7 @@ namespace PerfTimer {
     _(_Where) \
     _(CopyTrainImageToDevice) \
     _(ComputeSSIMGradient) \
+    _(SelectSparseTiles) \
     _(FusedProjectionBackwardOptimizerStep) \
     _(DefaultPostBackward) \
     _(MCMCPostBackward) \
@@ -65,16 +66,17 @@ std::vector<std::pair<size_t, double>> update(std::vector<double> times);
 
 std::map<std::string, std::tuple<size_t, double>> get_summary();
 
-// Work counters accumulated from values the host already has (no extra GPU readback).
-// Backward tiles skipped by the sparse_tile_grad_thresh early-exit are decided on the GPU and are
-// not counted: that would need a device atomic plus a new readback.
+// Work counters accumulated from values the host already has (no extra GPU readback). The tiles of sparse
+// backward passes are counted on the GPU and added by VkSplat.get_work_counters().
 struct WorkCounters {
     uint64_t forward_passes = 0;
     uint64_t tile_intersections_total = 0;  // sum of num_indices over forward passes
     uint64_t tile_intersections_last = 0;
     uint64_t tile_intersections_max = 0;
     uint64_t backward_dispatches = 0;
-    uint64_t backward_tiles_dispatched = 0;  // grid_width * grid_height per backward dispatch
+    uint64_t backward_tiles_dispatched = 0;  // dense passes: grid tiles; sparse passes: added from the GPU counter
+    uint64_t backward_tiles_total = 0;       // grid_width * grid_height per backward pass
+    uint64_t backward_sparse_passes = 0;     // backward passes that ran over the active-tile list
     // Reserved-capacity append: growth events of the per-splat buffer set, blocking fence waits inside
     // append calls, and reallocations of per-step (projection / gradient) buffers.
     uint64_t append_reallocs = 0;

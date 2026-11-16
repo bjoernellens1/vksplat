@@ -854,6 +854,11 @@ void VulkanGSTrainer::get_train_camera(size_t idx, VulkanGSRendererUniforms &uni
     camera_to_uniforms(dataset_train[idx].camera, uniforms);
 }
 
+size_t VulkanGSTrainer::train_tile_count(size_t idx) const {
+    const auto& cam = dataset_train[idx].camera;
+    return (size_t)_CEIL_DIV(cam.h, TILE_HEIGHT) * _CEIL_DIV(cam.w, TILE_WIDTH);
+}
+
 void VulkanGSTrainer::get_val_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const {
     camera_to_uniforms(dataset_val[idx].camera, uniforms);
 }
@@ -909,12 +914,16 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
 ) {
     size_t w = uniforms.image_width, h = uniforms.image_height;
     size_t num_pixels = w * h;
-    Uniform32_t shader_uniforms[4];
+    Uniform32_t shader_uniforms[5];
     shader_uniforms[0].u = (uint32_t)w;
     shader_uniforms[1].u = (uint32_t)h;
     const uint32_t kTwoHalo = 10;
     shader_uniforms[2].f = (1.0f - config.ssim_lambda) / (3.0f * w * h);  // l1 grad weight
     shader_uniforms[3].f = -config.ssim_lambda / (3.0f * (w-kTwoHalo) * (h-kTwoHalo));  // ssim grad weight
+    // Sparse objective: the loss gradient is formed only for the active tiles (L1 restricted to them,
+    // SSIM windows still read the full-frame statistics); the other tiles are never read by the raster backward.
+    const bool sparse = uniforms.use_tile_list != 0;
+    shader_uniforms[4].u = sparse ? 1u : 0u;
     
     auto& train_image = dataset_train[train_idx].buffer;
     if (train_image.deviceBuffer.buffer == VK_NULL_HANDLE) {
@@ -933,6 +942,9 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     PerfTimer::Timer<PerfTimer::ComputeSSIMGradient> timer(this);
 
     DEVICE_GUARD;
+
+    if (sparse)
+        executeSelectSparseTiles(uniforms, buffers, config.sparse_tile_quantile, config.sparse_tile_halo);
 
     // auto& ssim_map = buffers.ssim_map;
     auto& ssim_map = buffers._temp_gauss_attr;  // reuse buffer to save VRAM
@@ -953,14 +965,17 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     }, COMPUTE_SHADER_READ);
     executeCompute(
         {{w, 16}, {h, 16}},
-        shader_uniforms, 3*sizeof(Uniform32_t),
+        shader_uniforms, 5*sizeof(Uniform32_t),
         pipeline_ssim_backward,
         {
             buffers.pixel_state.deviceBuffer,
             buffers.ref_image.deviceBuffer,
             ssim_map.deviceBuffer,
             resizeDeviceBuffer(buffers.v_pixel_state, 4*num_pixels),
-        }
+            sparse_active_tiles,
+        },
+        -1,
+        sparse ? &sparse_args : nullptr
     );
 }
 

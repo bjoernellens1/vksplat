@@ -40,6 +40,7 @@ layout(binding=0) StructuredBuffer<float4> img1Buffer;
 layout(binding=1) StructuredBuffer<uint32_t> img2Buffer;
 layout(binding=2) RWStructuredBuffer<float4> ssimMapBuffer;
 layout(binding=3) RWStructuredBuffer<float4> dLdimg1Buffer;
+layout(binding=4) StructuredBuffer<uint32_t> activeTiles;  // backward: compacted tile list when useTileList != 0
 
 
 // forward
@@ -56,6 +57,7 @@ struct Uniforms {
     uint imageHeight;
     float gradWeightL1;
     float gradWeightSSIM;
+    uint useTileList;  // backward only: one workgroup per listed tile instead of per image tile
 }
 
 
@@ -296,15 +298,21 @@ void ssimBackward(
     const float gradWeightL1 = uniforms.gradWeightL1;
     const float gradWeightSSIM = uniforms.gradWeightSSIM;
 
-    uint pixX = dispatchThreadID.x;
-    uint pixY = dispatchThreadID.y;
+    uint2 tile = groupID.xy;
+    if (uniforms.useTileList != 0) {
+        uint tileIdx = activeTiles[groupID.x];
+        uint gridWidth = (imageWidth + BLOCK_X - 1) / BLOCK_X;
+        tile = uint2(tileIdx % gridWidth, tileIdx / gridWidth);
+    }
+    uint pixX = tile.x * BLOCK_X + groupThreadID.x;
+    uint pixY = tile.y * BLOCK_Y + groupThreadID.y;
     uint pixId = pixY * imageWidth + pixX;
     const uint numPixels = imageWidth * imageHeight;
 
     const uint tileSize = SHARED_Y * SHARED_X;
     const uint totalThreads = BLOCK_X * BLOCK_Y;
-    const uint startY = groupID.y * BLOCK_Y;
-    const uint startX = groupID.x * BLOCK_X;
+    const uint startY = tile.y * BLOCK_Y;
+    const uint startX = tile.x * BLOCK_X;
     const uint tid = groupThreadID.y * BLOCK_X + groupThreadID.x;
 
     float3 p1_rgb = float3(0.0f);

@@ -276,6 +276,12 @@ class ShaderCompiler:
             ShaderJob("step_gate", {}),
         ], []))
 
+        # Sparse backward tile selection (per-tile residual, quantile threshold, compaction, indirect arguments)
+        jobs.append(("sparse_tiles.slang", [
+            ShaderJob("sparse_tile_residual", {"ENTRY": 1}),
+            ShaderJob("sparse_tile_select", {"ENTRY": 2}),
+        ], ["config.slang"]))
+
         # Summation
         jobs.append(("sum.slang", [
             ShaderJob("sum", {}),

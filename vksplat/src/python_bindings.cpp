@@ -120,6 +120,8 @@ public:
             "projection_forward",
             "generate_keys",
             "step_gate",
+            "sparse_tile_residual",
+            "sparse_tile_select",
             "compute_tile_ranges",
             "rasterize_forward",
             "rasterize_backward_0",
@@ -265,8 +267,10 @@ public:
         config.cap_max = train_config["cap_max"].cast<int>();
         config.mcmc_protect_structural_groups = train_config.contains(py::str("mcmc_protect_structural_groups"))
             ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
-        config.sparse_tile_grad_thresh = train_config.contains(py::str("sparse_tile_grad_thresh"))
-            ? train_config["sparse_tile_grad_thresh"].cast<float>() : 0.0f;
+        set_sparse_backward(
+            train_config.contains(py::str("sparse_tile_quantile")) ? train_config["sparse_tile_quantile"].cast<float>() : 0.0f,
+            train_config.contains(py::str("sparse_tile_halo")) ? train_config["sparse_tile_halo"].cast<int>() : 1,
+            train_config.contains(py::str("sparse_full_every")) ? train_config["sparse_full_every"].cast<int>() : 4);
         config.rasterize_backward_pin_after = train_config.contains(py::str("rasterize_backward_pin_after"))
             ? train_config["rasterize_backward_pin_after"].cast<int>() : 0;
         trainer.setBackwardPinAfter((size_t)std::max(config.rasterize_backward_pin_after, 0));
@@ -334,6 +338,16 @@ public:
     void set_selective_freeze_unfrozen(bool unfrozen) {
         trainer.set_selective_freeze_unfrozen(unfrozen);
     }
+    void set_sparse_backward(float quantile, int halo, int full_every) {
+        if (quantile < 0.0f || quantile >= 1.0f)
+            throw std::runtime_error("sparse_tile_quantile must be in [0, 1)");
+        if (halo < 0 || full_every < 1)
+            throw std::runtime_error("sparse_tile_halo must be >= 0 and sparse_full_every >= 1");
+        config.sparse_tile_quantile = quantile;
+        config.sparse_tile_halo = halo;
+        config.sparse_full_every = full_every;
+    }
+
     void reset_anchored_snapshot(size_t new_num_anchored) {
         trainer.reset_anchored_snapshot(new_num_anchored);
     }
@@ -930,6 +944,7 @@ public:
 
     void set_train_image(size_t train_idx) {
         trainer.get_train_camera(train_idx, uniforms);
+        uniforms.use_tile_list = 0;
     }
 
     // per-step uniforms shared by the synchronous and the gated path
@@ -940,7 +955,9 @@ public:
             ? std::min(step / kShDegreeInterval, config.max_sh_degree_override)
             : std::min(step / kShDegreeInterval, 3);
         uniforms.step = step;
-        uniforms.sparse_tile_grad_thresh = config.sparse_tile_grad_thresh;
+        // sentinel: every sparse_full_every-th step is dense so converged tiles are re-verified
+        uniforms.use_tile_list = config.sparse_tile_quantile > 0.0f && config.sparse_full_every > 1 &&
+                                 step % config.sparse_full_every != 0;
     }
 
     // Steps with host-visible work (densify, prune, reset, Morton sort) and calls made inside an open
@@ -1022,6 +1039,12 @@ public:
     }
 
     void train_steps(const std::vector<int>& indices, int first_step) {
+        if (config.sparse_tile_quantile > 0.0f && !indices.empty()) {
+            size_t tiles = 0;
+            for (int idx : indices)
+                tiles = std::max(tiles, trainer.train_tile_count((size_t)idx));
+            trainer.ensureSparseTileBuffers(tiles);
+        }
         size_t i = 0;
         while (i < indices.size()) {
             const int step = first_step + (int)i;
@@ -1072,7 +1095,11 @@ public:
     }
 
     std::map<std::string, uint64_t> get_work_counters() {
-        return PerfTimer::get_work_counters();
+        // the device counter is read first so that its own fence is already part of fence_waits_total
+        const uint64_t sparse_tiles = PerfTimer::work_counters.backward_sparse_passes > 0 ? trainer.sparseTilesDispatched() : 0;
+        auto counters = PerfTimer::get_work_counters();
+        counters["backward_tiles_dispatched"] += sparse_tiles;
+        return counters;
     }
 
     std::map<std::string, size_t> get_vram_breakdown() {
@@ -1177,6 +1204,9 @@ PYBIND11_MODULE(vksplat, m) {
         .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
         .def("set_group_states", &VkSplat::set_group_states, "Batched set_group_state: one device upload for all (group_id, state) pairs", py::arg("group_ids"), py::arg("states"))
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
+        .def("set_sparse_backward", &VkSplat::set_sparse_backward,
+             "Sparse tile backward: quantile in [0,1) (0 = dense), halo tiles, every full_every-th step dense",
+             py::arg("quantile"), py::arg("halo") = 1, py::arg("full_every") = 4)
         .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
         .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))
         .def("get_scales_opacities_packed", &VkSplat::get_scales_opacities_packed, "Read packed (N, 4) scales+opacities in a single device transfer")

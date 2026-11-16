@@ -240,7 +240,8 @@ protected:
         const void* uniformsPtr, size_t uniformSize,
         _ComputePipeline &pipeline,
         const std::vector<_VulkanBuffer> &buffers,
-        int gate_slot = -1
+        int gate_slot = -1,
+        const _VulkanBuffer* indirect = nullptr  // dispatch from this buffer (VkDispatchIndirectCommand at offset 0)
     );
 
     bool gate_active = false;

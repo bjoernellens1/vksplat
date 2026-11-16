@@ -10,7 +10,21 @@ import numpy as np
 ROOT = Path(os.environ.get("VKSPLAT_PY_DIR") or Path(__file__).resolve().parents[1] / "vksplat")
 
 
-def build_dataset(root: Path, n_images: int = 4, n_points: int = 2000, w: int = 64, h: int = 48) -> Path:
+def structured_image(w: int, h: int, shift: int) -> np.ndarray:
+    """Smooth colour field plus a few sharp patches: most tiles fit quickly, the patches stay hard."""
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    xs = (xx + shift) / w
+    img = np.stack([0.5 + 0.3 * np.sin(2.0 * xs + 1.0 * yy / h), 0.5 + 0.3 * np.cos(1.5 * xs - yy / h),
+                    0.4 + 0.3 * (xs * yy / h)], axis=-1)
+    for cx, cy, r, col in [(0.25, 0.3, 0.07, (1.0, 0.1, 0.1)), (0.7, 0.65, 0.09, (0.1, 0.9, 0.2)),
+                           (0.55, 0.2, 0.05, (0.1, 0.2, 1.0))]:
+        m = ((xx - cx * w + shift) ** 2 + (yy - cy * h) ** 2) < (r * w) ** 2
+        img[m] = col
+    return (np.clip(img, 0, 1) * 255).astype(np.uint8)
+
+
+def build_dataset(root: Path, n_images: int = 4, n_points: int = 2000, w: int = 64, h: int = 48,
+                  structured: bool = False) -> Path:
     import cv2
 
     img_dir = root / "images"
@@ -23,7 +37,8 @@ def build_dataset(root: Path, n_images: int = 4, n_points: int = 2000, w: int = 
     lines = ["# Image list"]
     for i in range(n_images):
         name = f"frame_{i:04d}.png"
-        cv2.imwrite(str(img_dir / name), rng.integers(40, 210, size=(h, w, 3), dtype=np.uint8))
+        img = structured_image(w, h, 3 * i) if structured else rng.integers(40, 210, size=(h, w, 3), dtype=np.uint8)
+        cv2.imwrite(str(img_dir / name), img)
         lines += [f"{i + 1} 1.0 0.0 0.0 0.0 {0.12 * i:.4f} 0.0 2.0 1 {name}", ""]
     (sparse_dir / "images.txt").write_text("\n".join(lines) + "\n")
     pts = ["# 3D point list"]

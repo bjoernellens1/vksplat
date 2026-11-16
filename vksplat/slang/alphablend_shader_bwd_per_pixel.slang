@@ -26,6 +26,7 @@ layout(binding=7) StructuredBuffer<float4> v_current_pixel_state;
 layout(binding=8) RWByteAddressBuffer v_xy_vs;
 layout(binding=9) RWByteAddressBuffer v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer v_rgb;
+layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -39,9 +40,10 @@ void main(
     const uint32_t W = uniforms.image_width;
     const uint grid_width = uniforms.grid_width;
 
-    uint2 pix_coord = dispatchThreadID.xy;
-
-    uint tile_idx = groupID.y * grid_width + groupID.x;
+    uint tile_idx = uniforms.use_tile_list != 0 ? active_tiles[groupID.x] : groupID.y * grid_width + groupID.x;
+    uint2 pix_coord = uniforms.use_tile_list != 0 ?
+        uint2(tile_idx % grid_width, tile_idx / grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT) + groupThreadID.xy :
+        dispatchThreadID.xy;
     uint32_t tile_idx_start = tile_ranges[tile_idx];
     uint32_t tile_idx_end = tile_ranges[tile_idx+1];
 
@@ -59,13 +61,11 @@ void main(
 
     float4 current_pixel_state = float4(0.0);
     int32_t n_contrib_fwd = 0;
-    float local_grad_mag = 0.0f;
     if (is_inside) {
         uint32_t pix_id = pix_coord.y * W + pix_coord.x;
         current_pixel_state = final_pixel_state[pix_id];
         n_contrib_fwd = n_contributors[pix_id];
         d_current_pixel_state = v_current_pixel_state[pix_id];
-        local_grad_mag = max(max(abs(d_current_pixel_state.x), abs(d_current_pixel_state.y)), abs(d_current_pixel_state.z));
     }
 
     // Subgroup-first early contributor bound (ported from eligsir-native 06_alpha_backward:m5_subgroup_first)
@@ -80,17 +80,6 @@ void main(
         (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? subgroup_shared[lane_id] : 0.0f
     ));
     GroupMemoryBarrierWithGroupSync();
-    float subgroup_max_grad = WaveActiveMax(local_grad_mag);
-    if (WaveIsFirstLane()) {
-        subgroup_shared[subgroup_idx] = subgroup_max_grad;
-    }
-    GroupMemoryBarrierWithGroupSync();
-    float tile_max_grad = WaveActiveMax(
-        (lane_id < (TILE_SIZE / SUBGROUP_SIZE)) ? subgroup_shared[lane_id] : 0.0f
-    );
-    if (uniforms.sparse_tile_grad_thresh > 0.0f && tile_max_grad <= uniforms.sparse_tile_grad_thresh) {
-        return;
-    }
     tile_idx_end = tile_idx_start + uint32_t(min(int32_t(tile_idx_end - tile_idx_start), max(tile_max_n_contrib, 0)));
     rounds = int((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
     splats_left_to_process = int(tile_idx_end - tile_idx_start);

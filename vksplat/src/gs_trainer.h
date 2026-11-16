@@ -93,7 +93,12 @@ struct TrainerConfig {
     float grow_factor;
     int cap_max;
     bool mcmc_protect_structural_groups = false;
-    float sparse_tile_grad_thresh = 0.0f;
+    // Sparse backward: on non-sentinel steps only the tiles whose residual is at least the
+    // `sparse_tile_quantile`-quantile of all tile residuals (plus `sparse_tile_halo` tiles of dilation) get
+    // a raster/SSIM backward pass. 0 = dense. Every `sparse_full_every`-th step (step % k == 0) is dense.
+    float sparse_tile_quantile = 0.0f;
+    int sparse_tile_halo = 1;
+    int sparse_full_every = 4;
     // >0: stop exploring the rasterize-backward variants after this many timing updates and keep the
     // fastest measured one (0 = keep sampling, the default).
     int rasterize_backward_pin_after = 0;
@@ -149,6 +154,7 @@ public:
 
     void camera_to_uniforms(const Camera &cam, VulkanGSRendererUniforms &uniforms) const;
     void get_train_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
+    size_t train_tile_count(size_t idx) const;  // raster tiles of training view idx
     void get_val_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
 
     // true if the step has no densification/prune/reset/Morton work and can run in a gated batch
@@ -262,7 +268,7 @@ private:
     Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);
-    _ComputePipeline pipeline_ssim_backward = _ComputePipeline(4);
+    _ComputePipeline pipeline_ssim_backward = _ComputePipeline(5);
     _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(15);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);

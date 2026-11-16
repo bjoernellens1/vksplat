@@ -766,7 +766,7 @@ struct Uniforms {
     float cy;
     float4 dist_coeffs;
     float4x4 world_view_transform;
-    float sparse_tile_grad_thresh;
+    uint use_tile_list;
     float _pad_tile0;
     float _pad_tile1;
     float _pad_tile2;
