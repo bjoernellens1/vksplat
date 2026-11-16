@@ -93,7 +93,7 @@ def test_group_ids_and_state_stay_in_sync_after_growth(tmp_path):
     assert np.array_equal(np.asarray(mod.get_device_group_ids()), host)
     state = np.asarray(mod.get_device_group_state())
     assert len(state) >= int(host.max()) + 1
-    expect = np.ones(len(state), dtype=np.uint32)
+    expect = np.zeros(len(state), dtype=np.uint32)
     expect[6] = 2
     assert np.array_equal(state, expect)
 

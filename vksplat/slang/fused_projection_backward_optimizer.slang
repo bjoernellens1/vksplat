@@ -95,10 +95,16 @@ void main(
     
     if (g_idx >= uniforms.num_splats)
         return;
-    if (uniforms.protect_locked_groups != 0u) {
+    // group states: 0 normal, 1 IMAGINED (geometry/opacity frozen, SH trains), 2 LOCKED (fully frozen, gated)
+    bool imagined = false;
+    {
         int32_t gid = group_ids[g_idx];
-        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 2u)
-            return;
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
+            const uint32_t state = group_state[gid];
+            if (state == 2u && uniforms.protect_locked_groups != 0u)
+                return;
+            imagined = (state == 1u);
+        }
     }
 
     bool is_zero_grad = (tiles_touched[g_idx] == 0);
@@ -159,7 +165,7 @@ void main(
     uint32_t g2_idx = 2*g_idx+1;
 
     // means
-    {
+    if (!imagined) {
         float3 x = gauss.xyz_ws;
         float3 v = v_xyz_ws;
         float3 g1 = read_mean(g_idx, g_xyz_ws, 2, 0);
@@ -171,7 +177,7 @@ void main(
     }
 
     // rotations (normalized)
-    {
+    if (!imagined) {
         float4 x = gauss.rotations;
         float4 v = v_rotation; // TODO: should ideally project when NORMALIZE_QUATS_IN_OPTIMIZER is True
         float4 g1 = g_rotations[g1_idx];
@@ -183,7 +189,7 @@ void main(
     }
 
     // scales (exp) and opac (sigmoid)
-    {
+    if (!imagined) {
         // load
         float4 x = float4(gauss.scales, gauss.opacities);
         float4 v = float4(

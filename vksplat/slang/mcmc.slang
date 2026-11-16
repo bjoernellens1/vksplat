@@ -28,6 +28,7 @@ struct InjectNoiseUniforms {
     uint32_t image_height;
     float noise_lr;
     uint32_t protect_structural_groups;
+    uint32_t num_groups;
 };
 
 struct Uniforms {
@@ -36,7 +37,18 @@ struct Uniforms {
     uint32_t seed;
     float min_opacity;
     uint32_t protect_structural_groups;
+    uint32_t num_groups;
 };
+
+// A splat is immune to MCMC noise/relocation when its group is IMAGINED (state 1, always) or
+// when structural protection is on and it belongs to any group.
+bool mcmc_protected(int32_t gid, uint32_t protect_all, uint32_t num_groups, StructuredBuffer<uint32_t> group_state) {
+    if (gid < 0)
+        return false;
+    if (protect_all != 0)
+        return true;
+    return uint32_t(gid) < num_groups && group_state[gid] == 1u;
+}
 
 struct MaskGroupUniforms {
     uint32_t array_size;
@@ -53,6 +65,7 @@ layout(binding=1) StructuredBuffer<float4> rotations;  // (N, 4)
 layout(binding=2) RWStructuredBuffer<float> means;  // (N, 3)
 layout(binding=3) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
 layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=5) StructuredBuffer<uint32_t> group_state;  // (G,)
 
 #define injectNoise main
 
@@ -71,7 +84,7 @@ void injectNoise(
     const uint32_t tid = thread_id.x;
     if (tid >= num_splats)
         return;
-    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0)
+    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state))
         return;
     
     float4 quat = normalize(rotations[tid]);
@@ -98,6 +111,7 @@ void injectNoise(
 layout(binding=0) StructuredBuffer<float4> scales_opacs;  // (N,)
 layout(binding=1) RWStructuredBuffer<uint32_t> sample_probs;  // (N,)
 layout(binding=2) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=3) StructuredBuffer<uint32_t> group_state;  // (G,)
 #define computeProbabilities main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -110,7 +124,7 @@ void computeProbabilities(
     if (tid >= num_splats)
         return;
 
-    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0) {
+    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state)) {
         sample_probs[tid] = 0;
         return;
     }
@@ -192,6 +206,7 @@ layout(binding=1) StructuredBuffer<uint32_t> sample_probs_cumsum;  // (N,)
 layout(binding=2) RWStructuredBuffer<uint32_t> index_map;  // (N,)
 layout(binding=3) RWByteAddressBuffer n_idx_buffer;  // (N,)
 layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=5) StructuredBuffer<uint32_t> group_state;  // (G,)
 #define computeRelocationIndexMap main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -204,7 +219,7 @@ void computeRelocationIndexMap(
     if (tid >= array_size)
         return;
 
-    if (uniforms.protect_structural_groups != 0 && group_ids[tid] >= 0) {
+    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state)) {
         index_map[tid] = tid;
         return;
     }
@@ -493,7 +508,7 @@ void updateAdd(
 #if MCMC_PHASE == MCMC_PHASE_MaskRetractedGroup
 
 layout(binding=0) StructuredBuffer<int32_t> group_ids;  // (N,)
-layout(binding=1) StructuredBuffer<uint32_t> group_state;  // (G,) 1=ACTIVE, 2=LOCKED, 3=RETRACTED
+layout(binding=1) StructuredBuffer<uint32_t> group_state;  // (G,) 0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED
 layout(binding=2) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
 
 #define maskRetractedGroup main

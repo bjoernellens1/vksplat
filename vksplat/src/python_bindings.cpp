@@ -328,6 +328,7 @@ public:
         st["num_splats"] = buffers.num_splats;
         st["cap_max"] = config.cap_max;
         st["mcmc_protect_structural_groups"] = config.mcmc_protect_structural_groups;
+        st["imagined_protection"] = true;
         return st;
     }
     void set_selective_freeze_unfrozen(bool unfrozen) {
@@ -348,6 +349,12 @@ public:
     }
     void set_group_state(int32_t group_id, uint32_t state) {
         trainer.set_group_state(buffers, group_id, state);
+    }
+    void set_group_states(py::array_t<int32_t, py::array::c_style | py::array::forcecast> gids,
+                          py::array_t<uint32_t, py::array::c_style | py::array::forcecast> states) {
+        if (gids.size() != states.size())
+            throw std::invalid_argument("group_ids and states must have the same length");
+        trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
     }
     void retract_group_sparse(int32_t group_id) {
         trainer.retract_group_sparse(buffers, group_id);
@@ -1167,7 +1174,9 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_capacity", &VkSplat::get_splat_capacity, "Allocated capacity (elements) of per-splat buffers")
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
         .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
-        .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (1=ACTIVE, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
+        .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
+        .def("set_group_states", &VkSplat::set_group_states, "Batched set_group_state: one device upload for all (group_id, state) pairs", py::arg("group_ids"), py::arg("states"))
+        .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
         .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
         .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))
         .def("get_scales_opacities_packed", &VkSplat::get_scales_opacities_packed, "Read packed (N, 4) scales+opacities in a single device transfer")

@@ -240,6 +240,7 @@ public:
     void ensureGroupBuffersOnDevice(VulkanGSPipelineBuffers& buffers, size_t num_splats);
     void syncGroupStateSize(VulkanGSPipelineBuffers& buffers, const int32_t* gids, size_t count);
     void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
+    void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
 
 private:
@@ -275,9 +276,9 @@ private:
         _ComputePipeline reset_opa = _ComputePipeline(2);
     } pipeline_default;
     struct _MCMCComputePipeline {
-        _ComputePipeline inject_noise = _ComputePipeline(5);
-        _ComputePipeline compute_probs = _ComputePipeline(3);
-        _ComputePipeline compute_relocation_index_map = _ComputePipeline(5);
+        _ComputePipeline inject_noise = _ComputePipeline(6);
+        _ComputePipeline compute_probs = _ComputePipeline(4);
+        _ComputePipeline compute_relocation_index_map = _ComputePipeline(6);
         _ComputePipeline compute_relocation = _ComputePipeline(7);
         _ComputePipeline update_relocation = _ComputePipeline(10);
         _ComputePipeline compute_add_index_map = _ComputePipeline(3);

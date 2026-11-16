@@ -1538,7 +1538,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     const size_t kGroupSizeSparse = 64;
     size_t num_splats = buffers.num_splats;
 
-    Uniform32_t uniforms[6];
+    Uniform32_t uniforms[7];
     uniforms[0].u = (uint32_t)num_splats;
     uniforms[1].u = 0;  // num_add
     uniforms[2].u = std::uniform_int_distribution<uint32_t>()(rng);
@@ -1546,6 +1546,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     uniforms[4].u = config.mcmc_protect_structural_groups ? 1u : 0u;
 
     ensureGroupBuffersOnDevice(buffers, num_splats);
+    uniforms[5].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
 
     // refinement
     if (
@@ -1559,15 +1560,17 @@ void VulkanGSTrainer::executeMCMCPostBackward(
         bufferMemoryBarrier({
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
             { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ);
         executeCompute(
             {{num_splats, kGroupSize}},
-            &uniforms, 5*sizeof(Uniform32_t),
+            &uniforms, 6*sizeof(Uniform32_t),
             pipeline_mcmc.compute_probs,
             {
                 buffers.scales_opacs.deviceBuffer,
                 resizeDeviceBuffer(buffers.mcmc_sample_probs, num_splats),
                 buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
             }
         );
 
@@ -1590,10 +1593,11 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 { buffers.mcmc_sample_probs_cumsum.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
                 { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ_WRITE);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 5*sizeof(Uniform32_t),
+                &uniforms, 6*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation_index_map,
                 {
                     buffers.mcmc_sample_probs.deviceBuffer,
@@ -1601,6 +1605,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     resizeDeviceBuffer(buffers.mcmc_index_map, num_splats),
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
                     buffers.group_ids.deviceBuffer,
+                    buffers.group_state.deviceBuffer,
                 }
             );
 
@@ -1615,7 +1620,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 5*sizeof(Uniform32_t),
+                &uniforms, 6*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation,
                 {
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -1632,7 +1637,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 5*sizeof(Uniform32_t),
+                &uniforms, 6*sizeof(Uniform32_t),
                 pipeline_mcmc.update_relocation,
                 {
                     buffers.mcmc_index_map.deviceBuffer,
@@ -1686,15 +1691,17 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             bufferMemoryBarrier({
                 { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 5*sizeof(Uniform32_t),
+                &uniforms, 6*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_probs,
                 {
                     buffers.scales_opacs.deviceBuffer,
                     buffers.mcmc_sample_probs.deviceBuffer,
                     buffers.group_ids.deviceBuffer,
+                    buffers.group_state.deviceBuffer,
                 }
             );
 
@@ -1718,7 +1725,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ_WRITE);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 5*sizeof(Uniform32_t),
+                    &uniforms, 6*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add_index_map,
                     {
                         buffers.mcmc_sample_probs_cumsum.deviceBuffer,
@@ -1733,7 +1740,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ);
                 executeCompute(
                     {{num_splats, kGroupSizeSparse}},
-                    &uniforms, 5*sizeof(Uniform32_t),
+                    &uniforms, 6*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add,
                     {
                         buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -1748,7 +1755,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 barrierAllGaussParams(buffers);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 5*sizeof(Uniform32_t),
+                    &uniforms, 6*sizeof(Uniform32_t),
                     pipeline_mcmc.update_add,
                     {
                         buffers.mcmc_index_map.deviceBuffer,
@@ -1821,15 +1828,17 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     uniforms[3].u = renderer_uniforms.image_height;
     uniforms[4].f = config.noise_lr * config.get_means_lr(step, scene_scale);
     uniforms[5].u = config.mcmc_protect_structural_groups ? 1u : 0u;
+    uniforms[6].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
     bufferMemoryBarrier({
         { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
     executeCompute(
         {{buffers.num_splats, kGroupSize}},
-        &uniforms, 6*sizeof(Uniform32_t),
+        &uniforms, 7*sizeof(Uniform32_t),
         pipeline_mcmc.inject_noise,
         {
             buffers.radii.deviceBuffer,
@@ -1837,6 +1846,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             buffers.xyz_ws.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
             buffers.group_ids.deviceBuffer,
+            buffers.group_state.deviceBuffer,
         },
         GATE_POST
     );
@@ -2237,15 +2247,15 @@ void VulkanGSTrainer::syncGroupStateSize(
     if (buffers.group_state.deviceBuffer.buffer == VK_NULL_HANDLE || old_dev_count < required) {
         resizeAndCopyDeviceBuffer(buffers.group_state, required, false);
         size_t grow_count = required - old_dev_count;
-        std::vector<uint32_t> ones(grow_count, 1u);
+        std::vector<uint32_t> zeros(grow_count, 0u);
         uploadDeviceSlice(
             buffers.group_state.deviceBuffer,
             old_dev_count * sizeof(uint32_t),
-            ones.data(),
+            zeros.data(),
             grow_count * sizeof(uint32_t)
         );
         if (buffers.group_state.size() < required)
-            buffers.group_state.resize(required, 1u);
+            buffers.group_state.resize(required, 0u);
     }
 }
 
@@ -2280,36 +2290,54 @@ void VulkanGSTrainer::ensureGroupBuffersOnDevice(
     syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
 }
 
+void VulkanGSTrainer::set_group_states(
+    VulkanGSPipelineBuffers& buffers,
+    const int32_t* gids,
+    const uint32_t* states,
+    size_t count
+) {
+    if (count == 0)
+        return;
+    HOST_GUARD;
+    int32_t lo = gids[0], hi = gids[0];
+    for (size_t i = 1; i < count; ++i) {
+        lo = std::min(lo, gids[i]);
+        hi = std::max(hi, gids[i]);
+    }
+    if (lo < 0)
+        throw std::invalid_argument("group_id must be >= 0");
+    const size_t required = static_cast<size_t>(hi) + 1;
+    size_t old_dev_count = buffers.group_state.deviceSize();
+    if (buffers.group_state.deviceBuffer.buffer == VK_NULL_HANDLE || old_dev_count < required) {
+        resizeAndCopyDeviceBuffer(buffers.group_state, required, false);
+        size_t grow_count = required - old_dev_count;
+        std::vector<uint32_t> zeros(grow_count, 0u);
+        uploadDeviceSlice(
+            buffers.group_state.deviceBuffer,
+            old_dev_count * sizeof(uint32_t),
+            zeros.data(),
+            grow_count * sizeof(uint32_t)
+        );
+    }
+    if (buffers.group_state.size() < required)
+        buffers.group_state.resize(required, 0u);
+    for (size_t i = 0; i < count; ++i)
+        buffers.group_state[gids[i]] = states[i];
+    // one upload covering the touched range, taken from the host mirror
+    uploadDeviceSlice(
+        buffers.group_state.deviceBuffer,
+        static_cast<size_t>(lo) * sizeof(uint32_t),
+        &buffers.group_state[lo],
+        (required - static_cast<size_t>(lo)) * sizeof(uint32_t)
+    );
+}
+
 void VulkanGSTrainer::set_group_state(
     VulkanGSPipelineBuffers& buffers,
     int32_t group_id,
     uint32_t state
 ) {
-    if (group_id < 0)
-        throw std::invalid_argument("group_id must be >= 0");
-    HOST_GUARD;
-    size_t required = static_cast<size_t>(group_id) + 1;
-    size_t old_dev_count = buffers.group_state.deviceSize();
-    if (buffers.group_state.deviceBuffer.buffer == VK_NULL_HANDLE || old_dev_count < required) {
-        resizeAndCopyDeviceBuffer(buffers.group_state, required, false);
-        size_t grow_count = required - old_dev_count;
-        std::vector<uint32_t> ones(grow_count, 1u);
-        uploadDeviceSlice(
-            buffers.group_state.deviceBuffer,
-            old_dev_count * sizeof(uint32_t),
-            ones.data(),
-            grow_count * sizeof(uint32_t)
-        );
-    }
-    if (buffers.group_state.size() < required)
-        buffers.group_state.resize(required, 1u);
-    buffers.group_state[group_id] = state;
-    uploadDeviceSlice(
-        buffers.group_state.deviceBuffer,
-        static_cast<size_t>(group_id) * sizeof(uint32_t),
-        &state,
-        sizeof(uint32_t)
-    );
+    set_group_states(buffers, &group_id, &state, 1);
 }
 
 void VulkanGSTrainer::retract_group_sparse(
@@ -2487,14 +2515,14 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     grow(buffers.default_grad, 2 * new_n, true);
     grow(buffers.default_radii, new_n, true);
 
-    // group state: new groups start ACTIVE (1)
+    // group state: new groups start normal (0)
     const size_t old_groups = buffers.group_state.deviceSize();
     if (old_groups < required_groups) {
         grow(buffers.group_state, required_groups, false);
         vkCmdFillBuffer(cb, buffers.group_state.deviceBuffer.buffer, old_groups * sizeof(uint32_t),
-            (required_groups - old_groups) * sizeof(uint32_t), 1u);
+            (required_groups - old_groups) * sizeof(uint32_t), 0u);
         if (buffers.group_state.size() < required_groups)
-            buffers.group_state.resize(required_groups, 1u);
+            buffers.group_state.resize(required_groups, 0u);
     }
 
     upload(buffers.xyz_ws, off_xyz, 3 * old_n * sizeof(float), 3 * n_add * sizeof(float));

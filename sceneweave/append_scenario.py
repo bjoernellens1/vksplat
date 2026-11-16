@@ -35,7 +35,7 @@ def build_dataset(root: Path, n_images: int = 4, n_points: int = 2000, w: int = 
     return root
 
 
-def new_trainer(root: Path, out: Path, pin_after: int = 0):
+def new_trainer(root: Path, out: Path, pin_after: int = 0, **overrides):
     sys.path.insert(0, str(ROOT))
     import vksplat
     from simple_trainer import TrainerConfig, join_dir
@@ -51,7 +51,9 @@ def new_trainer(root: Path, out: Path, pin_after: int = 0):
         cfg.rasterize_backward_pin_after = pin_after  # ignored by builds that predate the field
     cfg.refine_start_iter = 100000
     cfg.refine_stop_iter = 200000
-    mod.set_train_config(asdict(cfg))
+    train_config = asdict(cfg)
+    train_config.update(overrides)  # also keys that only the native config knows (mcmc_protect_structural_groups)
+    mod.set_train_config(train_config)
     return mod
 
 

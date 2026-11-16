@@ -31,19 +31,19 @@
         "mcmc.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/mcmc.slang": "fcdccff71b97d386076402e35aa51a473b28d3482fd9df3c0c68d34f0b519327",
+                "slang/mcmc.slang": "2cbfa928a3e28abcc13570e3a5ec53f61df873d96d8426244a75708bca242cc1",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
-                "shader/generated/mcmc_compute_add.spv": "9b4075ce9b41af1fed9e179e81a7cccce282f38f85a8aabca67620aa5a8a7baa",
-                "shader/generated/mcmc_compute_add_index_map.spv": "b141d2710436c4d5ffe796586eace8861434b6eb49371755c8935de5ce6535d5",
-                "shader/generated/mcmc_compute_probs.spv": "51af75f6cae0ce3e0d8ba1c0bc977a5b2caf6fa8fe508e007dbb0971d653375b",
-                "shader/generated/mcmc_compute_relocation.spv": "fcf57173492bff7076a04c180e47f8ffe9d3a701c81d71522b2407891a3a4131",
-                "shader/generated/mcmc_compute_relocation_index_map.spv": "d32be11f39c0af5ce7106f0432cf63e7877667ffef38a92906b562e8074f04ad",
-                "shader/generated/mcmc_inject_noise.spv": "d01add55d9d1a97ec200038b98dc9d84c92b25513e5eb503353ff75daa820554",
+                "shader/generated/mcmc_compute_add.spv": "0475b5cd0cb830b6fa2ed2d07b1bb52e6c6b8bcd54f50448b2b1aacdaa5acc0c",
+                "shader/generated/mcmc_compute_add_index_map.spv": "f89a7c9ce52b73779c4dcdec401aa73b9bb7625287a34f24285feceef9736780",
+                "shader/generated/mcmc_compute_probs.spv": "9f27655af4fd22042e27b57ef9bfc669854e12b0a2ab8501c429ff648f7fcd91",
+                "shader/generated/mcmc_compute_relocation.spv": "8af4b448aa085d198339b3600571122b4cd2b77c73c700cbea781f6c9269b779",
+                "shader/generated/mcmc_compute_relocation_index_map.spv": "5793b16ca3921ac1746799e6180493e5978bb093c94a58a8bb5b37dd0f0c90fe",
+                "shader/generated/mcmc_inject_noise.spv": "5e3c706a71756eb719e299b47cf970b6b898189bf57a8bc8e1e6d43442ae6555",
                 "shader/generated/mcmc_mask_retracted_group.spv": "fc99164ee12f3be7c8a77aa5c905465b5e318af693f1f5ab608b54fb33f20ea2",
-                "shader/generated/mcmc_update_add.spv": "0951a8e8d5fc59395cded07238654582e22ca51beaeb9543249bec9be591986e",
-                "shader/generated/mcmc_update_relocation.spv": "b06f1124fe0f866c37b0b2de96d7848f330383ea2f518c98cf1ec57aec587b5f"
+                "shader/generated/mcmc_update_add.spv": "ad26de06424d9ce6d78b4b3782cfd4ef94c58ff2e577ef734a1ffe9f9abd6809",
+                "shader/generated/mcmc_update_relocation.spv": "3800f93b533efd3604a8b00577d154765bbf56ccac64ac8ad44e9dc8ed4cf5d6"
             }
         },
         "default.slang": {
@@ -91,14 +91,14 @@
         "fused_projection_backward_optimizer.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/fused_projection_backward_optimizer.slang": "1d6d0558d0051db3b18ac7365ac91a1c817e5c5d9a63f472274a5721cba8c8fd",
+                "slang/fused_projection_backward_optimizer.slang": "d3c8a035e9e4f5e35078b8854995c6b47c31ec2ddf94a43a882bcf55d2137282",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9",
                 "slang/utils.slang": "2ce71d8ea1b60b740f13b5c36339e41c6361dd42b065647ff2b9a467b1d56017",
                 "slang/vertex_shader.slang": "6c76579bef6b2ffa402ecd41ffd70d878142a56e4a63ad10fcbb2a2e43242462"
             },
             "outputs": {
-                "shader/generated/fused_projection_backward_optimizer.spv": "1ce6c364c07c395bfeee3e0c79bc05dac16f5024852c0ea7738d5ed43e48bf03"
+                "shader/generated/fused_projection_backward_optimizer.spv": "47f1be4c90c774c797f01a61af991af1e74201f2ccaeedbef3bdddeeedf94b3d"
             }
         },
         "ssim.slang": {

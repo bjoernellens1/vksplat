@@ -140,7 +140,7 @@ struct VulkanGSPipelineBuffers {
 
     // structural group state (device-authoritative)
     Buffer<int32_t> group_ids;     // (N,) -1 = ungrouped, >= 0 = group ID
-    Buffer<uint32_t> group_state;  // (G,) 1 = ACTIVE, 2 = LOCKED/PROTECTED, 3 = RETRACTED
+    Buffer<uint32_t> group_state;  // (G,) 0 = normal, 1 = IMAGINED, 2 = LOCKED/PROTECTED, 3 = RETRACTED
 
     // intermediate buffers
     Buffer<float> _temp_gauss_attr;
