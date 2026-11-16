@@ -271,6 +271,11 @@ class ShaderCompiler:
             ShaderJob("where", {}),
         ], []))
 
+        # Per-step GPU gate (intersection count, overflow flag, indirect dispatch arguments)
+        jobs.append(("step_gate.slang", [
+            ShaderJob("step_gate", {}),
+        ], []))
+
         # Summation
         jobs.append(("sum.slang", [
             ShaderJob("sum", {}),

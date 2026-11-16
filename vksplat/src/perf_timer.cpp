@@ -57,24 +57,24 @@ void hostToc() {
 template<TrainStage stage>
 Timer<stage>::Timer(VulkanGSPipeline *module) : module(module) {
     then = std::chrono::high_resolution_clock::now();
-    if (module->writeTimestamp(1))
+    constexpr bool kScheduling = stage >= _RasterizeBackwardScheduling_PerPixel && stage < _RasterizeBackwardScheduling_N;
+    if ((kScheduling || !module->timestamp_scheduling_only) && module->writeTimestamp(1)) {
         marks.emplace_back(stage, 1);
+        stamped = true;
+    }
 }
 
 template<TrainStage stage>
 Timer<stage>::~Timer() {
-    // std::lock_guard<std::mutex> lock(mutex);
-    PerfTimer::stages[int(stage)].count += 1;
-    if (stage >= _RasterizeBackwardScheduling_PerPixel && stage < _RasterizeBackwardScheduling_N)
-        PerfTimer::stages[RasterizeBackward].count += 1;
+    // untimed stages of batched steps are not counted either, so total_time / count stays a per-step mean
+    if (stamped || !module->timestamp_scheduling_only) {
+        PerfTimer::stages[int(stage)].count += 1;
+        if (stage >= _RasterizeBackwardScheduling_PerPixel && stage < _RasterizeBackwardScheduling_N)
+            PerfTimer::stages[RasterizeBackward].count += 1;
+    }
 
-    if (module->writeTimestampNoExcept(-1))
+    if (stamped && module->writeTimestampNoExcept(-1))
         marks.emplace_back(stage, -1);
-
-    // auto now = std::chrono::high_resolution_clock::now();
-    // double dt = std::chrono::duration<double>(now - then).count();
-
-    // PerfTimer::stages[int(stage)].total_time += dt;
 }
 
 void pushMarker(VulkanGSPipeline *module) {
@@ -158,6 +158,8 @@ std::map<std::string, uint64_t> get_work_counters() {
         {"append_fence_waits", w.append_fence_waits},
         {"step_buffer_reallocs", w.step_buffer_reallocs},
         {"fence_waits_total", w.fence_waits_total},
+        {"gate_overflows", w.gate_overflows},
+        {"gate_steps_redone", w.gate_steps_redone},
     };
 }
 

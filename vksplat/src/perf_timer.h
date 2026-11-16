@@ -51,6 +51,7 @@ template<TrainStage stage>
 struct Timer {
     VulkanGSPipeline *module;
     std::chrono::time_point<std::chrono::high_resolution_clock> then;
+    bool stamped = false;  // false: this timer wrote no GPU timestamps (batched steps after the first)
     // static std::mutex mutex;
 
     Timer(VulkanGSPipeline *module);
@@ -80,6 +81,10 @@ struct WorkCounters {
     uint64_t append_fence_waits = 0;
     uint64_t step_buffer_reallocs = 0;
     uint64_t fence_waits_total = 0;  // every blocking fence wait (any submit path)
+    // Batched steps: batches whose tile-intersection count exceeded the buffer capacity, and the steps the
+    // gate skipped on the GPU in them (recorded again after the buffers were grown).
+    uint64_t gate_overflows = 0;
+    uint64_t gate_steps_redone = 0;
 };
 extern WorkCounters work_counters;
 

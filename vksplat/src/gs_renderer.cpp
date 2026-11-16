@@ -57,6 +57,8 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
     
     createComputePipeline(pipeline_projection_forward, spirv_paths.at("projection_forward"));
     createComputePipeline(pipeline_generate_keys, spirv_paths.at("generate_keys"));
+    createComputePipeline(pipeline_step_gate, spirv_paths.at("step_gate"));
+    createGateBuffers();
     for (int i = 0; i < 2; ++i) {
         createComputePipeline(pipeline_compute_tile_ranges[i], spirv_paths.at("compute_tile_ranges"));
         createComputePipeline(pipeline_rasterize_forward[i], spirv_paths.at("rasterize_forward"));
@@ -134,8 +136,10 @@ void VulkanGSRenderer::executeGenerateKeys(
     size_t num_indices = buffers.num_indices;
 
     // Reset ping-pong parity and pre-reserve sorting buffers with headroom to avoid per-step descriptor updates
+    // (deferred steps: the capacity is ensured by the caller and the count is unknown on the host)
+    const bool deferred = gate_active;
     buffers.is_unsorted_1 = true;
-    if (buffers.sorting_keys_1.deviceBuffer.allocSize < num_indices * sizeof(sortingKey_t)) {
+    if (!deferred && buffers.sorting_keys_1.deviceBuffer.allocSize < num_indices * sizeof(sortingKey_t)) {
         size_t reserve = std::max(num_indices + (num_indices >> 1), num_elements * 16);
         resizeDeviceBuffer(buffers.sorting_keys_1, reserve);
         resizeDeviceBuffer(buffers.sorting_keys_2, reserve);
@@ -143,6 +147,8 @@ void VulkanGSRenderer::executeGenerateKeys(
         resizeDeviceBuffer(buffers.sorting_gauss_idx_2, reserve);
         resizeDeviceBuffer(buffers._sorting_histogram_cumsum, _CEIL_DIV(reserve, 4096) * 256);
     }
+    if (!deferred)
+        writeIsectCount((uint32_t)num_indices);  // sort and tile-range kernels read the count from a buffer
 
     // barrier shouldn't be needed as this is after cumsum and read element
     #if 0
@@ -167,9 +173,10 @@ void VulkanGSRenderer::executeGenerateKeys(
             buffers.rect_tile_space.deviceBuffer,
             buffers.index_buffer_offset.deviceBuffer,
             // outputs
-            resizeDeviceBuffer(buffers.unsorted_keys(), num_indices),
-            resizeDeviceBuffer(buffers.unsorted_gauss_idx(), num_indices),
-        }
+            deferred ? buffers.unsorted_keys().deviceBuffer : resizeDeviceBuffer(buffers.unsorted_keys(), num_indices),
+            deferred ? buffers.unsorted_gauss_idx().deviceBuffer : resizeDeviceBuffer(buffers.unsorted_gauss_idx(), num_indices),
+        },
+        GATE_GENERATE_KEYS
     );
 
 }
@@ -188,19 +195,19 @@ void VulkanGSRenderer::executeComputeTileRanges(
         { buffers.sorted_keys().deviceBuffer, COMPUTE_SHADER_WRITE },
     }, COMPUTE_SHADER_READ);
 
-    VulkanGSRendererUniforms uniforms_1 = uniforms;
-    uniforms_1.active_sh = (uint32_t)num_indices;  // alias memory
-
     executeCompute(
         {{num_indices+1, 256}},
-        &uniforms_1, sizeof(uniforms),
+        &uniforms, sizeof(uniforms),
         pipeline_compute_tile_ranges[buffers.is_unsorted_1],
         {
             // inputs
             buffers.sorted_keys().deviceBuffer,
             // outputs
             resizeDeviceBuffer(buffers.tile_ranges, num_tiles+1),
-        }
+            // intersection count (written by writeIsectCount or the step gate)
+            isect_count,
+        },
+        GATE_TILE_RANGES
     );
 }
 
@@ -213,7 +220,7 @@ void VulkanGSRenderer::executeRasterizeForward(
 
     size_t num_pixels = uniforms.image_height * uniforms.image_width;
 
-    if (buffers.num_indices == 0) {
+    if (!gate_active && buffers.num_indices == 0) {
         clearDeviceBuffer(buffers.pixel_state, 4 * num_pixels);
         clearDeviceBuffer(buffers.n_contributors, num_pixels);
         return;
@@ -239,7 +246,8 @@ void VulkanGSRenderer::executeRasterizeForward(
             // outputs
             resizeDeviceBuffer(buffers.pixel_state, 4*num_pixels),
             resizeDeviceBuffer(buffers.n_contributors, num_pixels),
-        })
+        }),
+        GATE_RASTER_FWD
     );
 
     // _displayImage(buffers.pixel_state, uniforms.image_width, true);
@@ -287,6 +295,7 @@ void VulkanGSRenderer::initRasterizationBackwardScheduler() {
         1000,  // adapt_tau
         10  // warmup_tau
     );
+    rasterizeBackwardScheduler.set_pin_after(backward_pin_after);
 
     auto timerCallback = [&](const std::vector<std::pair<size_t, double>>& time_updates) {
         for (size_t impl = 0; impl < (size_t)RasterBackwardImpl::size; impl++) {
@@ -313,7 +322,8 @@ void VulkanGSRenderer::executeRasterizeBackward(
     if (RASTERIZE_BACKWARD_USE_SCHEDULING) {
         using namespace PerfTimer;
         initRasterizationBackwardScheduler();
-        scheduled_impl = rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
+        scheduled_impl = gate_active ? (RasterBackwardImpl)gate_backward_impl :
+            rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
         // scheduled_impl = RasterBackwardImpl::PerSplat;
         if (scheduled_impl == RasterBackwardImpl::PerPixel)
             timer = std::make_shared<Timer<_RasterizeBackwardScheduling_PerPixel>>(this);
@@ -337,7 +347,7 @@ void VulkanGSRenderer::executeRasterizeBackward(
     clearDeviceBuffer(buffers.v_xy_vs, 2*num_elements);
     clearDeviceBuffer(buffers.v_inv_cov_vs_opacity, 4*num_elements);
     clearDeviceBuffer(buffers.v_rgb, 3*num_elements);
-    if (buffers.num_indices == 0)
+    if (!gate_active && buffers.num_indices == 0)
         return;
     bufferMemoryBarrier({
         { buffers.n_contributors.deviceBuffer, COMPUTE_SHADER_WRITE },
@@ -374,7 +384,8 @@ void VulkanGSRenderer::executeRasterizeBackward(
             buffers.v_xy_vs.deviceBuffer,
             buffers.v_inv_cov_vs_opacity.deviceBuffer,
             buffers.v_rgb.deviceBuffer,
-        }
+        },
+        GATE_RASTER_BWD
     );
 
 }
@@ -545,7 +556,8 @@ void VulkanGSRenderer::executeCumsum(
 }
 
 void VulkanGSRenderer::executeCalculateIndexBufferOffset(
-    VulkanGSPipelineBuffers& buffers
+    VulkanGSPipelineBuffers& buffers,
+    bool read_count
 ) {
     PerfTimer::Timer<PerfTimer::CalculateIndexBufferOffset> timer(this);
 
@@ -557,6 +569,8 @@ void VulkanGSRenderer::executeCalculateIndexBufferOffset(
         buffers.index_buffer_offset
     );
 
+    if (!read_count)
+        return;
     if (commandBatchInProgress) bufferMemoryBarrier({
         { buffers.index_buffer_offset.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
     }, TRANSFER_READ);
@@ -591,6 +605,7 @@ void VulkanGSRenderer::executeSort(
     auto& globalHistogram = buffers._sorting_histogram;
     auto& partitionHistogram = buffers._sorting_histogram_cumsum;
 
+    // deferred: num_elements is the buffer capacity (the dispatch size comes from the GPU-side count)
     const size_t num_parts = _CEIL_DIV(num_elements, PARTITION_SIZE);
 
     int max_nonzero_bit = 8*sizeof(sortingKey_t);
@@ -636,7 +651,9 @@ void VulkanGSRenderer::executeSort(
                 buffers.unsorted_keys().deviceBuffer,
                 globalHistogram.deviceBuffer,
                 partitionHistogram.deviceBuffer,
-            }
+                isect_count,
+            },
+            GATE_SORT
         );
 
         bufferMemoryBarrier({
@@ -650,6 +667,7 @@ void VulkanGSRenderer::executeSort(
             {
                 globalHistogram.deviceBuffer,
                 partitionHistogram.deviceBuffer,
+                isect_count,
             }
         );
 
@@ -668,13 +686,174 @@ void VulkanGSRenderer::executeSort(
                 buffers.unsorted_gauss_idx().deviceBuffer,
                 buffers.sorted_keys().deviceBuffer,
                 buffers.sorted_gauss_idx().deviceBuffer,
-            }
+                isect_count,
+            },
+            GATE_SORT
         );
 
         buffers.is_unsorted_1 = !buffers.is_unsorted_1;
     }
     buffers.is_unsorted_1 = !buffers.is_unsorted_1;
 
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Batched training steps: GPU-driven tile pipeline (no host readback of the intersection count)
+
+void VulkanGSRenderer::writeIsectCount(uint32_t n) {
+    DEVICE_GUARD;
+    vkCmdUpdateBuffer(command_buffer, isect_count.buffer, 0, sizeof(uint32_t), &n);
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+size_t VulkanGSRenderer::isectCapacity(const VulkanGSPipelineBuffers& buffers) const {
+    // all four ping-pong buffers are allocated together; keep one spare key for the tile-range kernel
+    size_t alloc = std::min({
+        buffers.sorting_keys_1.deviceBuffer.allocSize, buffers.sorting_keys_2.deviceBuffer.allocSize,
+        buffers.sorting_gauss_idx_1.deviceBuffer.allocSize, buffers.sorting_gauss_idx_2.deviceBuffer.allocSize});
+    size_t elements = alloc / sizeof(sortingKey_t);
+    return elements > 0 ? elements - 1 : 0;
+}
+
+void VulkanGSRenderer::ensureIsectCapacity(VulkanGSPipelineBuffers& buffers, size_t want) {
+    size_t capacity = isectCapacity(buffers);
+    if (capacity < want) {
+        // contents are scratch; geometric growth like the append buffers
+        capacity = std::max(want, capacity + (capacity >> 1));
+        const size_t elements = capacity + 1;
+        resizeDeviceBuffer(buffers.sorting_keys_1, elements);
+        resizeDeviceBuffer(buffers.sorting_keys_2, elements);
+        resizeDeviceBuffer(buffers.sorting_gauss_idx_1, elements);
+        resizeDeviceBuffer(buffers.sorting_gauss_idx_2, elements);
+        resizeDeviceBuffer(buffers._sorting_histogram_cumsum, _CEIL_DIV(elements, 4096) * 256);
+        PerfTimer::work_counters.step_buffer_reallocs++;
+    }
+    // logical size = the whole allocation (a legacy step may have set it to its exact count)
+    for (auto* b : {&buffers.sorting_keys_1, &buffers.sorting_keys_2})
+        b->deviceBuffer.size = b->deviceBuffer.allocSize;
+    for (auto* b : {&buffers.sorting_gauss_idx_1, &buffers.sorting_gauss_idx_2})
+        b->deviceBuffer.size = b->deviceBuffer.allocSize;
+}
+
+void VulkanGSRenderer::setIsectCapacityExact(VulkanGSPipelineBuffers& buffers, size_t capacity) {
+    const size_t elements = capacity + 1;
+    for (auto* b : {&buffers.sorting_keys_1, &buffers.sorting_keys_2})
+        resizeDeviceBuffer(*b, elements, false);
+    for (auto* b : {&buffers.sorting_gauss_idx_1, &buffers.sorting_gauss_idx_2})
+        resizeDeviceBuffer(*b, elements, false);
+    resizeDeviceBuffer(buffers._sorting_histogram_cumsum, _CEIL_DIV(elements, 4096) * 256, false);
+}
+
+void VulkanGSRenderer::gateBeginBatch() {
+    // status = 0: no step done, no overflow
+    vkCmdFillBuffer(command_buffer, gate_status.buffer, 0, gate_status.size, 0);
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    gate_active = true;
+    gate_step = 0;
+}
+
+void VulkanGSRenderer::gateBeginStep(uint32_t step_in_batch) {
+    if (step_in_batch >= kGateMaxSteps)
+        throw std::runtime_error("too many steps in one gated batch");
+    gate_step = step_in_batch;
+    timestamp_scheduling_only = step_in_batch > 0;
+    // WAR/RAW hazards between the scratch buffers of consecutive steps (the fence used to provide this)
+    if (step_in_batch > 0)
+        fullBarrier();
+}
+
+void VulkanGSRenderer::executeTilesDeferred(
+    const VulkanGSRendererUniforms& uniforms,
+    VulkanGSPipelineBuffers& buffers,
+    const GatePlan& plan
+) {
+    DEVICE_GUARD;
+    gate_plan = plan;
+
+    executeCalculateIndexBufferOffset(buffers, false);
+    fullBarrier();  // projection outputs and the prefix sum are read by the gate and by key generation
+
+    struct { uint32_t num_splats, capacity, step_idx, pad; uint32_t base[kGateSlots][4]; } gate_uniforms = {};
+    gate_uniforms.num_splats = (uint32_t)buffers.num_splats;
+    gate_uniforms.capacity = (uint32_t)isectCapacity(buffers);
+    gate_uniforms.step_idx = gate_step;
+    memcpy(gate_uniforms.base, plan.base, sizeof(plan.base));
+    executeCompute(
+        {{1, 1}},
+        &gate_uniforms, sizeof(gate_uniforms),
+        pipeline_step_gate,
+        {
+            buffers.index_buffer_offset.deviceBuffer,
+            gate_status,
+            isect_count,
+            gate_args,
+        }
+    );
+    {  // gate outputs: indirect arguments, count, status
+        VkMemoryBarrier barrier = {};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            0, 1, &barrier, 0, nullptr, 0, nullptr);
+    }
+
+    executeGenerateKeys(uniforms, buffers);
+    executeSort(uniforms, buffers, -1);
+    executeComputeTileRanges(uniforms, buffers);
+}
+
+void VulkanGSRenderer::gateEndBatch() {
+    gate_active = false;
+    timestamp_scheduling_only = false;
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferCopy region = {};
+    region.size = kGateStatusWords * sizeof(uint32_t);
+    vkCmdCopyBuffer(command_buffer, gate_status.buffer, gate_host_buffer, 1, &region);
+    VkMemoryBarrier host = {};
+    host.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 1, &host, 0, nullptr, 0, nullptr);
+}
+
+VulkanGSRenderer::GateResult VulkanGSRenderer::gateResult() const {
+    GateResult r;
+    r.steps_done = gate_host_status[0];
+    r.overflow = gate_host_status[1] != 0;
+    r.needed = gate_host_status[2];
+    for (uint32_t i = 0; i < kGateMaxSteps; i++)
+        r.isects[i] = gate_host_status[4 + i];
+    return r;
+}
+
+int VulkanGSRenderer::sampleBackwardImpl() {
+    initRasterizationBackwardScheduler();
+    gate_backward_impl = (int)rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
+    return gate_backward_impl;
+}
+
+void VulkanGSRenderer::setBackwardPinAfter(size_t updates) {
+    backward_pin_after = updates;
+    if (!rasterizeBackwardScheduler.empty())
+        rasterizeBackwardScheduler.set_pin_after(updates);
 }
 
 

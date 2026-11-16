@@ -94,6 +94,9 @@ struct TrainerConfig {
     int cap_max;
     bool mcmc_protect_structural_groups = false;
     float sparse_tile_grad_thresh = 0.0f;
+    // >0: stop exploring the rasterize-backward variants after this many timing updates and keep the
+    // fastest measured one (0 = keep sampling, the default).
+    int rasterize_backward_pin_after = 0;
 };
 
 
@@ -148,6 +151,9 @@ public:
     void get_train_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
     void get_val_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
 
+    // true if the step has no densification/prune/reset/Morton work and can run in a gated batch
+    bool stepIsDeferrable(const TrainerConfig &config, int step) const;
+    GatePlan buildGatePlan(const VulkanGSRendererUniforms& uniforms, const VulkanGSPipelineBuffers& buffers, int backward_impl) const;
     void executeComputeSSIMGradient(const TrainerConfig &config, const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, size_t train_idx);
     void executeFusedProjectionBackwardOptimizerStep(const TrainerConfig &config, const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, int step);
 

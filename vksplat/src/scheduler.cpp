@@ -30,6 +30,7 @@ void ThompsonSamplingScheduler::update(size_t idx, double val) {
     stdev_offset *= warmup_beta;
 
     // update at idx
+    total_updates += 1;
     Stat& stat = stats[idx];
     stat.count += 1.0;
     stat.sum_val += val;
@@ -53,6 +54,15 @@ size_t ThompsonSamplingScheduler::sample() {
         size_t idx = std::uniform_int_distribution<size_t>(0, ustats.size()-1)(rng);
         return ustats[idx];
     }
+
+    if (pinned()) {  // every option has been measured: stop exploring
+        size_t best = 0;
+        for (size_t i = 1; i < stats.size(); i++)
+            if (stats[i].mean() < stats[best].mean())
+                best = i;
+        return best;
+    }
+
 
     // if sampling is needed, do that one first
     for (size_t i = 0; i < stats.size(); i++) {

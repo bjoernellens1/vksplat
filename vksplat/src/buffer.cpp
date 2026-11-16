@@ -126,7 +126,8 @@ void VulkanGSPipeline::createBuffer(size_t size, _VulkanBuffer& buffer) {
     // Try to create device-local buffer first (optimal for GPU operations)
     const auto deviceUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | 
                             VK_BUFFER_USAGE_TRANSFER_DST_BIT | 
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
     const auto deviceProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     
     // Create main device-local buffer
@@ -163,6 +164,67 @@ void VulkanGSPipeline::createBuffer(size_t size, _VulkanBuffer& buffer) {
     current_vram += size;
     if (current_vram > peak_vram)
         peak_vram = current_vram;
+}
+
+
+void VulkanGSPipeline::createGateBuffers() {
+    if (gate_args.buffer != VK_NULL_HANDLE)
+        return;
+    createBuffer(kGateMaxSteps * kGateSlots * 16, gate_args);
+    createBuffer(kGateStatusWords * sizeof(uint32_t), gate_status);
+    createBuffer(sizeof(uint32_t), isect_count);
+
+    // host-visible mirror of the status, copied once per batch and read after the batch's fence
+    VkBufferCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = kGateStatusWords * sizeof(uint32_t);
+    info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &info, nullptr, &gate_host_buffer) != VK_SUCCESS)
+        throw std::runtime_error("Failed to create gate status buffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, gate_host_buffer, &req);
+    uint32_t type = findMemoryType(physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type == UINT32_MAX)
+        throw std::runtime_error("Failed to find gate status memory type");
+    VkMemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = req.size;
+    alloc_info.memoryTypeIndex = type;
+    if (vkAllocateMemory(device, &alloc_info, nullptr, &gate_host_memory) != VK_SUCCESS)
+        throw std::runtime_error("Failed to allocate gate status memory");
+    vkBindBufferMemory(device, gate_host_buffer, gate_host_memory, 0);
+    void* ptr = nullptr;
+    vkMapMemory(device, gate_host_memory, 0, VK_WHOLE_SIZE, 0, &ptr);
+    gate_host_status = static_cast<const volatile uint32_t*>(ptr);
+}
+
+
+void VulkanGSPipeline::destroyGateBuffers() {
+    if (gate_host_buffer != VK_NULL_HANDLE) {
+        vkUnmapMemory(device, gate_host_memory);
+        vkDestroyBuffer(device, gate_host_buffer, nullptr);
+        vkFreeMemory(device, gate_host_memory, nullptr);
+        gate_host_buffer = VK_NULL_HANDLE;
+        gate_host_memory = VK_NULL_HANDLE;
+        gate_host_status = nullptr;
+    }
+    destroyBuffer(gate_args);
+    destroyBuffer(gate_status);
+    destroyBuffer(isect_count);
+}
+
+
+void VulkanGSPipeline::fullBarrier() {
+    if (!commandBatchInProgress)
+        return;
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 

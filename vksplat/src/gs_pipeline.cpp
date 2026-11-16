@@ -133,6 +133,7 @@ void VulkanGSPipeline::cleanup() {
 
     if (device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device);
+        destroyGateBuffers();
         append_pending = false;
         for (auto& b : retired_buffers)
             destroyBuffer(b);
@@ -907,7 +908,8 @@ void VulkanGSPipeline::executeCompute(
     std::vector<std::pair<size_t, size_t>> dims,
     const void* uniformsPtr, size_t uniformSize,
     _ComputePipeline &pipeline,
-    const std::vector<_VulkanBuffer> &buffers
+    const std::vector<_VulkanBuffer> &buffers,
+    int gate_slot
 ) {
     if (uniformSize > MAX_UNIFORM_SIZE)
         _THROW_ERROR("Maximum uniform size exceeded");
@@ -939,6 +941,18 @@ void VulkanGSPipeline::executeCompute(
     uint32_t nGroupsX = (uint32_t)_CEIL_DIV(dims[0].first, dims[0].second);
     uint32_t nGroupsY = (uint32_t)_CEIL_DIV(dims[1].first, dims[1].second);
     uint32_t nGroupsZ = (uint32_t)_CEIL_DIV(dims[2].first, dims[2].second);
+    if (gate_active && gate_slot >= 0) {
+        // the gate wrote the arguments from the host plan (or from the GPU intersection count for the
+        // sort and tile-range slots); a plan that disagrees with the site would silently mis-dispatch
+        if (gate_slot != GATE_SORT && gate_slot != GATE_TILE_RANGES) {
+            const uint32_t* b = gate_plan.base[gate_slot];
+            if (b[0] != nGroupsX || b[1] != nGroupsY || b[2] != nGroupsZ)
+                throw std::runtime_error("step gate plan does not match the dispatch of slot " + std::to_string(gate_slot));
+        }
+        vkCmdDispatchIndirect(command_buffer, gate_args.buffer,
+            ((VkDeviceSize)gate_step * kGateSlots + (VkDeviceSize)gate_slot) * 16);
+        return;
+    }
     if (nGroupsX > deviceInfo.maxGroupsX ||
         nGroupsY > deviceInfo.maxGroupsY ||
         nGroupsZ > deviceInfo.maxGroupsZ

@@ -166,6 +166,7 @@ void main(
 
 layout(binding=0) StructuredBuffer<sortingKey_t> sorted_keys;
 layout(binding=1) RWStructuredBuffer<int32_t> out_tile_ranges;
+layout(binding=2) StructuredBuffer<uint32_t> isect_count;  // (1,) number of tile intersections, written on the GPU
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -179,7 +180,7 @@ void main(
     const uint grid_width = uniforms.grid_width;
     uint32_t DEPTH_BITS = min(uint32_t(31.99-log2(grid_height*grid_width)), FLOAT32_FRACTION_BITS);
 
-    uint32_t num_isects = uniforms.active_sh;  // alias memory
+    uint32_t num_isects = isect_count[0];
     if (globalIdx > num_isects)
         return;
 

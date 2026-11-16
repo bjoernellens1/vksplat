@@ -49,6 +49,7 @@ class TrainerConfig:
     init_surface_mode: int = 0  # 0 isotropic; 1 aligned anisotropic; 2 random anisotropic
     init_normal_scale_ratio: float = 0.25
     freeze_geometry_after_iter: int = 0  # >0 freezes 3D mean/densification at this step
+    rasterize_backward_pin_after: int = 0  # >0: stop exploring backward variants after this many timing updates, keep the fastest
     enable_lr_boost: bool = False
     max_sh_degree_override: int = -1
     enable_pre_freeze_prune: bool = False

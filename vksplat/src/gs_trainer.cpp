@@ -859,6 +859,48 @@ void VulkanGSTrainer::get_val_camera(size_t idx, VulkanGSRendererUniforms &unifo
 }
 
 
+bool VulkanGSTrainer::stepIsDeferrable(const TrainerConfig &config, int step) const {
+    // Steps that densify, prune, reset or Morton-sort need host-visible results mid-step (fences, buffer
+    // reallocation) and keep the synchronous path; the common step is only forward/backward/optimizer.
+    if (config.selective_plane_freeze)
+        return false;
+    const int every = std::max(config.refine_every, 1);
+    if (config.strategy == TrainerConfig::Strategy::MCMC) {
+        const bool in_window = step < config.refine_stop_iter && step > config.refine_start_iter;
+        const bool morton = !(config.mcmc_protect_structural_groups && !splat_group_ids.empty());
+        return !(step % every == 0 && (in_window || morton));
+    }
+    const bool freeze_prune = config.enable_pre_freeze_prune && config.freeze_geometry_after_iter > 0 &&
+                              step == config.freeze_geometry_after_iter - 1;
+    return step % every != 0 && (config.reset_every <= 0 || step % config.reset_every != 0) && !freeze_prune;
+}
+
+VulkanGSTrainer::GatePlan VulkanGSTrainer::buildGatePlan(
+    const VulkanGSRendererUniforms& uniforms,
+    const VulkanGSPipelineBuffers& buffers,
+    int backward_impl
+) const {
+    // dims must match the dispatch sites (checked against them in executeCompute)
+    auto set = [](GatePlan& plan, int slot, std::vector<std::pair<size_t, size_t>> dims) {
+        while (dims.size() < 3)
+            dims.push_back({1, 1});
+        for (int i = 0; i < 3; i++)
+            plan.base[slot][i] = (uint32_t)_CEIL_DIV(dims[i].first, dims[i].second);
+    };
+    GatePlan plan;
+    const size_t n = buffers.num_splats;
+    set(plan, GATE_GENERATE_KEYS, {{n, 64}});
+    const std::vector<std::pair<size_t, size_t>> image_tiles =
+        {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}};
+    set(plan, GATE_RASTER_FWD, image_tiles);
+    set(plan, GATE_RASTER_BWD, backwardImplIsPerPixel(backward_impl) ? image_tiles :
+        std::vector<std::pair<size_t, size_t>>{{uniforms.grid_width*uniforms.grid_height, 1}});
+    set(plan, GATE_OPTIMIZER, {{n, SUBGROUP_SIZE}});
+    set(plan, GATE_POST, {{n, 256}});
+    return plan;
+}
+
+
 void VulkanGSTrainer::executeComputeSSIMGradient(
     const TrainerConfig &config,
     const VulkanGSRendererUniforms& uniforms,
@@ -1022,7 +1064,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2*4*alloc_size, true),
             buffers.group_ids.deviceBuffer,
             buffers.group_state.deviceBuffer,
-        }
+        },
+        GATE_OPTIMIZER
     );
 
     if (selective_active && anchored_xyz_snapshot_valid && num_anchored_splats <= num_splats) {
@@ -1123,7 +1166,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             buffers.radii.deviceBuffer,
             resizeDeviceBuffer(buffers.default_grad, 2*num_splats),
             resizeDeviceBuffer(buffers.default_radii, num_splats),
-        }
+        },
+        GATE_POST
     );
     bufferMemoryBarrier({
         { buffers.default_grad.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
@@ -1793,7 +1837,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             buffers.xyz_ws.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
             buffers.group_ids.deviceBuffer,
-        }
+        },
+        GATE_POST
     );
 
 }
@@ -1834,6 +1879,7 @@ void VulkanGSTrainer::executeMortonSorting(
         }
     );
 
+    writeIsectCount(num_splats);  // the sort kernels read the key count from a buffer
     // TODO: fix double timer count
     executeSort(uniforms, buffers, 32);
 

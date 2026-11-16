@@ -40,6 +40,8 @@ class ThompsonSamplingScheduler {
     std::vector<Stat> stats;
 
     std::default_random_engine rng;
+    size_t pin_after = 0;  // 0: explore forever
+    size_t total_updates = 0;
 
 public:
     ThompsonSamplingScheduler()
@@ -55,6 +57,11 @@ public:
         uint_fast32_t seed=42);
 
     void update(size_t idx, double val);
+
+    // Stop exploring after this many updates (0 = never) and always return the option with the lowest mean
+    // measured time. Changes which implementation runs, so it is off by default.
+    void set_pin_after(size_t updates) { pin_after = updates; }
+    bool pinned() const { return pin_after > 0 && total_updates >= pin_after; }
 
     size_t sample();
 

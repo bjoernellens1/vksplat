@@ -3,14 +3,14 @@
     "groups": {
         "radix_sort": {
             "sources": {
-                "shader/radix_sort/downsweep.comp": "6cf253a8198d2aef692d2b0a9ad73db5857828fe14c19da5c1066a32f6e14a50",
-                "shader/radix_sort/spine.comp": "8ef36ebe49ee0b9e3542cdd3877207fb6a5c687a7ecdece160e74a390c7a4fff",
-                "shader/radix_sort/upsweep.comp": "ec8c05e103d11f2fa812720f2d5ce6bca98ef290d9788aa4d2007fb252a0f6be"
+                "shader/radix_sort/downsweep.comp": "d6ac1fcbf2078b462a5be324baa7a5ed82aac79ec647443405925d048b2b060d",
+                "shader/radix_sort/spine.comp": "75276f4e57033da2e3e36c0be8c31ce34eb479253fb3f93b497d3ab0f0c80a20",
+                "shader/radix_sort/upsweep.comp": "c55bbd3ca62941b6bf6f5336112f6ce84103a42d31eadc4ee5c7da1267e98a00"
             },
             "outputs": {
-                "shader/radix_sort/downsweep.spv": "48ccc871bbb69bb8533dd3a4b842a6cca5c4e681c95e250102a49c37d9e739eb",
-                "shader/radix_sort/spine.spv": "a430046af4e6bfb2f710421215219ff970b14c5bae3cf3c2206ae7fa68fc7baf",
-                "shader/radix_sort/upsweep.spv": "34e449ed0baee1a6de9f06e6d9e71c513f930fccbe77d21c2ec4490f280a91cd"
+                "shader/radix_sort/downsweep.spv": "d15a7181bffb592e38b1f7a3ed4dc9ea80e1abb89230da7430cdb9eb399bf19e",
+                "shader/radix_sort/spine.spv": "a3710e882a668834567d800dc3ccfb557e8163ceb43fec5fdd698fbd33df20f5",
+                "shader/radix_sort/upsweep.spv": "c3166845f7abfbef29481c6be0e69989a33c2b165db64d9e67556b25271253e5"
             }
         },
         "morton_sort.slang": {
@@ -70,6 +70,14 @@
             },
             "outputs": {
                 "shader/generated/where.spv": "38bdd1f8d748db3dddcb53a989658cccd48a6746eed3569ada4229f99da176d0"
+            }
+        },
+        "step_gate.slang": {
+            "sources": {
+                "slang/step_gate.slang": "f1b0ea26e00bf0f4a97449f1299b67e740ff7f4688dd79eb26d94d8728f7ea48"
+            },
+            "outputs": {
+                "shader/generated/step_gate.spv": "d0337cf6c579d6b29836883a13cedb3ef53032d8a97ec5f3b720db6baa633d3a"
             }
         },
         "sum.slang": {
@@ -135,11 +143,11 @@
         "tile_shader.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/tile_shader.slang": "04fe4912897ac4fd57bca6b2cfbe0c9bba004d4a216ea0e6a5bf3cfe621027ab",
+                "slang/tile_shader.slang": "ae4936128f5adb217cf74b19ea4be1ee90007ded10e22bb61b549afb43475676",
                 "slang/utils.slang": "2ce71d8ea1b60b740f13b5c36339e41c6361dd42b065647ff2b9a467b1d56017"
             },
             "outputs": {
-                "shader/generated/compute_tile_ranges.spv": "e95518ed4be4bf7f4b13320ebd2d40693a1713d6f776f63c94a44344c454cbd2",
+                "shader/generated/compute_tile_ranges.spv": "4e66ea68688cdcef2d110a64df367bdc83efaac2b3f9580a314de10bd1e4c95c",
                 "shader/generated/generate_keys.spv": "1f66750b7863b94dae936cfc968e375aa0f1a6138ee6c8223b384c0b2d5bcd57"
             }
         },

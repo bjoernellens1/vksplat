@@ -65,6 +65,22 @@ public:
     }
     bool writeTimestamp(int delta);
     bool writeTimestampNoExcept(int delta);
+    // Batched steps: only the first step of a batch records the full stage breakdown, the others only the
+    // timers the backward-variant scheduler needs (the query pool is small).
+    bool timestamp_scheduling_only = false;
+
+    // GPU step gate for batched training steps (see step_gate.slang). Dispatches that depend on the tile
+    // intersection count, or that mutate state after it, are dispatched indirectly through `gate_args`, so a
+    // step whose count exceeds the buffer capacity (or follows such a step) becomes a no-op on the GPU.
+    static constexpr uint32_t kGateSlots = 8;
+    static constexpr uint32_t kGateMaxSteps = 8;
+    enum GateSlot {
+        GATE_GENERATE_KEYS = 0, GATE_SORT = 1, GATE_TILE_RANGES = 2, GATE_RASTER_FWD = 3,
+        GATE_RASTER_BWD = 4, GATE_OPTIMIZER = 5, GATE_POST = 6,
+    };
+    // group counts of the host-known gate slots (cross-checked against the dispatch site)
+    struct GatePlan { uint32_t base[kGateSlots][4] = {}; };
+    bool gateActive() const { return gate_active; }
 
     size_t getPeakAllocSize() const
         { return peak_vram; }
@@ -218,12 +234,28 @@ protected:
     void createComputeDescriptorPool(_ComputePipeline &pipeline);
     void updateComputeDescriptorSet(_ComputePipeline &pipeline, const std::vector<_VulkanBuffer> &buffers);
     void createComputePipeline(_ComputePipeline &pipeline, const std::string& spirv_path, uint32_t min_shared_memory=0, bool compatible_subgroup_size=true);
+    // gate_slot >= 0 and gate active: dispatch indirectly from the step gate's arguments for that slot
     void executeCompute(
         std::vector<std::pair<size_t, size_t>> dims,
         const void* uniformsPtr, size_t uniformSize,
         _ComputePipeline &pipeline,
-        const std::vector<_VulkanBuffer> &buffers
+        const std::vector<_VulkanBuffer> &buffers,
+        int gate_slot = -1
     );
+
+    bool gate_active = false;
+    uint32_t gate_step = 0;  // step index inside the current batch
+    GatePlan gate_plan;
+    _VulkanBuffer gate_args;     // kGateMaxSteps x kGateSlots VkDispatchIndirectCommand (16 B stride)
+    _VulkanBuffer gate_status;   // see step_gate.slang
+    _VulkanBuffer isect_count;   // (1,) tile intersection count read by sort / tile-range kernels
+    VkBuffer gate_host_buffer = VK_NULL_HANDLE;
+    VkDeviceMemory gate_host_memory = VK_NULL_HANDLE;
+    const volatile uint32_t* gate_host_status = nullptr;
+    static constexpr uint32_t kGateStatusWords = 4 + kGateMaxSteps;
+    void createGateBuffers();
+    void destroyGateBuffers();
+    void fullBarrier();
 
     void _displayImage(Buffer<float>& pixels, int width, bool reverse_alpha);
 

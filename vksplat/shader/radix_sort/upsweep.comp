@@ -21,9 +21,14 @@ layout (std430, binding = 0) readonly buffer Keys {
   keyType data[];  // (N)
 } keys;
 
+// number of keys, written on the GPU (or by vkCmdUpdateBuffer) so the host does not need to know it
+layout (std430, binding = 3) readonly buffer ElementCount {
+  uint32_t data[];
+} elementCountBuf;
+
 layout (push_constant) uniform PushConstant {
   uint32_t pass;
-  uint32_t elementCount;
+  uint32_t elementCount;  // unused: see ElementCount
 } uniforms;
 
 shared uint32_t localHistogram[RADIX];
@@ -33,7 +38,7 @@ void main() {
   uint subgroupIndex = gl_SubgroupID;  // 0..31
   uint index = subgroupIndex * gl_SubgroupSize + threadIndex;
 
-  uint elementCount = uniforms.elementCount;
+  uint elementCount = elementCountBuf.data[0];
   int pass = int(uniforms.pass);
 
   uint partitionIndex = gl_WorkGroupID.x;

@@ -16,6 +16,8 @@ public:
     VulkanGSRendererUniforms uniforms;
     VulkanGSPipelineBuffers buffers;
     TrainerConfig config;
+    bool isect_capacity_forced = false;  // test hook: skip the proactive capacity growth once
+    size_t last_isects = 0;  // intersection count of the last gated step (sizes the next batch)
 
     template<typename Ti, typename To, bool on_device=true>
     py::array_t<To> buffer_to_array(
@@ -117,6 +119,7 @@ public:
         std::vector<std::string> spirv_paths = {
             "projection_forward",
             "generate_keys",
+            "step_gate",
             "compute_tile_ranges",
             "rasterize_forward",
             "rasterize_backward_0",
@@ -264,6 +267,9 @@ public:
             ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
         config.sparse_tile_grad_thresh = train_config.contains(py::str("sparse_tile_grad_thresh"))
             ? train_config["sparse_tile_grad_thresh"].cast<float>() : 0.0f;
+        config.rasterize_backward_pin_after = train_config.contains(py::str("rasterize_backward_pin_after"))
+            ? train_config["rasterize_backward_pin_after"].cast<int>() : 0;
+        trainer.setBackwardPinAfter((size_t)std::max(config.rasterize_backward_pin_after, 0));
 
         // load dataset
         trainer.load_colmap_dataset(config, buffers);
@@ -871,7 +877,7 @@ public:
     }
 
     void compute_pixel_loss_grad(size_t train_idx) {
-        if (buffers.num_indices == 0)
+        if (!trainer.gateActive() && buffers.num_indices == 0)
             return;
         try {
             trainer.executeComputeSSIMGradient(config, uniforms, buffers, train_idx);
@@ -919,7 +925,8 @@ public:
         trainer.get_train_camera(train_idx, uniforms);
     }
 
-    void train_step(size_t train_idx, int step) {
+    // per-step uniforms shared by the synchronous and the gated path
+    void begin_step(size_t train_idx, int step) {
         set_train_image(train_idx);
         const int kShDegreeInterval = 1000;
         uniforms.active_sh = (config.max_sh_degree_override >= 0)
@@ -927,6 +934,12 @@ public:
             : std::min(step / kShDegreeInterval, 3);
         uniforms.step = step;
         uniforms.sparse_tile_grad_thresh = config.sparse_tile_grad_thresh;
+    }
+
+    // Steps with host-visible work (densify, prune, reset, Morton sort) and calls made inside an open
+    // command batch: the intersection count is read back mid-forward (one extra fence per step).
+    void train_step_sync(size_t train_idx, int step) {
+        begin_step(train_idx, step);
 
         auto deviceGuard = DeviceGuard(&trainer);
 
@@ -936,13 +949,97 @@ public:
 
         // post_backward_step(step+1);
         post_backward_step(step);
+    }
 
+    // One step recorded into the open gated batch: no host readback and no fence; see step_gate.slang.
+    void train_step_gated(size_t train_idx, int step, uint32_t step_in_batch) {
+        begin_step(train_idx, step);
+        trainer.gateBeginStep(step_in_batch);
+        projection_forward();
+        const int backward_impl = trainer.sampleBackwardImpl();
+        trainer.executeTilesDeferred(uniforms, buffers, trainer.buildGatePlan(uniforms, buffers, backward_impl));
+        rasterize_forward();
+        compute_pixel_loss_grad(train_idx);
+        backward_optimize(step);
+        post_backward_step(step);
+    }
+
+    // Runs `count` consecutive deferrable steps starting at indices[begin] in as few submits as possible
+    // (one, unless a descriptor/buffer change forces a split or a step overflows the intersection buffers).
+    // An overflowing step and every later step of the batch are skipped on the GPU without touching the
+    // parameters or optimizer state; the buffers are grown and the skipped steps are recorded again, so the
+    // result is exactly that of running the steps one by one.
+    void train_steps_gated(const std::vector<int>& indices, int first_step, size_t begin, size_t count) {
+        size_t done = 0;
+        for (int attempt = 0; done < count; ++attempt) {
+            if (attempt > 16)
+                _THROW_ERROR_ALWAYS("gated training steps keep overflowing the intersection buffers");
+            const size_t remaining = count - done;
+            if (!isect_capacity_forced)
+                trainer.ensureIsectCapacity(buffers, std::max<size_t>(
+                    {size_t(1) << 18, 16 * buffers.num_splats, last_isects + (last_isects >> 1)}));
+            isect_capacity_forced = false;
+            {
+                auto deviceGuard = DeviceGuard(&trainer);
+                trainer.gateBeginBatch();
+                try {
+                    for (size_t j = 0; j < remaining; ++j)
+                        train_step_gated(
+                            (size_t)indices[begin + done + j], first_step + (int)(begin + done + j), (uint32_t)j);
+                } catch (...) {
+                    trainer.gateEndBatch();
+                    throw;
+                }
+                trainer.gateEndBatch();
+            }  // submit + the one fence of the batch
+            const auto result = trainer.gateResult();
+            auto& w = PerfTimer::work_counters;
+            for (uint32_t i = 0; i < result.steps_done; ++i) {
+                w.forward_passes++;
+                w.tile_intersections_total += result.isects[i];
+                w.tile_intersections_last = result.isects[i];
+                w.tile_intersections_max = std::max<uint64_t>(w.tile_intersections_max, result.isects[i]);
+                last_isects = result.isects[i];
+            }
+            if (result.steps_done > 0)
+                buffers.num_indices = last_isects;
+            done += result.steps_done;
+            if (result.overflow) {
+                w.gate_overflows++;
+                w.gate_steps_redone += remaining - result.steps_done;
+                trainer.ensureIsectCapacity(buffers, result.needed + (result.needed >> 1));
+            }
+            else if (result.steps_done != remaining)
+                _THROW_ERROR_ALWAYS("gated batch stopped without an overflow");
+        }
     }
 
     void train_steps(const std::vector<int>& indices, int first_step) {
-        for (size_t i = 0; i < indices.size(); ++i) {
-            train_step(static_cast<size_t>(indices[i]), first_step + static_cast<int>(i));
+        size_t i = 0;
+        while (i < indices.size()) {
+            const int step = first_step + (int)i;
+            if (buffers.num_splats == 0 || trainer.isCommandBatchInProgress() || !trainer.stepIsDeferrable(config, step)) {
+                train_step_sync((size_t)indices[i], step);
+                ++i;
+                continue;
+            }
+            size_t count = 1;
+            while (i + count < indices.size() && count < VulkanGSTrainer::kGateMaxSteps &&
+                   trainer.stepIsDeferrable(config, step + (int)count))
+                ++count;
+            train_steps_gated(indices, first_step, i, count);
+            i += count;
         }
+    }
+
+    void train_step(size_t train_idx, int step) {
+        train_steps({(int)train_idx}, step);
+    }
+
+    // Test hook: shrink the intersection buffers to `capacity` so the next gated batch overflows.
+    void force_isect_capacity(size_t capacity) {
+        trainer.setIsectCapacityExact(buffers, capacity);
+        isect_capacity_forced = true;
     }
 
     void render_train(size_t idx) {
@@ -1043,8 +1140,15 @@ PYBIND11_MODULE(vksplat, m) {
         .def("train_step", &VkSplat::train_step,
              "Train on the give image for one step.", py::call_guard<py::gil_scoped_release>())
         .def("train_steps", &VkSplat::train_steps,
-             "Run a sequence of training steps without re-acquiring the GIL",
+             "Run training steps on the given train slots (step numbers first_step, first_step+1, ...), "
+             "batched into as few GPU submits as possible",
              py::arg("indices"), py::arg("first_step"), py::call_guard<py::gil_scoped_release>())
+        .def("_force_isect_capacity", &VkSplat::force_isect_capacity,
+             "Test hook: shrink the tile-intersection buffers so the next batched step overflows",
+             py::arg("capacity"), py::call_guard<py::gil_scoped_release>())
+        .def("train_steps_slots", &VkSplat::train_steps,
+             "Alias of train_steps(list_of_train_slots, start_step)",
+             py::arg("slots"), py::arg("start_step"), py::call_guard<py::gil_scoped_release>())
         .def("render_train", &VkSplat::render_train,
              "Render the train camera pose to buffer.", py::call_guard<py::gil_scoped_release>())
         .def("render_val", &VkSplat::render_val,
