@@ -71,6 +71,9 @@ public:
     GateResult gateResult() const;
     int sampleBackwardImpl();  // scheduler pick (RasterBackwardImpl as int) for the next backward pass
     void setBackwardPinAfter(size_t updates);
+    // Force one backward variant (RasterBackwardImpl value) instead of the scheduler; -1 restores scheduling.
+    void forceBackwardImpl(int impl);
+    std::vector<int> backwardImplCandidates();
 
 private:
     enum class RasterBackwardImpl {
@@ -85,6 +88,8 @@ private:
     std::vector<RasterBackwardImpl> rasterizeBackwardAlternatives;
     ThompsonSamplingScheduler rasterizeBackwardScheduler;
     size_t backward_pin_after = 0;
+    int forced_backward_impl = -1;
+    RasterBackwardImpl sampleBackwardAlternative();
     int gate_backward_impl = 0;  // pick made at plan time for the step being recorded
     void initRasterizationBackwardScheduler();
 

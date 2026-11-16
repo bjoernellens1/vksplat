@@ -157,6 +157,7 @@ public:
             "mcmc_compute_add",
             "mcmc_update_add",
             "mcmc_mask_retracted_group",
+            "mcmc_clamp_scales",
             "morton_sort_compute_stats",
             "morton_sort_generate_keys",
             "morton_sort_apply_indices",
@@ -268,7 +269,7 @@ public:
         config.sparse_tile_grad_thresh = train_config.contains(py::str("sparse_tile_grad_thresh"))
             ? train_config["sparse_tile_grad_thresh"].cast<float>() : 0.0f;
         config.rasterize_backward_pin_after = train_config.contains(py::str("rasterize_backward_pin_after"))
-            ? train_config["rasterize_backward_pin_after"].cast<int>() : 0;
+            ? train_config["rasterize_backward_pin_after"].cast<int>() : 20;
         trainer.setBackwardPinAfter((size_t)std::max(config.rasterize_backward_pin_after, 0));
 
         // load dataset
@@ -355,6 +356,11 @@ public:
         if (gids.size() != states.size())
             throw std::invalid_argument("group_ids and states must have the same length");
         trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
+    }
+    void force_backward_variant(int impl) { trainer.forceBackwardImpl(impl); }
+    std::vector<int> backward_variants() { return trainer.backwardImplCandidates(); }
+    void clamp_scales(float max_scale, float tangent_cap) {
+        trainer.clamp_scales(buffers, max_scale, tangent_cap);
     }
     void retract_group_sparse(int32_t group_id) {
         trainer.retract_group_sparse(buffers, group_id);
@@ -1177,6 +1183,9 @@ PYBIND11_MODULE(vksplat, m) {
         .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
         .def("set_group_states", &VkSplat::set_group_states, "Batched set_group_state: one device upload for all (group_id, state) pairs", py::arg("group_ids"), py::arg("states"))
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
+        .def("force_backward_variant", &VkSplat::force_backward_variant, "Pin one rasterize-backward variant (0 PerPixel, 1 PerSplat, 2/3/4 Tensor); -1 restores the scheduler", py::arg("impl"))
+        .def("backward_variants", &VkSplat::backward_variants, "Backward variants available on this device")
+        .def("clamp_scales", &VkSplat::clamp_scales, "GPU clamp of scales without readback: ungrouped splats to max_scale on all axes; grouped splats (group_id >= 0) to tangent_cap on x, y and max_scale on z", py::arg("max_scale"), py::arg("tangent_cap"), py::call_guard<py::gil_scoped_release>())
         .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
         .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))
         .def("get_scales_opacities_packed", &VkSplat::get_scales_opacities_packed, "Read packed (N, 4) scales+opacities in a single device transfer")

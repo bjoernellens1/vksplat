@@ -31,10 +31,11 @@
         "mcmc.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/mcmc.slang": "2cbfa928a3e28abcc13570e3a5ec53f61df873d96d8426244a75708bca242cc1",
+                "slang/mcmc.slang": "46875ab2bf6e6f33112235b0c048b4415ff4895e352dfffea9b32da67ec5527d",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
+                "shader/generated/mcmc_clamp_scales.spv": "164e9b659aa7e2401df8f88b8bc7a89a4bb7456a58b8f9d08f068125388921af",
                 "shader/generated/mcmc_compute_add.spv": "0475b5cd0cb830b6fa2ed2d07b1bb52e6c6b8bcd54f50448b2b1aacdaa5acc0c",
                 "shader/generated/mcmc_compute_add_index_map.spv": "f89a7c9ce52b73779c4dcdec401aa73b9bb7625287a34f24285feceef9736780",
                 "shader/generated/mcmc_compute_probs.spv": "9f27655af4fd22042e27b57ef9bfc669854e12b0a2ab8501c429ff648f7fcd91",

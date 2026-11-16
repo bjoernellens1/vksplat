@@ -13,6 +13,7 @@
 #define MCMC_PHASE_UpdateAdd 22
 
 #define MCMC_PHASE_MaskRetractedGroup 30
+#define MCMC_PHASE_ClampScales 31
 
 #ifndef MCMC_PHASE
 #define MCMC_PHASE -1
@@ -53,6 +54,12 @@ bool mcmc_protected(int32_t gid, uint32_t protect_all, uint32_t num_groups, Stru
 struct MaskGroupUniforms {
     uint32_t array_size;
     uint32_t num_groups;
+};
+
+struct ClampScalesUniforms {
+    uint32_t array_size;
+    float max_scale;  // every axis of an ungrouped splat; the normal axis (z) of a grouped one
+    float tangent_cap;  // axes x, y of a grouped splat (group_id >= 0)
 };
 
 
@@ -529,5 +536,31 @@ void maskRetractedGroup(
 }
 
 #endif  // MCMC_PHASE == MCMC_PHASE_MaskRetractedGroup
+
+#if MCMC_PHASE == MCMC_PHASE_ClampScales
+
+layout(binding=0) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=1) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
+
+#define clampScales main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void clampScales(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform ClampScalesUniforms uniforms
+) {
+    const uint32_t tid = thread_id.x;
+    if (tid >= uniforms.array_size)
+        return;
+
+    float4 so = scales_opacs[tid];
+    const float xy_cap = group_ids[tid] >= 0 ? uniforms.tangent_cap : uniforms.max_scale;
+    const float3 limit = float3(xy_cap, xy_cap, uniforms.max_scale);
+    const float3 clamped = min(so.xyz, limit);
+    if (any(clamped != so.xyz))
+        scales_opacs[tid] = float4(clamped, so.w);
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_ClampScales
 
 

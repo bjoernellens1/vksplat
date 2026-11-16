@@ -322,8 +322,7 @@ void VulkanGSRenderer::executeRasterizeBackward(
     if (RASTERIZE_BACKWARD_USE_SCHEDULING) {
         using namespace PerfTimer;
         initRasterizationBackwardScheduler();
-        scheduled_impl = gate_active ? (RasterBackwardImpl)gate_backward_impl :
-            rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
+        scheduled_impl = gate_active ? (RasterBackwardImpl)gate_backward_impl : sampleBackwardAlternative();
         // scheduled_impl = RasterBackwardImpl::PerSplat;
         if (scheduled_impl == RasterBackwardImpl::PerPixel)
             timer = std::make_shared<Timer<_RasterizeBackwardScheduling_PerPixel>>(this);
@@ -846,8 +845,31 @@ VulkanGSRenderer::GateResult VulkanGSRenderer::gateResult() const {
 
 int VulkanGSRenderer::sampleBackwardImpl() {
     initRasterizationBackwardScheduler();
-    gate_backward_impl = (int)rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
+    gate_backward_impl = (int)sampleBackwardAlternative();
     return gate_backward_impl;
+}
+
+VulkanGSRenderer::RasterBackwardImpl VulkanGSRenderer::sampleBackwardAlternative() {
+    if (forced_backward_impl >= 0)
+        return (RasterBackwardImpl)forced_backward_impl;
+    return rasterizeBackwardAlternatives[rasterizeBackwardScheduler.sample()];
+}
+
+std::vector<int> VulkanGSRenderer::backwardImplCandidates() {
+    initRasterizationBackwardScheduler();
+    std::vector<int> out;
+    for (auto impl : rasterizeBackwardAlternatives)
+        out.push_back((int)impl);
+    return out;
+}
+
+void VulkanGSRenderer::forceBackwardImpl(int impl) {
+    if (impl >= 0) {
+        auto c = backwardImplCandidates();
+        if (std::find(c.begin(), c.end(), impl) == c.end())
+            throw std::invalid_argument("backward variant not available on this device");
+    }
+    forced_backward_impl = impl;
 }
 
 void VulkanGSRenderer::setBackwardPinAfter(size_t updates) {
