@@ -101,7 +101,7 @@ struct TrainerConfig {
     int sparse_full_every = 4;
     // >0: stop exploring the rasterize-backward variants after this many timing updates and keep the
     // fastest measured one (0 = keep sampling, the default).
-    int rasterize_backward_pin_after = 0;
+    int rasterize_backward_pin_after = 20;
 };
 
 
@@ -248,6 +248,7 @@ public:
     void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
     void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
+    void clamp_scales(VulkanGSPipelineBuffers& buffers, float max_scale, float tangent_cap);
 
 private:
     std::default_random_engine rng;
@@ -291,6 +292,7 @@ private:
         _ComputePipeline compute_add = _ComputePipeline(2);
         _ComputePipeline update_add = _ComputePipeline(10);
         _ComputePipeline mask_retracted_group = _ComputePipeline(3);
+        _ComputePipeline clamp_scales = _ComputePipeline(2);
     } pipeline_mcmc;
     struct _MortonSortComputePipeline {
         _ComputePipeline compute_stats = _ComputePipeline(2);

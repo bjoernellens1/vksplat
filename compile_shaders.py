@@ -250,7 +250,7 @@ class ShaderCompiler:
                 ("inject_noise", 0), ("compute_probs", 1),
                 ("compute_relocation_index_map", 10), ("compute_relocation", 11), ("update_relocation", 12),
                 ("compute_add_index_map", 20), ("compute_add", 21), ("update_add", 22),
-                ("mask_retracted_group", 30),
+                ("mask_retracted_group", 30), ("clamp_scales", 31),
             ]
         ], ["strategy_utils.slang", "config.slang"]))
 

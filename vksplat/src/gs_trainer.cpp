@@ -131,6 +131,7 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_mcmc.compute_add, spirv_paths.at("mcmc_compute_add"));
     createComputePipeline(pipeline_mcmc.update_add, spirv_paths.at("mcmc_update_add"));
     createComputePipeline(pipeline_mcmc.mask_retracted_group, spirv_paths.at("mcmc_mask_retracted_group"));
+    createComputePipeline(pipeline_mcmc.clamp_scales, spirv_paths.at("mcmc_clamp_scales"));
     createComputePipeline(pipeline_morton_sort.compute_stats, spirv_paths.at("morton_sort_compute_stats"));
     createComputePipeline(pipeline_morton_sort.generate_keys, spirv_paths.at("morton_sort_generate_keys"));
     createComputePipeline(pipeline_morton_sort.apply_indices, spirv_paths.at("morton_sort_apply_indices"));
@@ -2383,6 +2384,39 @@ void VulkanGSTrainer::retract_group_sparse(
         {
             buffers.group_ids.deviceBuffer,
             buffers.group_state.deviceBuffer,
+            buffers.scales_opacs.deviceBuffer,
+        }
+    );
+    bufferMemoryBarrier({
+        { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+}
+
+void VulkanGSTrainer::clamp_scales(
+    VulkanGSPipelineBuffers& buffers,
+    float max_scale,
+    float tangent_cap
+) {
+    if (buffers.num_splats == 0)
+        return;
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+
+    DEVICE_GUARD;
+    Uniform32_t uniforms[3];
+    uniforms[0].u = static_cast<uint32_t>(buffers.num_splats);
+    uniforms[1].f = max_scale;
+    uniforms[2].f = tangent_cap;
+
+    bufferMemoryBarrier({
+        { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+    executeCompute(
+        {{buffers.num_splats, 256}},
+        &uniforms, sizeof(uniforms),
+        pipeline_mcmc.clamp_scales,
+        {
+            buffers.group_ids.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
         }
     );

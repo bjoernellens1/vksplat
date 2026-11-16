@@ -50,7 +50,7 @@ def build_dataset(root: Path, n_images: int = 4, n_points: int = 2000, w: int = 
     return root
 
 
-def new_trainer(root: Path, out: Path, pin_after: int = 0, **overrides):
+def new_trainer(root: Path, out: Path, pin_after: int | None = None, **overrides):
     sys.path.insert(0, str(ROOT))
     import vksplat
     from simple_trainer import TrainerConfig, join_dir
@@ -62,7 +62,7 @@ def new_trainer(root: Path, out: Path, pin_after: int = 0, **overrides):
         sparse_dir=join_dir(str(root), "sparse/0"), output_dir=str(out),
         train_steps=50, max_steps=500, enable_viewer=False, save_train_renders=False,
     )
-    if pin_after:
+    if pin_after is not None:
         cfg.rasterize_backward_pin_after = pin_after  # ignored by builds that predate the field
     cfg.refine_start_iter = 100000
     cfg.refine_stop_iter = 200000
