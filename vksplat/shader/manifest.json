@@ -114,12 +114,13 @@
         },
         "ssim.slang": {
             "sources": {
-                "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/ssim.slang": "72e1ec5f881a64e9967287c7f0d8a00ea90633643584db324658b2e524b9a8a7"
+                "slang/ssim.slang": "a886b738999cb6470843a3ac162336507ad190f74f27da040af1125b8e5f62cd"
             },
             "outputs": {
-                "shader/generated/ssim_backward.spv": "e16818add291a87a8fc17ce01f00cd61c765e9fb5f4ce7d82af7115c40f8a6eb",
-                "shader/generated/ssim_forward.spv": "ec305992aa34d662113e34074d0257cdbc23267a61d8be430e3880e6465dc725"
+                "shader/generated/ssim_grad.spv": "40633db96946dfc9f0e3f3fed38a4c2d5be83d21a19c681ea45f321fd27a90ad",
+                "shader/generated/ssim_grad_ds2.spv": "273c429d671e65cf29b618e7ef45c81f86b7a5bcf5aecab814a006ce689e92b1",
+                "shader/generated/ssim_stats.spv": "e5cc7d73f1ab06504d745bd2b66af4b78e6e0884cc2381cfe39248e32005b436",
+                "shader/generated/ssim_stats_ds2.spv": "492438b5c34fc7ec4e8e2559c393c3890a54dab85663d54875c09b7340d441d5"
             }
         },
         "cumsum.slang": {

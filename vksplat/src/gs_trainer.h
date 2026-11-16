@@ -55,6 +55,8 @@ struct TrainerConfig {
     // optimizer
     int max_steps;
     float ssim_lambda;
+    int ssim_every = 1;       // SSIM term only on steps with step % ssim_every == 0 (L1 only otherwise)
+    int ssim_downsample = 1;  // 2: SSIM on the 2x2 box-averaged images
     float means_lr;
     float means_lr_final;
     float features_dc_lr;
@@ -160,7 +162,7 @@ public:
     // true if the step has no densification/prune/reset/Morton work and can run in a gated batch
     bool stepIsDeferrable(const TrainerConfig &config, int step) const;
     GatePlan buildGatePlan(const VulkanGSRendererUniforms& uniforms, const VulkanGSPipelineBuffers& buffers, int backward_impl) const;
-    void executeComputeSSIMGradient(const TrainerConfig &config, const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, size_t train_idx);
+    void executeComputeSSIMGradient(const TrainerConfig &config, const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, size_t train_idx, int step);
     void executeFusedProjectionBackwardOptimizerStep(const TrainerConfig &config, const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers, int step);
 
     void executeDefaultPostBackward(const TrainerConfig &config, const VulkanGSRendererUniforms& renderer_uniforms, VulkanGSPipelineBuffers& buffers, int step);
@@ -268,8 +270,10 @@ private:
     size_t mcmc_added_count = 0;
     Buffer<float> anchored_xyz_ws;
 
-    _ComputePipeline pipeline_ssim_forward = _ComputePipeline(3);
-    _ComputePipeline pipeline_ssim_backward = _ComputePipeline(5);
+    _ComputePipeline pipeline_ssim_stats = _ComputePipeline(3);
+    _ComputePipeline pipeline_ssim_grad = _ComputePipeline(5);
+    _ComputePipeline pipeline_ssim_stats_ds2 = _ComputePipeline(3);  // SSIM on the 2x2 box-averaged images
+    _ComputePipeline pipeline_ssim_grad_ds2 = _ComputePipeline(5);
     _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(15);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);

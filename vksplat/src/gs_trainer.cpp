@@ -110,8 +110,10 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
 
     VulkanGSRenderer::initialize(spirv_paths, device_id);
     
-    createComputePipeline(pipeline_ssim_forward, spirv_paths.at("ssim_forward"));
-    createComputePipeline(pipeline_ssim_backward, spirv_paths.at("ssim_backward"));
+    createComputePipeline(pipeline_ssim_stats, spirv_paths.at("ssim_stats"));
+    createComputePipeline(pipeline_ssim_grad, spirv_paths.at("ssim_grad"));
+    createComputePipeline(pipeline_ssim_stats_ds2, spirv_paths.at("ssim_stats_ds2"));
+    createComputePipeline(pipeline_ssim_grad_ds2, spirv_paths.at("ssim_grad_ds2"));
     createComputePipeline(pipeline_fused_projection_backward_optimizer, spirv_paths.at("fused_projection_backward_optimizer"));
     createComputePipeline(pipeline_default.update_state, spirv_paths.at("default_update_state"));
     createComputePipeline(pipeline_default.compute_grow_mask, spirv_paths.at("default_compute_grow_mask"));
@@ -911,21 +913,27 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     const TrainerConfig &config,
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers,
-    size_t train_idx
+    size_t train_idx,
+    int step
 ) {
-    size_t w = uniforms.image_width, h = uniforms.image_height;
-    size_t num_pixels = w * h;
-    Uniform32_t shader_uniforms[5];
+    const size_t w = uniforms.image_width, h = uniforms.image_height;
+    const uint32_t ds = (uint32_t)config.ssim_downsample;
+    const bool use_ssim = step % config.ssim_every == 0;
+    const uint32_t kTwoHalo = 10;
+    Uniform32_t shader_uniforms[6];
     shader_uniforms[0].u = (uint32_t)w;
     shader_uniforms[1].u = (uint32_t)h;
-    const uint32_t kTwoHalo = 10;
     shader_uniforms[2].f = (1.0f - config.ssim_lambda) / (3.0f * w * h);  // l1 grad weight
-    shader_uniforms[3].f = -config.ssim_lambda / (3.0f * (w-kTwoHalo) * (h-kTwoHalo));  // ssim grad weight
-    // Sparse objective: the loss gradient is formed only for the active tiles (L1 restricted to them,
-    // SSIM windows still read the full-frame statistics); the other tiles are never read by the raster backward.
+    // ssim grad weight: mean over the interior of the SSIM grid, split over the ds x ds pixels of a grid pixel
+    shader_uniforms[3].f = -config.ssim_lambda / (3.0f * (w/ds-kTwoHalo) * (h/ds-kTwoHalo) * ds * ds);
+    shader_uniforms[4].u = use_ssim ? 1u : 0u;
+    // Sparse objective: the loss gradient is formed only for the active tiles (L1 restricted to them, SSIM windows
+    // still read the full-frame statistics); the other tiles are never read by the raster backward. The tile list
+    // indexes 16x16 image tiles, which are the stage-2 workgroups only without downsampling.
     const bool sparse = uniforms.use_tile_list != 0;
-    shader_uniforms[4].u = sparse ? 1u : 0u;
-    
+    const bool sparse_grad = sparse && ds == 1;
+    shader_uniforms[5].u = sparse_grad ? 1u : 0u;
+
     auto& train_image = dataset_train[train_idx].buffer;
     if (train_image.deviceBuffer.buffer == VK_NULL_HANDLE) {
         PerfTimer::Timer<PerfTimer::CopyTrainImageToDevice> timer(this);
@@ -947,36 +955,37 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     if (sparse)
         executeSelectSparseTiles(uniforms, buffers, config.sparse_tile_quantile, config.sparse_tile_halo);
 
-    // auto& ssim_map = buffers.ssim_map;
+    const size_t gw = (w+ds-1)/ds, gh = (h+ds-1)/ds;
     auto& ssim_map = buffers._temp_gauss_attr;  // reuse buffer to save VRAM
-
-    executeCompute(
-        {{w, 16}, {h, 16}},
-        shader_uniforms, 4*sizeof(Uniform32_t),
-        pipeline_ssim_forward,
+    const auto map_buffer = resizeDeviceBuffer(ssim_map, 9*(w/ds)*(h/ds));  // also bound (unread) on L1-only steps
+    if (use_ssim) {
         {
-            buffers.pixel_state.deviceBuffer,
-            buffers.ref_image.deviceBuffer,
-            resizeDeviceBuffer(ssim_map, 12*num_pixels),
+            PerfTimer::Timer<PerfTimer::_SSIMStats> statsTimer(this);
+            executeCompute(
+                {{gw, 16}, {gh, 16}},
+                shader_uniforms, 6*sizeof(Uniform32_t),
+                ds == 1 ? pipeline_ssim_stats : pipeline_ssim_stats_ds2,
+                { buffers.pixel_state.deviceBuffer, buffers.ref_image.deviceBuffer, map_buffer }
+            );
         }
-    );
-
-    bufferMemoryBarrier({
-        { ssim_map.deviceBuffer, COMPUTE_SHADER_WRITE },
-    }, COMPUTE_SHADER_READ);
+        bufferMemoryBarrier({
+            { ssim_map.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ);
+    }
+    PerfTimer::Timer<PerfTimer::_SSIMGrad> gradTimer(this);
     executeCompute(
-        {{w, 16}, {h, 16}},
-        shader_uniforms, 5*sizeof(Uniform32_t),
-        pipeline_ssim_backward,
+        {{gw, 16}, {gh, 16}},
+        shader_uniforms, 6*sizeof(Uniform32_t),
+        ds == 1 ? pipeline_ssim_grad : pipeline_ssim_grad_ds2,
         {
             buffers.pixel_state.deviceBuffer,
             buffers.ref_image.deviceBuffer,
-            ssim_map.deviceBuffer,
-            resizeDeviceBuffer(buffers.v_pixel_state, 4*num_pixels),
+            map_buffer,
+            resizeDeviceBuffer(buffers.v_pixel_state, 4*w*h),
             sparse_active_tiles,
         },
         -1,
-        sparse ? &sparse_args : nullptr
+        sparse_grad ? &sparse_args : nullptr
     );
 }
 

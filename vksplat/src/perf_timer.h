@@ -24,6 +24,8 @@ namespace PerfTimer {
     _(CopyTrainImageToDevice) \
     _(ComputeSSIMGradient) \
     _(SelectSparseTiles) \
+    _(_SSIMStats) \
+    _(_SSIMGrad) \
     _(FusedProjectionBackwardOptimizerStep) \
     _(DefaultPostBackward) \
     _(MCMCPostBackward) \

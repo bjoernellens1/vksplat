@@ -108,7 +108,6 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> n_contributors;  // (H, W, 1)
 
     // rasterization v_outputs
-    Buffer<float> ssim_map;  // (H, W, 3, 4)
     Buffer<float> v_pixel_state;  // (H, W, 4)
     Buffer<uint8_t> ref_image;  // (H, W, 4)
 
