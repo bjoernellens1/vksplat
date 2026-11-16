@@ -352,6 +352,8 @@ void VulkanGSRenderer::executeRasterizeBackward(
         dims = {{(int)uniforms.image_width, TILE_WIDTH}, {(int)uniforms.image_height, TILE_HEIGHT}};
     else
         dims = {{uniforms.grid_width*uniforms.grid_height, 1}};
+    PerfTimer::work_counters.backward_dispatches++;
+    PerfTimer::work_counters.backward_tiles_dispatched += (uint64_t)uniforms.grid_width * uniforms.grid_height;
 
     executeCompute(
         dims,
@@ -560,6 +562,13 @@ void VulkanGSRenderer::executeCalculateIndexBufferOffset(
     }, TRANSFER_READ);
     int num_indices = readElement<int32_t>(buffers.index_buffer_offset.deviceBuffer, num_elements-1);
     buffers.num_indices = (size_t)num_indices;
+    {
+        auto& w = PerfTimer::work_counters;
+        w.forward_passes++;
+        w.tile_intersections_total += (uint64_t)num_indices;
+        w.tile_intersections_last = (uint64_t)num_indices;
+        w.tile_intersections_max = std::max(w.tile_intersections_max, (uint64_t)num_indices);
+    }
     // printf("num_splats=%d num_indices=%d\n", (int)num_elements, (int)num_indices);
 }
 

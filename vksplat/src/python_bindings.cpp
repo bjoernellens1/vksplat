@@ -94,7 +94,24 @@ public:
 
 public:
 
+    // Refuse to run SPIR-V older than its sources (shader_freshness.py sits next to this extension).
+    static void check_shader_freshness(const std::string &spirv_dir) {
+        py::module_ os_path = py::module_::import("os.path");
+        std::string pkg_dir = os_path.attr("dirname")(py::module_::import("vksplat").attr("__file__")).cast<std::string>();
+        std::string script = pkg_dir + "/shader_freshness.py";
+        if (!os_path.attr("isfile")(script).cast<bool>()) {
+            PyErr_WarnEx(PyExc_RuntimeWarning, ("shader freshness check skipped: missing " + script).c_str(), 1);
+            return;
+        }
+        py::module_ util = py::module_::import("importlib.util");
+        py::object spec = util.attr("spec_from_file_location")("vksplat_shader_freshness", script);
+        py::object mod = util.attr("module_from_spec")(spec);
+        spec.attr("loader").attr("exec_module")(mod);
+        mod.attr("check")(spirv_dir);
+    }
+
     void initialize(std::string spirv_dir, int device_id) {
+        check_shader_freshness(spirv_dir);
         buffers.num_splats = 0;
 
         std::vector<std::string> spirv_paths = {
@@ -932,6 +949,10 @@ public:
         return PerfTimer::get_summary();
     }
 
+    std::map<std::string, uint64_t> get_work_counters() {
+        return PerfTimer::get_work_counters();
+    }
+
     std::map<std::string, size_t> get_vram_breakdown() {
         return buffers.getVramBreakdown();
     }
@@ -1015,6 +1036,8 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_vram_usage", &VkSplat::get_vram_usage, "Get VRAM Usage")
         .def("get_peak_vram_usage", &VkSplat::get_peak_vram_usage, "Get peak VRAM Usage")
         .def("get_timing_breakdown", &VkSplat::get_timing_breakdown, "Get timing for each step since start")
+        .def("get_work_counters", &VkSplat::get_work_counters,
+             "Cumulative tile-intersection (num_indices) and backward-dispatch counters since initialize; no extra readback")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file", py::call_guard<py::gil_scoped_release>())
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")

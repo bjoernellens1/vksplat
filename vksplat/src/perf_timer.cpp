@@ -24,12 +24,15 @@ bool hostHold = false;
 std::chrono::time_point<std::chrono::high_resolution_clock> hostStartTime;
 double hostTimeDelta = -1.0;
 
+WorkCounters work_counters;
+
 // reset timing and counts
 void reset() {
     for (int i = 0; i < int(TrainStage::END); i++) {
         stages[i] = {0, 0.0};
     }
     marks.clear();
+    work_counters = {};
 }
 
 void hostTic() {
@@ -140,6 +143,18 @@ std::map<std::string, std::tuple<size_t, double>> get_summary() {
         summary[name] = { stages[i].count, stages[i].total_time };
     }
     return summary;
+}
+
+std::map<std::string, uint64_t> get_work_counters() {
+    const WorkCounters& w = work_counters;
+    return {
+        {"forward_passes", w.forward_passes},
+        {"tile_intersections_total", w.tile_intersections_total},
+        {"tile_intersections_last", w.tile_intersections_last},
+        {"tile_intersections_max", w.tile_intersections_max},
+        {"backward_dispatches", w.backward_dispatches},
+        {"backward_tiles_dispatched", w.backward_tiles_dispatched},
+    };
 }
 
 // template instantiation of timers

@@ -14,6 +14,10 @@ from typing import List, Dict, Optional, Tuple, Literal
 import argparse
 import shutil
 import json
+import re
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "vksplat"))
+import shader_freshness
 
 
 @dataclass
@@ -57,6 +61,7 @@ class ShaderCompiler:
         
         common_paths = [
             Path.home() / ".local/lib/python3.10/site-packages/slangtorch/bin/slangc",
+            *sorted((Path.home() / ".local/opt").glob("slang-*/bin/slangc"), reverse=True),
         ]
         for path in common_paths:
             if path.exists():
@@ -80,6 +85,39 @@ class ShaderCompiler:
                 return path
         
         raise RuntimeError("glslc not found. Please install glslc or specify path with --glslc")
+
+    def _slang_closure(self, names: List[str]) -> List[str]:
+        """Slang files plus everything they transitively #include / import."""
+        seen, todo = [], list(names)
+        while todo:
+            name = todo.pop()
+            if name in seen:
+                continue
+            seen.append(name)
+            text = (self.config.slang_src_path / name).read_text()
+            for inc in re.findall(r'^\s*#include\s+"([^"]+)"', text, re.M):
+                todo.append(inc)
+            for mod in re.findall(r'^\s*import\s+(\w+)\s*;', text, re.M):
+                if (self.config.slang_src_path / f"{mod}.slang").exists():
+                    todo.append(f"{mod}.slang")
+        return sorted(seen)
+
+    def _group_files(self, source_file: str, shader_jobs: List[ShaderJob], deps: List[str]) -> Tuple[List[Path], List[Path]]:
+        """(source paths, generated .spv paths) of one compile group."""
+        if '.' in source_file:
+            sources = [self.config.slang_src_path / n for n in self._slang_closure([source_file] + deps)]
+            outputs = [self.config.generated_dst_path / (j.name + ".spv") for j in shader_jobs]
+        else:
+            group_dir = self.config.shader_dst_path / source_file
+            sources = [group_dir / j.name for j in shader_jobs]
+            outputs = [(group_dir / j.name).with_suffix(".spv") for j in shader_jobs]
+        return sources, outputs
+
+    def write_manifest(self, job_groups) -> None:
+        groups = {src: self._group_files(src, jobs, deps) for src, jobs, deps in job_groups if jobs}
+        manifest = shader_freshness.build_manifest(self.config.shader_dst_path.parent, groups)
+        path = self.config.shader_dst_path / shader_freshness.MANIFEST_NAME
+        path.write_text(json.dumps(manifest, indent=4) + "\n")
 
     def _compute_checksum(self, files: List[Path]) -> str:
         """Compute MD5 checksum of multiple files"""
@@ -170,7 +208,7 @@ class ShaderCompiler:
                 job_name = os.path.join(source_file, job.name + '.' + ext)
                 output = self._compile_shader_glsl(source_file, job, target, ext)
             if output.stdout != "" or output.stderr != "":
-                return False, f"O Compiled {job_name} with warning: {output.stdout} {output.stderr}"
+                print(f"O {job_name} compiled with warning: {output.stdout} {output.stderr}")
             return True, f"✓ Compiled {job_name}"
         except subprocess.CalledProcessError as e:
             return False, f"✗ Failed to compile {job_name}: {e.stderr}"
@@ -304,7 +342,7 @@ class ShaderCompiler:
                 if not shader_jobs:
                     continue
 
-                checksum = self._compute_checksum([source_file] + deps)
+                checksum = self._compute_checksum(self._slang_closure([source_file] + deps) if '.' in source_file else [source_file] + deps)
                 checksum_key = source_file#.rstrip('.slang')
                 
                 if not force and not self._should_compile(checksum_key, checksum):
@@ -325,6 +363,12 @@ class ShaderCompiler:
                 if not success:
                     all_successful = False
 
+        manifest_path = self.config.shader_dst_path / shader_freshness.MANIFEST_NAME
+        if all_successful:
+            self.write_manifest(job_groups)
+        else:
+            manifest_path.unlink(missing_ok=True)
+            print("Manifest removed; fix the errors and rerun with --force.")
         return all_successful
 
 
@@ -338,6 +382,8 @@ def main():
                        help="Destination directory for compiled shaders")
     parser.add_argument("-j", "--jobs", type=int, help="Number of parallel jobs")
     parser.add_argument("--force", action="store_true", help="Force recompilation of all shaders")
+    parser.add_argument("--manifest-only", action="store_true",
+                        help="Rewrite shader/manifest.json from the files on disk without compiling")
     
     args = parser.parse_args()
     
@@ -356,6 +402,9 @@ def main():
     config.glslc_compile_args += additional_args
     
     compiler = ShaderCompiler(config)
+    if args.manifest_only:
+        compiler.write_manifest(compiler._create_shader_jobs())
+        sys.exit(0)
     success = compiler.compile_all(force=args.force)
     
     if success:

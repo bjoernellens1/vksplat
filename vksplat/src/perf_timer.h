@@ -64,5 +64,20 @@ std::vector<std::pair<size_t, double>> update(std::vector<double> times);
 
 std::map<std::string, std::tuple<size_t, double>> get_summary();
 
+// Work counters accumulated from values the host already has (no extra GPU readback).
+// Backward tiles skipped by the sparse_tile_grad_thresh early-exit are decided on the GPU and are
+// not counted: that would need a device atomic plus a new readback.
+struct WorkCounters {
+    uint64_t forward_passes = 0;
+    uint64_t tile_intersections_total = 0;  // sum of num_indices over forward passes
+    uint64_t tile_intersections_last = 0;
+    uint64_t tile_intersections_max = 0;
+    uint64_t backward_dispatches = 0;
+    uint64_t backward_tiles_dispatched = 0;  // grid_width * grid_height per backward dispatch
+};
+extern WorkCounters work_counters;
+
+std::map<std::string, uint64_t> get_work_counters();
+
 
 }  // namespace PerfTimer
