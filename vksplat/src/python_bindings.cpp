@@ -293,6 +293,24 @@ public:
         const auto& gids = trainer.get_splat_group_ids();
         return py::array_t<int32_t>({gids.size()}, {sizeof(int32_t)}, gids.data());
     }
+    // Device-resident structural group state (test/diagnostic readback, one-off copy)
+    py::array_t<int32_t> get_device_group_ids() {
+        return buffer_to_array<int32_t, int32_t>(buffers.group_ids);
+    }
+    py::array_t<uint32_t> get_device_group_state() {
+        return buffer_to_array<uint32_t, uint32_t>(buffers.group_state);
+    }
+    // Allocated capacity in elements of the per-splat parameter buffers (logical count is num_splats)
+    std::map<std::string, size_t> get_splat_capacity() {
+        return {
+            {"xyz_ws", buffers.xyz_ws.deviceBuffer.allocSize / (3 * sizeof(float))},
+            {"rotations", buffers.rotations.deviceBuffer.allocSize / (4 * sizeof(float))},
+            {"group_ids", buffers.group_ids.deviceBuffer.allocSize / sizeof(int32_t)},
+            {"g_rotations", buffers.g_rotations.deviceBuffer.allocSize / (8 * sizeof(float))},
+            {"v_xy_vs", buffers.v_xy_vs.deviceBuffer.allocSize / (2 * sizeof(float))},
+            {"tiles_touched", buffers.tiles_touched.deviceBuffer.allocSize / sizeof(int32_t)},
+        };
+    }
     py::array_t<int32_t> get_splat_entity_ids() {
         const auto& eids = trainer.get_splat_entity_ids();
         return py::array_t<int32_t>({eids.size()}, {sizeof(int32_t)}, eids.data());
@@ -1040,6 +1058,9 @@ PYBIND11_MODULE(vksplat, m) {
              "Cumulative tile-intersection (num_indices) and backward-dispatch counters since initialize; no extra readback")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file", py::call_guard<py::gil_scoped_release>())
+        .def("get_device_group_ids", &VkSplat::get_device_group_ids, "Read the device-resident per-splat group ids")
+        .def("get_device_group_state", &VkSplat::get_device_group_state, "Read the device-resident group state table")
+        .def("get_splat_capacity", &VkSplat::get_splat_capacity, "Allocated capacity (elements) of per-splat buffers")
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
         .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
         .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (1=ACTIVE, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())

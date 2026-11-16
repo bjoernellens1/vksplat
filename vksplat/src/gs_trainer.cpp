@@ -2302,6 +2302,12 @@ void VulkanGSTrainer::retract_group_sparse(
     }, COMPUTE_SHADER_READ_WRITE);
 }
 
+// Reserved-capacity append. The logical splat count (buffers.num_splats, uniforms, dispatch sizes) is
+// separate from the allocated capacity of every per-splat buffer, which grows geometrically (x1.5) and is
+// copied on device only when exceeded. All new-splat attributes go through one persistent host-visible
+// staging buffer and one dedicated command buffer, submitted without a fence wait: queue order plus a
+// trailing memory barrier serialize it before the next train step. Replaced buffers are retired and freed
+// once the append fence has signalled. The SH block layout is written in place (no tail readback).
 size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     VulkanGSPipelineBuffers& buffers,
     const float* new_xyz_norm,
@@ -2316,89 +2322,154 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     if (n_add == 0)
         return buffers.num_splats;
 
+    auto& counters = PerfTimer::work_counters;
+    const uint64_t fence_waits_before = counters.fence_waits_total;
+
     const size_t old_n = buffers.num_splats;
     const size_t new_n = old_n + n_add;
-    const size_t kNumSH = 16;
+    constexpr size_t kShVec4 = 12;  // 16 SH coefficients * 3 channels = 12 float4 per splat
+    constexpr size_t R = SH_REORDER_SIZE;
 
     ensureGroupBuffersOnDevice(buffers, old_n);
 
-    // 1. Resize parameter buffers directly on device (device-to-device copy, no host readback)
-    resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3 * new_n, false);
-    resizeAndCopyDeviceBuffer(buffers.sh_coeffs, kNumSH * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), false);
-    resizeAndCopyDeviceBuffer(buffers.rotations, 4 * new_n, false);
-    resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4 * new_n, false);
-    resizeAndCopyDeviceBuffer(buffers.group_ids, new_n, false);
-
-    // 2. Upload ONLY the k newly appended splats
-    uploadDeviceSlice(buffers.xyz_ws.deviceBuffer, 3 * old_n * sizeof(float), new_xyz_norm, 3 * n_add * sizeof(float));
-    uploadDeviceSlice(buffers.rotations.deviceBuffer, 4 * old_n * sizeof(float), new_rotations, 4 * n_add * sizeof(float));
-
-    std::vector<float> new_so(4 * n_add);
-    for (size_t i = 0; i < n_add; ++i) {
-        new_so[4 * i + 0] = new_scales[3 * i + 0];
-        new_so[4 * i + 1] = new_scales[3 * i + 1];
-        new_so[4 * i + 2] = new_scales[3 * i + 2];
-        new_so[4 * i + 3] = new_opacities[i];
-    }
-    uploadDeviceSlice(buffers.scales_opacs.deviceBuffer, 4 * old_n * sizeof(float), new_so.data(), 4 * n_add * sizeof(float));
-
     std::vector<int32_t> add_gids(n_add, -1);
-    if (new_group_ids != nullptr) {
+    if (new_group_ids != nullptr)
         std::memcpy(add_gids.data(), new_group_ids, n_add * sizeof(int32_t));
-    }
-    uploadDeviceSlice(buffers.group_ids.deviceBuffer, old_n * sizeof(int32_t), add_gids.data(), n_add * sizeof(int32_t));
+    int32_t max_gid = -1;
+    for (int32_t g : add_gids)
+        max_gid = std::max(max_gid, g);
+    const size_t required_groups = (max_gid >= 0) ? (size_t)(max_gid + 1) : 1;
 
-    if (splat_group_ids.size() < old_n) {
-        splat_group_ids.resize(old_n, -1);
+    // SH staging, in float4 units: one contiguous run per (reorder group, coefficient). The last group is
+    // padded with zeros up to R so the unused lanes of the final block stay defined.
+    const size_t g_first = old_n / R, g_last = (new_n - 1) / R;
+    const size_t sh_vec4 = (R > 1 ? ((g_last - g_first + 1) * R - old_n % R) : n_add) * kShVec4;
+
+    const size_t off_xyz = 0;
+    const size_t off_rot = off_xyz + 3 * n_add * sizeof(float);
+    const size_t off_so = off_rot + 4 * n_add * sizeof(float);
+    const size_t off_gid = off_so + 4 * n_add * sizeof(float);
+    const size_t off_sh = off_gid + n_add * sizeof(int32_t);
+    const size_t staging_bytes = off_sh + sh_vec4 * 4 * sizeof(float);
+
+    uint8_t* stage = beginAppendRecording(staging_bytes);
+    const VkCommandBuffer cb = appendCommandBuffer();
+    const VkBuffer src = appendStagingBuffer();
+
+    float* st_xyz = reinterpret_cast<float*>(stage + off_xyz);
+    float* st_rot = reinterpret_cast<float*>(stage + off_rot);
+    float* st_so = reinterpret_cast<float*>(stage + off_so);
+    std::memcpy(st_xyz, new_xyz_norm, 3 * n_add * sizeof(float));
+    std::memcpy(st_rot, new_rotations, 4 * n_add * sizeof(float));
+    for (size_t i = 0; i < n_add; ++i) {
+        st_so[4 * i + 0] = new_scales[3 * i + 0];
+        st_so[4 * i + 1] = new_scales[3 * i + 1];
+        st_so[4 * i + 2] = new_scales[3 * i + 2];
+        st_so[4 * i + 3] = new_opacities[i];
     }
+    std::memcpy(stage + off_gid, add_gids.data(), n_add * sizeof(int32_t));
+
+    struct Vec4 { float v[4]; };
+    Vec4* st_sh = reinterpret_cast<Vec4*>(stage + off_sh);
+    const Vec4* in_sh = reinterpret_cast<const Vec4*>(new_sh_coeffs);
+    std::vector<VkBufferCopy> sh_regions;
+    if (R <= 1) {
+        std::memcpy(st_sh, in_sh, n_add * kShVec4 * sizeof(Vec4));
+        sh_regions.push_back({off_sh, old_n * kShVec4 * sizeof(Vec4), n_add * kShVec4 * sizeof(Vec4)});
+    } else {
+        size_t cursor = 0;  // float4 units inside the SH staging area
+        for (size_t g = g_first; g <= g_last; ++g) {
+            const size_t j_lo = (g == g_first) ? old_n % R : 0;
+            for (size_t k = 0; k < kShVec4; ++k) {
+                for (size_t j = j_lo; j < R; ++j) {
+                    const size_t gi = g * R + j;
+                    if (gi < new_n)
+                        st_sh[cursor + (j - j_lo)] = in_sh[(gi - old_n) * kShVec4 + k];
+                    else
+                        st_sh[cursor + (j - j_lo)] = Vec4{{0.f, 0.f, 0.f, 0.f}};
+                }
+                sh_regions.push_back({
+                    off_sh + cursor * sizeof(Vec4),
+                    ((g * kShVec4 + k) * R + j_lo) * sizeof(Vec4),
+                    (R - j_lo) * sizeof(Vec4)});
+                cursor += R - j_lo;
+            }
+        }
+    }
+
+    bool reallocated = false;
+    auto grow = [&](auto& buf, size_t new_elems, bool zero_new) {
+        using T = typename std::remove_reference_t<decltype(buf)>::value_type;
+        _VulkanBuffer& db = buf.deviceBuffer;
+        const size_t old_bytes = db.size;
+        const size_t new_bytes = new_elems * sizeof(T);
+        if (db.allocSize < new_bytes) {
+            _VulkanBuffer fresh;
+            // first allocation reserves 2x, later growth 1.5x (min 4 KiB so tiny tables do not churn)
+            const size_t grown = db.allocSize == 0 ? 2 * new_bytes : db.allocSize + (db.allocSize >> 1);
+            createBuffer(std::max({new_bytes, grown, (size_t)4096}), fresh);
+            if (db.buffer != VK_NULL_HANDLE && old_bytes > 0) {
+                VkBufferCopy region{0, 0, old_bytes};
+                vkCmdCopyBuffer(cb, db.buffer, fresh.buffer, 1, &region);
+            }
+            if (db.buffer != VK_NULL_HANDLE)
+                retireDeviceBuffer(db);
+            db = fresh;
+            reallocated = true;
+        }
+        db.size = new_bytes;
+        if (zero_new && new_bytes > old_bytes)
+            vkCmdFillBuffer(cb, db.buffer, old_bytes, new_bytes - old_bytes, 0u);
+    };
+    auto upload = [&](Buffer<float>& buf, size_t src_off, size_t dst_byte, size_t bytes) {
+        VkBufferCopy region{src_off, dst_byte, bytes};
+        vkCmdCopyBuffer(cb, src, buf.deviceBuffer.buffer, 1, &region);
+    };
+
+    // parameters (new region fully overwritten below)
+    grow(buffers.xyz_ws, 3 * new_n, false);
+    grow(buffers.sh_coeffs, kShVec4 * 4 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), false);
+    grow(buffers.rotations, 4 * new_n, false);
+    grow(buffers.scales_opacs, 4 * new_n, false);
+    grow(buffers.group_ids, new_n, false);
+    // optimizer moments and densification statistics of existing splats are preserved, new ones start at zero
+    grow(buffers.g_xyz_ws, 2 * 3 * new_n, true);
+    grow(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
+    grow(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
+    grow(buffers.g_rotations, 2 * 4 * new_n, true);
+    grow(buffers.g_scales_opacs, 2 * 4 * new_n, true);
+    grow(buffers.default_grad, 2 * new_n, true);
+    grow(buffers.default_radii, new_n, true);
+
+    // group state: new groups start ACTIVE (1)
+    const size_t old_groups = buffers.group_state.deviceSize();
+    if (old_groups < required_groups) {
+        grow(buffers.group_state, required_groups, false);
+        vkCmdFillBuffer(cb, buffers.group_state.deviceBuffer.buffer, old_groups * sizeof(uint32_t),
+            (required_groups - old_groups) * sizeof(uint32_t), 1u);
+        if (buffers.group_state.size() < required_groups)
+            buffers.group_state.resize(required_groups, 1u);
+    }
+
+    upload(buffers.xyz_ws, off_xyz, 3 * old_n * sizeof(float), 3 * n_add * sizeof(float));
+    upload(buffers.rotations, off_rot, 4 * old_n * sizeof(float), 4 * n_add * sizeof(float));
+    upload(buffers.scales_opacs, off_so, 4 * old_n * sizeof(float), 4 * n_add * sizeof(float));
+    {
+        VkBufferCopy region{off_gid, old_n * sizeof(int32_t), n_add * sizeof(int32_t)};
+        vkCmdCopyBuffer(cb, src, buffers.group_ids.deviceBuffer.buffer, 1, &region);
+    }
+    vkCmdCopyBuffer(cb, src, buffers.sh_coeffs.deviceBuffer.buffer, (uint32_t)sh_regions.size(), sh_regions.data());
+
+    submitAppendRecording();
+
+    if (splat_group_ids.size() < old_n)
+        splat_group_ids.resize(old_n, -1);
     splat_group_ids.resize(new_n, -1);
     std::memcpy(splat_group_ids.data() + old_n, add_gids.data(), n_add * sizeof(int32_t));
-    syncGroupStateSize(buffers, add_gids.data(), n_add);
+    buffers.num_splats = new_n;
 
-    // 3. Reorder & upload SH coefficients for ONLY the new splats (plus partial tail block if old_n % SH_REORDER_SIZE != 0)
-    const size_t tail_count = (SH_REORDER_SIZE > 1) ? (old_n % SH_REORDER_SIZE) : 0;
-    const size_t aligned_old_n = old_n - tail_count;
-    Buffer<float> sh_stage;
-    if (tail_count == 0) {
-        sh_stage.assign(new_sh_coeffs, new_sh_coeffs + kNumSH * 3 * n_add);
-    } else {
-        sh_stage.resize(kNumSH * 3 * SH_REORDER_SIZE);
-        downloadDeviceSlice(
-            buffers.sh_coeffs.deviceBuffer,
-            kNumSH * 3 * aligned_old_n * sizeof(float),
-            sh_stage.data(),
-            kNumSH * 3 * SH_REORDER_SIZE * sizeof(float)
-        );
-        buffers.undoReorderSH(sh_stage, tail_count);
-        sh_stage.resize(kNumSH * 3 * (tail_count + n_add));
-        std::memcpy(
-            sh_stage.data() + kNumSH * 3 * tail_count,
-            new_sh_coeffs,
-            kNumSH * 3 * n_add * sizeof(float)
-        );
-    }
-    buffers.reorderSH(sh_stage);
-    uploadDeviceSlice(
-        buffers.sh_coeffs.deviceBuffer,
-        kNumSH * 3 * aligned_old_n * sizeof(float),
-        sh_stage.data(),
-        sh_stage.byteLength()
-    );
-
-    // 4. Grow Adam optimizer state buffers on device WITHOUT resetting existing splats' moments
-    {
-        DEVICE_GUARD;
-        barrierAllGaussParams(buffers);
-        resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 2 * 3 * new_n, true);
-        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
-        resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
-        resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * new_n, true);
-        resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * new_n, true);
-        resizeAndCopyDeviceBuffer(buffers.default_grad, 2 * new_n, true);
-        resizeAndCopyDeviceBuffer(buffers.default_radii, new_n, true);
-        buffers.num_splats = new_n;
-        barrierAllGaussParams(buffers);
-    }
-
+    if (reallocated)
+        counters.append_reallocs++;
+    counters.append_fence_waits += counters.fence_waits_total - fence_waits_before;
     return buffers.num_splats;
 }

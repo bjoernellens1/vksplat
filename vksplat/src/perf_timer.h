@@ -74,6 +74,12 @@ struct WorkCounters {
     uint64_t tile_intersections_max = 0;
     uint64_t backward_dispatches = 0;
     uint64_t backward_tiles_dispatched = 0;  // grid_width * grid_height per backward dispatch
+    // Reserved-capacity append: growth events of the per-splat buffer set, blocking fence waits inside
+    // append calls, and reallocations of per-step (projection / gradient) buffers.
+    uint64_t append_reallocs = 0;
+    uint64_t append_fence_waits = 0;
+    uint64_t step_buffer_reallocs = 0;
+    uint64_t fence_waits_total = 0;  // every blocking fence wait (any submit path)
 };
 extern WorkCounters work_counters;
 

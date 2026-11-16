@@ -154,6 +154,10 @@ std::map<std::string, uint64_t> get_work_counters() {
         {"tile_intersections_max", w.tile_intersections_max},
         {"backward_dispatches", w.backward_dispatches},
         {"backward_tiles_dispatched", w.backward_tiles_dispatched},
+        {"append_reallocs", w.append_reallocs},
+        {"append_fence_waits", w.append_fence_waits},
+        {"step_buffer_reallocs", w.step_buffer_reallocs},
+        {"fence_waits_total", w.fence_waits_total},
     };
 }
 

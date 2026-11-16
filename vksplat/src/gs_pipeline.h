@@ -34,6 +34,9 @@ public:
     void destroyBuffer(_VulkanBuffer &buffer);
     void resizeDeviceBuffer(_VulkanBuffer& deviceBuffer, size_t new_byte_size, bool no_shrink=true);
     template<typename T> _VulkanBuffer& resizeDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool no_shrink=true);
+    // Grow-only resize with geometric capacity: the logical size becomes new_size, the allocation is
+    // reallocated (contents not preserved) only when it is too small, to max(needed, 1.5 * old).
+    template<typename T> _VulkanBuffer& reserveDeviceBuffer(Buffer<T>& buffer, size_t new_size);
     template<typename T> _VulkanBuffer& clearDeviceBuffer(Buffer<T>& buffer, size_t new_size);
     template<typename T> _VulkanBuffer& resizeAndCopyDeviceBuffer(Buffer<T>& buffer, size_t new_size, bool clear);
     template<typename T> _VulkanBuffer& copyToDevice(Buffer<T>& buffer);
@@ -44,6 +47,16 @@ public:
     template<typename T> void copyFromDeviceToDevice(const Buffer<T>& src, Buffer<T>& dst);
     template<typename T> T readElement(const _VulkanBuffer& buffer, size_t index);
     template<typename T> void dumpRawBytesToFile(Buffer<T>& buffer, std::string filename);
+
+    // Fence-free transfer path used by append: records into a dedicated command buffer and host staging
+    // buffer, and is submitted without waiting. Queue order serializes it before the next submit.
+    // Returns the mapped staging pointer; the previous append is waited on only if still running.
+    uint8_t* beginAppendRecording(size_t staging_bytes);
+    void submitAppendRecording();
+    VkCommandBuffer appendCommandBuffer() const { return append_cb; }
+    VkBuffer appendStagingBuffer() const { return append_stage.buffer; }
+    // Destroys buffers replaced by an append once the GPU is done with them.
+    void retireDeviceBuffer(const _VulkanBuffer& old_buffer) { retired_buffers.push_back(old_buffer); }
 
     void beginCommandBatch();
     void endCommandBatch(bool use_fence = true);
@@ -104,6 +117,19 @@ protected:
     VkCommandPool command_pool;
     VkCommandBuffer command_buffer;
     VkFence fence;
+    VkCommandBuffer append_cb = VK_NULL_HANDLE;
+    VkFence append_fence = VK_NULL_HANDLE;
+    bool append_pending = false;
+    struct _AppendStage {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        uint8_t* mapped = nullptr;
+        size_t allocSize = 0;
+    };
+    _AppendStage append_stage;
+    std::vector<_VulkanBuffer> retired_buffers;
+    void waitAppendFence();
+    void freeAppendStage();
     VkQueryPool timestamp_query_pool;
 
     enum class DeviceVendor {

@@ -1,4 +1,5 @@
 #include "gs_renderer.h"
+#include "perf_timer.h"
 
 
 size_t VulkanGSPipelineBuffers::getTotalAllocSize() {
@@ -165,6 +166,103 @@ void VulkanGSPipeline::createBuffer(size_t size, _VulkanBuffer& buffer) {
 }
 
 
+void VulkanGSPipeline::waitAppendFence() {
+    if (!append_pending)
+        return;
+    if (vkGetFenceStatus(device, append_fence) != VK_SUCCESS) {
+        PerfTimer::work_counters.fence_waits_total++;
+        vkWaitForFences(device, 1, &append_fence, VK_TRUE, UINT64_MAX);
+    }
+    vkResetFences(device, 1, &append_fence);
+    append_pending = false;
+    for (auto& b : retired_buffers)
+        destroyBuffer(b);
+    retired_buffers.clear();
+}
+
+
+void VulkanGSPipeline::freeAppendStage() {
+    if (append_stage.buffer != VK_NULL_HANDLE) {
+        if (append_stage.mapped)
+            vkUnmapMemory(device, append_stage.memory);
+        vkDestroyBuffer(device, append_stage.buffer, nullptr);
+        vkFreeMemory(device, append_stage.memory, nullptr);
+    }
+    append_stage = _AppendStage();
+}
+
+
+uint8_t* VulkanGSPipeline::beginAppendRecording(size_t staging_bytes) {
+    HOST_GUARD;  // the append command buffer must be ordered against any open main batch
+    waitAppendFence();
+
+    if (append_stage.allocSize < staging_bytes) {
+        freeAppendStage();
+        const size_t alloc = std::max<size_t>(2 * staging_bytes, 1 << 20);
+        VkBufferCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        info.size = alloc;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &info, nullptr, &append_stage.buffer) != VK_SUCCESS)
+            _THROW_ERROR("Failed to create append staging buffer");
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(device, append_stage.buffer, &req);
+        uint32_t type = findMemoryType(physical_device, req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (type == UINT32_MAX)
+            _THROW_ERROR("Failed to find append staging memory type");
+        VkMemoryAllocateInfo alloc_info = {};
+        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc_info.allocationSize = req.size;
+        alloc_info.memoryTypeIndex = type;
+        if (vkAllocateMemory(device, &alloc_info, nullptr, &append_stage.memory) != VK_SUCCESS)
+            throw std::runtime_error("Failed to allocate append staging memory");
+        vkBindBufferMemory(device, append_stage.buffer, append_stage.memory, 0);
+        void* ptr = nullptr;
+        vkMapMemory(device, append_stage.memory, 0, VK_WHOLE_SIZE, 0, &ptr);
+        append_stage.mapped = static_cast<uint8_t*>(ptr);
+        append_stage.allocSize = alloc;
+    }
+
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(append_cb, 0);
+    if (vkBeginCommandBuffer(append_cb, &begin_info) != VK_SUCCESS)
+        _THROW_ERROR("Failed to begin append command buffer");
+
+    // order after everything already submitted (training steps, earlier appends)
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(append_cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    return append_stage.mapped;
+}
+
+
+void VulkanGSPipeline::submitAppendRecording() {
+    // make the copies visible to every later command on this queue (next train step)
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(append_cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    if (vkEndCommandBuffer(append_cb) != VK_SUCCESS)
+        _THROW_ERROR("Failed to end append command buffer");
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &append_cb;
+    if (vkQueueSubmit(command_queue, 1, &submit, append_fence) != VK_SUCCESS)
+        _THROW_ERROR("Failed to submit append batch");
+    append_pending = true;
+}
+
+
 void VulkanGSPipeline::destroyBuffer(_VulkanBuffer &buffer) {
     if (commandBatchInProgress)
         _THROW_ERROR("destroyBuffer called when command batch in progress");
@@ -203,12 +301,30 @@ _VulkanBuffer& VulkanGSPipeline::resizeDeviceBuffer(Buffer<T>& buffer, size_t ne
 
 
 template<typename T>
+_VulkanBuffer& VulkanGSPipeline::reserveDeviceBuffer(Buffer<T>& buffer, size_t new_size) {
+    auto& deviceBuffer = buffer.deviceBuffer;
+    const size_t new_byte_size = new_size * sizeof(T);
+    if (deviceBuffer.allocSize < new_byte_size) {
+        HOST_GUARD;
+        const size_t capacity = std::max(new_byte_size, deviceBuffer.allocSize + (deviceBuffer.allocSize >> 1));
+        destroyBuffer(deviceBuffer);
+        try {
+            createBuffer(capacity, deviceBuffer);
+        } catch (const std::runtime_error& err) {
+            _THROW_ERROR(std::string(err.what()) + ". createBuffer failed inside reserveDeviceBuffer");
+        }
+        PerfTimer::work_counters.step_buffer_reallocs++;
+    }
+    deviceBuffer.size = new_byte_size;
+    return deviceBuffer;
+}
+
+
+template<typename T>
 _VulkanBuffer& VulkanGSPipeline::clearDeviceBuffer(Buffer<T>& buffer, size_t new_size) {
     auto& deviceBuffer = buffer.deviceBuffer;
-    if (deviceBuffer.size != new_size * sizeof(T)) {
-        HOST_GUARD;
-        resizeDeviceBuffer(buffer, new_size);
-    }
+    if (deviceBuffer.size != new_size * sizeof(T))
+        reserveDeviceBuffer(buffer, new_size);
 
     {
         DEVICE_GUARD;
@@ -762,6 +878,7 @@ void VulkanGSPipelineBuffers::assignScalesOpacs(
 
 #define _INSTANTIATE_BUFFER(dtype) \
     template _VulkanBuffer& VulkanGSPipeline::resizeDeviceBuffer(Buffer<dtype>& buffer, size_t new_size, bool no_shrink); \
+    template _VulkanBuffer& VulkanGSPipeline::reserveDeviceBuffer(Buffer<dtype>& buffer, size_t new_size); \
     template _VulkanBuffer& VulkanGSPipeline::clearDeviceBuffer(Buffer<dtype>& buffer, size_t new_size); \
     template _VulkanBuffer& VulkanGSPipeline::resizeAndCopyDeviceBuffer(Buffer<dtype>& buffer, size_t new_size, bool clear); \
     template _VulkanBuffer& VulkanGSPipeline::copyToDevice(Buffer<dtype>& buffer); \

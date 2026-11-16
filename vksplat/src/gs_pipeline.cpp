@@ -133,7 +133,20 @@ void VulkanGSPipeline::cleanup() {
 
     if (device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device);
-        
+        append_pending = false;
+        for (auto& b : retired_buffers)
+            destroyBuffer(b);
+        retired_buffers.clear();
+        freeAppendStage();
+        if (append_fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device, append_fence, nullptr);
+            append_fence = VK_NULL_HANDLE;
+        }
+        if (append_cb != VK_NULL_HANDLE) {
+            vkFreeCommandBuffers(device, command_pool, 1, &append_cb);
+            append_cb = VK_NULL_HANDLE;
+        }
+
         for (_ComputePipeline* pipeline : all_compute_pipelines)
             destroyComputePipeline(*pipeline);
         all_compute_pipelines.clear();
@@ -474,6 +487,8 @@ void VulkanGSPipeline::createCommandPool() {
     
     if (vkAllocateCommandBuffers(device, &alloc_info, &command_buffer) != VK_SUCCESS)
         _THROW_ERROR("Failed to allocate command buffer");
+    if (vkAllocateCommandBuffers(device, &alloc_info, &append_cb) != VK_SUCCESS)
+        _THROW_ERROR("Failed to allocate append command buffer");
 }
 
 void VulkanGSPipeline::createFence() {
@@ -484,6 +499,8 @@ void VulkanGSPipeline::createFence() {
     VkResult result = vkCreateFence(device, &fenceInfo, nullptr, &fence);
     if (result != VK_SUCCESS)
         _THROW_ERROR("Failed to create fence");
+    if (vkCreateFence(device, &fenceInfo, nullptr, &append_fence) != VK_SUCCESS)
+        _THROW_ERROR("Failed to create append fence");
 }
 
 void VulkanGSPipeline::createQueryPools() {
@@ -551,6 +568,7 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence) {
     commandBatchInProgress = false;
 
     if (use_fence) {
+        PerfTimer::work_counters.fence_waits_total++;
       #if SSE2_AVAILABLE
       #if ENABLE_ASSERTION
         constexpr unsigned long long kTimeout = 0x100000000ull;

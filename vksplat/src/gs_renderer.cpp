@@ -111,13 +111,13 @@ void VulkanGSRenderer::executeProjectionForward(
             buffers.rotations.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
             // outputs
-            resizeDeviceBuffer(buffers.tiles_touched, alloc_size),
-            resizeDeviceBuffer(buffers.rect_tile_space, alloc_size),
-            resizeDeviceBuffer(buffers.radii, alloc_size),
-            resizeDeviceBuffer(buffers.xy_vs, 2*alloc_size),
-            resizeDeviceBuffer(buffers.depths, alloc_size),
-            resizeDeviceBuffer(buffers.inv_cov_vs_opacity, 4*alloc_size),
-            resizeDeviceBuffer(buffers.rgb, 3*alloc_size),
+            reserveDeviceBuffer(buffers.tiles_touched, alloc_size),
+            reserveDeviceBuffer(buffers.rect_tile_space, alloc_size),
+            reserveDeviceBuffer(buffers.radii, alloc_size),
+            reserveDeviceBuffer(buffers.xy_vs, 2*alloc_size),
+            reserveDeviceBuffer(buffers.depths, alloc_size),
+            reserveDeviceBuffer(buffers.inv_cov_vs_opacity, 4*alloc_size),
+            reserveDeviceBuffer(buffers.rgb, 3*alloc_size),
         }
     );
 
@@ -403,7 +403,7 @@ void VulkanGSRenderer::executeCumsum(
         { input_buffer.deviceBuffer, COMPUTE_SHADER_WRITE },
     }, COMPUTE_SHADER_READ);
 
-    resizeDeviceBuffer(output_buffer, num_elements);
+    reserveDeviceBuffer(output_buffer, num_elements);
 
     if (num_elements <= block_0) {
         executeCompute(
