@@ -23,6 +23,8 @@ namespace PerfTimer {
     _(_Where) \
     _(CopyTrainImageToDevice) \
     _(ComputeSSIMGradient) \
+    _(_SSIMStats) \
+    _(_SSIMGrad) \
     _(FusedProjectionBackwardOptimizerStep) \
     _(DefaultPostBackward) \
     _(MCMCPostBackward) \

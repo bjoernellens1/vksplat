@@ -288,9 +288,10 @@ class ShaderCompiler:
 
         # SSIM
         jobs.append(("ssim.slang", [
-            ShaderJob("ssim_forward", {"EXPORT_MODE": forward}),
-            ShaderJob("ssim_backward", {"EXPORT_MODE": backward}),
-        ], ["config.slang"]))
+            ShaderJob(f"ssim_{stage}{suffix}", {"STAGE": stage_id, "DOWNSAMPLE": downsample})
+            for stage, stage_id in [("stats", 1), ("grad", 2)]
+            for suffix, downsample in [("", 1), ("_ds2", 2)]
+        ], []))
 
         # Prefix Sum
         jobs.append(("cumsum.slang", [

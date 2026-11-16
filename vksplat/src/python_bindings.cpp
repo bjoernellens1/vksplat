@@ -134,8 +134,10 @@ public:
             "radix_sort/upsweep",
             "radix_sort/spine",
             "radix_sort/downsweep",
-            "ssim_forward",
-            "ssim_backward",
+            "ssim_stats",
+            "ssim_grad",
+            "ssim_stats_ds2",
+            "ssim_grad_ds2",
             "fused_projection_backward_optimizer",
             "sum",
             "where",
@@ -231,6 +233,12 @@ public:
         // optimizer
         config.max_steps = train_config["max_steps"].cast<int>();
         config.ssim_lambda = train_config["ssim_lambda"].cast<float>();
+        config.ssim_every = train_config.contains(py::str("ssim_every")) ? train_config["ssim_every"].cast<int>() : 1;
+        config.ssim_downsample = train_config.contains(py::str("ssim_downsample")) ? train_config["ssim_downsample"].cast<int>() : 1;
+        if (config.ssim_every < 1)
+            throw std::runtime_error("ssim_every must be >= 1");
+        if (config.ssim_downsample != 1 && config.ssim_downsample != 2)
+            throw std::runtime_error("ssim_downsample must be 1 or 2");
         config.means_lr = train_config["means_lr"].cast<float>();
         config.means_lr_final = train_config["means_lr_final"].cast<float>();
         config.features_dc_lr = train_config["features_dc_lr"].cast<float>();
@@ -883,11 +891,12 @@ public:
 
     }
 
-    void compute_pixel_loss_grad(size_t train_idx) {
+    void compute_pixel_loss_grad(size_t train_idx, int step) {
+        auto deviceGuard = DeviceGuard(&trainer);
         if (!trainer.gateActive() && buffers.num_indices == 0)
             return;
         try {
-            trainer.executeComputeSSIMGradient(config, uniforms, buffers, train_idx);
+            trainer.executeComputeSSIMGradient(config, uniforms, buffers, train_idx, step);
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeComputeSSIMGradient failed");
         }
@@ -951,7 +960,7 @@ public:
         auto deviceGuard = DeviceGuard(&trainer);
 
         forward();
-        compute_pixel_loss_grad(train_idx);
+        compute_pixel_loss_grad(train_idx, step);
         backward_optimize(step);
 
         // post_backward_step(step+1);
@@ -966,7 +975,7 @@ public:
         const int backward_impl = trainer.sampleBackwardImpl();
         trainer.executeTilesDeferred(uniforms, buffers, trainer.buildGatePlan(uniforms, buffers, backward_impl));
         rasterize_forward();
-        compute_pixel_loss_grad(train_idx);
+        compute_pixel_loss_grad(train_idx, step);
         backward_optimize(step);
         post_backward_step(step);
     }
@@ -1141,7 +1150,8 @@ PYBIND11_MODULE(vksplat, m) {
              "Execute the backward rasterization trainer", py::call_guard<py::gil_scoped_release>())
         .def("forward", &VkSplat::forward, "Execute forward all the way", py::call_guard<py::gil_scoped_release>())
         .def("compute_pixel_loss_grad", &VkSplat::compute_pixel_loss_grad,
-             "Execute compute gradient of pixel loss", py::call_guard<py::gil_scoped_release>())
+             "Execute compute gradient of pixel loss (the SSIM term only on steps with step % ssim_every == 0)",
+             py::arg("train_idx"), py::arg("step") = 0, py::call_guard<py::gil_scoped_release>())
         .def("set_train_image", &VkSplat::set_train_image,
              "Train on the give image for one step.", py::call_guard<py::gil_scoped_release>())
         .def("train_step", &VkSplat::train_step,
@@ -1220,7 +1230,6 @@ PYBIND11_MODULE(vksplat, m) {
         .DEF_BUFFER_ARRAY(tile_ranges, int32_t, 2)
         .DEF_BUFFER_ARRAY(pixel_state, float, self.uniforms.image_width, 4)
         .DEF_BUFFER_ARRAY(n_contributors, int32_t, self.uniforms.image_width, 1)
-        .DEF_BUFFER_ARRAY(ssim_map, float, self.uniforms.image_width, 12)
         .DEF_BUFFER_ARRAY(v_pixel_state, float, self.uniforms.image_width, 4)
         .DEF_BUFFER_ARRAY(v_xy_vs, float, 2)
         .DEF_BUFFER_ARRAY(v_depths, float, 1)

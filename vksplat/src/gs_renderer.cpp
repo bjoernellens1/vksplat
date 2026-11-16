@@ -35,7 +35,7 @@ VulkanGSPipeline::DeviceRequirement VulkanGSRenderer::getDeviceRequirement() {
         // uint32_t raster_backward_2 = TILE_SIZE*(1+2+4+4+6+2*8+4)*4;  // tensor 0 8 0
         // uint32_t raster_backward_3 = TILE_SIZE*(1+2+4+4+6+2*8+4+6)*4;  // tensor 0 8 8
         // uint32_t raster_backward_4 = TILE_SIZE*(1+2+4+4+2*16+4)*4;  // tensor 1 16 0
-        uint32_t ssim = (26*26*(2+3)+TILE_HEIGHT*TILE_WIDTH*(5+3))*4;
+        uint32_t ssim = (26*27*4 + 26*17*4)*4;  // tiles of the SSIM stages (stats: 26*27*2 + 2 + 26*17*4 floats)
         uint32_t radix_sort_rts = 4096*sizeof(sortingKey_t)+256*4;
         return std::max({
             raster_backward_0, raster_backward_1,

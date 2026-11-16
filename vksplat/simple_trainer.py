@@ -64,6 +64,8 @@ class TrainerConfig:
     # optimizer
     max_steps: int = 30000  # used for lr scheduling, not the same as train_steps
     ssim_lambda: float = 0.2  # 0.2 in most works, increase for better visual quality (SSIM/LPIPS) but potentially worse PSNR
+    ssim_every: int = 1  # SSIM term only on steps with step % ssim_every == 0 (L1 only otherwise)
+    ssim_downsample: int = 1  # 2: SSIM on the 2x2 box-averaged images
     means_lr: float = 1.6e-4  # adjust for large scenes
     means_lr_final: float = 1.6e-6  # adjust for large scenes
     features_dc_lr: float = 0.0025

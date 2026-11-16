@@ -1,17 +1,27 @@
-// Based on https://github.com/MrNeRF/optimized-fused-ssim/blob/main/ssim.cu
+// L1 + SSIM pixel-loss gradient in two dispatches.
+//
+//   STAGE 1 (ssim_stats): per colour channel, Gaussian statistics of (render x, ground truth y) -> the three
+//       partial derivatives of the SSIM map, (dM/dmu1, dM/dsigma1^2, dM/dsigma12), written as planar fp32
+//       maps for the interior [5, size - 5) of the SSIM grid (9 floats per grid pixel).
+//   STAGE 2 (ssim_grad): Gaussian blur of the three maps (the transposed filter), the chain rule
+//       dSSIM/dx = blur(dmu1) + 2 x blur(dsigma1^2) + y blur(dsigma12), the L1 gradient, the ReLU of the
+//       render, and the write of dL/dpixel. With useSsim = 0 only the L1 gradient is written (stage 1 is
+//       then not dispatched).
+//
+// Both stages use register-blocked separable FIRs on a 16x16 tile with LDS tiles of at most 18 KB; the map is
+// the only global-memory intermediate (the former pair wrote 12 floats per pixel and read it with float4s).
+// The SSIM value itself is not needed by training and is not computed.
+//
+// DOWNSAMPLE = 2 (the *_ds2 variants) evaluates SSIM on the 2x2 box average of the (alpha-premultiplied)
+// images; every full-resolution pixel of a 2x2 block then receives a quarter of the gradient of its grid pixel
+// (the weight is folded into gradWeightSSIM by the host).
 
-#include "config.slang"
-
-#ifndef EXPORT_MODE
-#define EXPORT_MODE 0
+#ifndef STAGE
+#define STAGE 1
 #endif
-
-#if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
-#define ssimForward main
-#elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
-#define ssimBackward main
+#ifndef DOWNSAMPLE
+#define DOWNSAMPLE 1
 #endif
-
 
 static const float GAUSS_COEFFS[6] = {
     0.001028380123898387f,
@@ -21,389 +31,269 @@ static const float GAUSS_COEFFS[6] = {
     0.21300552785396576f,
     0.26601171493530273f
 };
+static const float W11[11] = {
+    GAUSS_COEFFS[0], GAUSS_COEFFS[1], GAUSS_COEFFS[2], GAUSS_COEFFS[3], GAUSS_COEFFS[4], GAUSS_COEFFS[5],
+    GAUSS_COEFFS[4], GAUSS_COEFFS[3], GAUSS_COEFFS[2], GAUSS_COEFFS[1], GAUSS_COEFFS[0]
+};
 
-static const uint BLOCK_X = 16;
-static const uint BLOCK_Y = 16;
+static const uint BLOCK = 16;
 static const uint HALO = 5;
-static const uint SHARED_X = BLOCK_X + 2 * HALO;
-static const uint SHARED_Y = BLOCK_Y + 2 * HALO;
-static const uint CONV_X = BLOCK_X;
-static const uint CONV_Y = SHARED_Y;
+static const uint TILE = BLOCK + 2 * HALO;  // 26: input tile of stage 1, map tile of stage 2
+static const uint NUM_THREADS = BLOCK * BLOCK;
+static const uint ds = DOWNSAMPLE;  // SSIM grid = 1/ds of the image
+// Odd row strides keep the strided LDS accesses of a wave conflict-free.
+static const uint IMG_STRIDE = TILE + 1;
+static const uint STAT_STRIDE = BLOCK + 1;
 
-static const float C1 = 0.01*0.01;
-static const float C2 = 0.03*0.03;
-static const uint numChannels = 3u;
+static const float C1 = 0.01 * 0.01;
+static const float C2 = 0.03 * 0.03;
 
-
-// Input/Output buffer declarations
-layout(binding=0) StructuredBuffer<float4> img1Buffer;
-layout(binding=1) StructuredBuffer<uint32_t> img2Buffer;
-layout(binding=2) RWStructuredBuffer<float4> ssimMapBuffer;
-layout(binding=3) RWStructuredBuffer<float4> dLdimg1Buffer;
-
-
-// forward
-groupshared float sTile[SHARED_Y][SHARED_X][2]; // [img1, img2]
-groupshared float xconv[CONV_Y][CONV_X][5]; // 5 values
-// backward
-groupshared float sData[3][SHARED_Y][SHARED_X]; // [dmu1, dsigma1sq, dsigma12]
-groupshared float sScratch[CONV_Y][CONV_X][3]; // 3 values
-
-
-// Uniform parameters
 struct Uniforms {
     uint imageWidth;
     uint imageHeight;
     float gradWeightL1;
-    float gradWeightSSIM;
+    float gradWeightSSIM;  // includes 1 / downsample^2
+    uint useSsim;
 }
 
-
-// Utility function to safely fetch pixel values with zero padding
-[ForceInline]
-float3 getPixelValue(StructuredBuffer<float4> buffer, int x, int y, int w, int h) {
-    if (x < 0 || x >= w || y < 0 || y >= h)
-        return float3(0, 0, 0);
-    int idx = y * w + x;
-    float4 val = buffer[idx];
-    return max(float3(val.rgb), float3(0, 0, 0));
+// Alpha-premultiplied (render, ground truth) of one full-resolution pixel; zero outside the image.
+float2x3 fetchPixel(StructuredBuffer<float4> img1, StructuredBuffer<uint32_t> img2, int x, int y, uint w, uint h) {
+    if (x < 0 || y < 0 || x >= int(w) || y >= int(h))
+        return float2x3(0.0f);
+    uint idx = uint(y) * w + uint(x);
+    float3 v1 = max(img1[idx].rgb, float3(0.0f));
+    uint32_t val = img2[idx];
+    float alpha = float(val >> 24) / 255.0f;
+    float3 v2 = float3(val & 255, (val >> 8) & 255, (val >> 16) & 255) / 255.0f;
+    return float2x3(v1 * alpha, v2 * alpha);
 }
 
-[ForceInline]
-float3 getPixelValue(StructuredBuffer<half4> buffer, int x, int y, int w, int h) {
-    if (x < 0 || x >= w || y < 0 || y >= h)
-        return float3(0, 0, 0);
-    int idx = y * w + x;
-    half4 val = buffer[idx];
-    return max(float3(val.rgb), float3(0, 0, 0));
-}
+#if STAGE == 1
 
-[ForceInline]
-float3 getPixelValue(StructuredBuffer<uint32_t> buffer, int x, int y, int w, int h, out float alpha) {
-    if (x < 0 || x >= w || y < 0 || y >= h) {
-        alpha = float(0);
-        return float3(0, 0, 0);
-    }
-    int idx = y * w + x;
-    uint32_t val = buffer[idx];
-    alpha = float(val >> 24) / float(255);
-    return float3(val & 255, (val >> 8) & 255, (val >> 16) & 255) / float(255);
-}
+layout(binding=0) StructuredBuffer<float4> img1Buffer;    // render (pixel_state), RGB + alpha
+layout(binding=1) StructuredBuffer<uint32_t> img2Buffer;  // ground truth, RGBA8
+layout(binding=2) RWStructuredBuffer<float> mapBuffer;    // [channel][grid pixel][3 maps]
 
+groupshared float2 sImg[TILE * IMG_STRIDE + 2];         // (x, y) of the channel
+groupshared float4 sStat[TILE * STAT_STRIDE];           // horizontally filtered (x, y, x^2 + y^2, x y), [TILE][BLOCK]
 
-// Fully-fused gradient computation (single pass, constant input gradient)
-[numthreads(BLOCK_X, BLOCK_Y, 1)]
-void ssimForward(
-    uint3 dispatchThreadID : SV_DispatchThreadID,
+[numthreads(BLOCK, BLOCK, 1)]
+void main(
     uint3 groupThreadID : SV_GroupThreadID,
     uint3 groupID : SV_GroupID,
     uniform Uniforms uniforms
 ) {
-    const uint imageWidth = uniforms.imageWidth;
-    const uint imageHeight = uniforms.imageHeight;
+    const uint w = uniforms.imageWidth;
+    const uint h = uniforms.imageHeight;
+    const int gridW = int(w / ds);
+    const int gridH = int(h / ds);
+    const int originX = int(groupID.x * BLOCK);
+    const int originY = int(groupID.y * BLOCK);
+    const uint tid = groupThreadID.y * BLOCK + groupThreadID.x;
 
-    uint pixX = dispatchThreadID.x;
-    uint pixY = dispatchThreadID.y;
-    uint pixId = pixY * imageWidth + pixX;
-    const uint numPixels = imageWidth * imageHeight;
-
-    const uint tileSize = SHARED_Y * SHARED_X;
-    const uint threads = BLOCK_X * BLOCK_Y;
-    const uint tileStartY = groupID.y * BLOCK_Y;
-    const uint tileStartX = groupID.x * BLOCK_X;
-    const uint baseTid = groupThreadID.y * BLOCK_X + groupThreadID.x;
-
-    // Preload 3-channel halo tile from global memory once per workgroup (eliminates 2/3 of global reads)
+    // Input tile of the grid (alpha-premultiplied, ds x ds box average), held across the channel loop.
     float3 pre1[3];
     float3 pre2[3];
     [ForceUnroll]
     for (uint s = 0; s < 3; ++s) {
-        uint tid = s * threads + baseTid;
-        if (tid < tileSize) {
-            uint localY = tid / SHARED_X;
-            uint localX = tid % SHARED_X;
-            int gy = int(tileStartY + localY) - int(HALO);
-            int gx = int(tileStartX + localX) - int(HALO);
-            float alpha;
-            float3 v1 = getPixelValue(img1Buffer, gx, gy, imageWidth, imageHeight);
-            float3 v2 = getPixelValue(img2Buffer, gx, gy, imageWidth, imageHeight, alpha);
-            pre1[s] = v1 * alpha;
-            pre2[s] = v2 * alpha;
-        } else {
-            pre1[s] = float3(0.0f);
-            pre2[s] = float3(0.0f);
+        uint i = s * NUM_THREADS + tid;
+        float3 a1 = float3(0.0f), a2 = float3(0.0f);
+        if (i < TILE * TILE) {
+            int gx = originX + int(i % TILE) - int(HALO);
+            int gy = originY + int(i / TILE) - int(HALO);
+            if (gx >= 0 && gy >= 0 && gx < gridW && gy < gridH) {
+                for (uint dy = 0; dy < ds; ++dy)
+                    for (uint dx = 0; dx < ds; ++dx) {
+                        float2x3 p = fetchPixel(img1Buffer, img2Buffer, gx * int(ds) + int(dx), gy * int(ds) + int(dy), w, h);
+                        a1 += p[0];
+                        a2 += p[1];
+                    }
+                a1 *= 1.0f / float(ds * ds);
+                a2 *= 1.0f / float(ds * ds);
+            }
         }
+        pre1[s] = a1;
+        pre2[s] = a2;
     }
 
-    for (uint ci = 0; ci < numChannels; ++ci)
-    {
+    [ForceUnroll]
+    for (uint ci = 0; ci < 3; ++ci) {
         [ForceUnroll]
         for (uint s = 0; s < 3; ++s) {
-            uint tid = s * threads + baseTid;
-            if (tid < tileSize) {
-                uint localY = tid / SHARED_X;
-                uint localX = tid % SHARED_X;
-                sTile[localY][localX][0] = pre1[s][ci];
-                sTile[localY][localX][1] = pre2[s][ci];
-            }
+            uint i = s * NUM_THREADS + tid;
+            if (i < TILE * TILE)
+                sImg[(i / TILE) * IMG_STRIDE + i % TILE] = float2(pre1[s][ci], pre2[s][ci]);
         }
-        
         GroupMemoryBarrierWithGroupSync();
-        
-        /* Forward pass: horizontal convolution */
 
-        uint ly = groupThreadID.y;
-        uint lx = groupThreadID.x + HALO;
-        
-        float sumX = 0.0f, sumX2 = 0.0f, sumY = 0.0f, sumY2 = 0.0f, sumXY = 0.0f;
-        
-        [ForceUnroll]
-        for (int d = 1; d <= int(HALO); ++d) {
-            float w = GAUSS_COEFFS[HALO - d];
-            float xLeft = sTile[ly][lx - d][0];
-            float yLeft = sTile[ly][lx - d][1];
-            float xRight = sTile[ly][lx + d][0];
-            float yRight = sTile[ly][lx + d][1];
-            
-            sumX += float((xLeft + xRight) * w);
-            sumX2 += float((xLeft * xLeft + xRight * xRight) * w);
-            sumY += float((yLeft + yRight) * w);
-            sumY2 += float((yLeft * yLeft + yRight * yRight) * w);
-            sumXY += float((xLeft * yLeft + xRight * yRight) * w);
-        }
-        
-        float centerX = sTile[ly][lx][0];
-        float centerY = sTile[ly][lx][1];
-        float wc = GAUSS_COEFFS[HALO];
-        sumX += float(centerX * wc);
-        sumX2 += float(centerX * centerX * wc);
-        sumY += float(centerY * wc);
-        sumY2 += float(centerY * centerY * wc);
-        sumXY += float(centerX * centerY * wc);
-        
-        xconv[ly][groupThreadID.x][0] = float(sumX);
-        xconv[ly][groupThreadID.x][1] = float(sumX2);
-        xconv[ly][groupThreadID.x][2] = float(sumY);
-        xconv[ly][groupThreadID.x][3] = float(sumY2);
-        xconv[ly][groupThreadID.x][4] = float(sumXY);
-        
-        // Handle second row in same subgroup without redundant intermediate barrier
-        int ly2 = ly + BLOCK_Y;
-        if (ly2 < CONV_Y) {
-            sumX = 0.f; sumX2 = 0.f; sumY = 0.f; sumY2 = 0.f; sumXY  = 0.f;
-
+        // Horizontal pass: 4 blocks of 4 columns x 26 rows, 14 input columns per block.
+        if (tid < 4 * TILE) {
+            uint row = tid % TILE;
+            uint col0 = (tid / TILE) * 4;
+            float4 q[14];
             [ForceUnroll]
-            for (int d = 1; d <= int(HALO); ++d) {
-                float w = GAUSS_COEFFS[HALO-d];
-                float xLeft  = sTile[ly2][lx-d][0];
-                float yLeft  = sTile[ly2][lx-d][1];
-                float xRight = sTile[ly2][lx+d][0];
-                float yRight = sTile[ly2][lx+d][1];
-
-                sumX += float((xLeft + xRight) * w);
-                sumX2 += float((xLeft * xLeft + xRight * xRight) * w);
-                sumY += float((yLeft + yRight) * w);
-                sumY2 += float((yLeft * yLeft + yRight * yRight) * w);
-                sumXY += float((xLeft * yLeft + xRight * yRight) * w);
+            for (uint k = 0; k < 14; ++k) {
+                float2 p = sImg[row * IMG_STRIDE + col0 + k];
+                q[k] = float4(p.x, p.y, p.x * p.x + p.y * p.y, p.x * p.y);
             }
-        
-            float centerX = sTile[ly2][lx][0];
-            float centerY = sTile[ly2][lx][1];
-            float wc = GAUSS_COEFFS[HALO];
-            sumX += float(centerX * wc);
-            sumX2 += float(centerX * centerX * wc);
-            sumY += float(centerY * wc);
-            sumY2 += float(centerY * centerY * wc);
-            sumXY += float(centerX * centerY * wc);
-            
-            xconv[ly2][groupThreadID.x][0] = float(sumX);
-            xconv[ly2][groupThreadID.x][1] = float(sumX2);
-            xconv[ly2][groupThreadID.x][2] = float(sumY);
-            xconv[ly2][groupThreadID.x][3] = float(sumY2);
-            xconv[ly2][groupThreadID.x][4] = float(sumXY);
+            [ForceUnroll]
+            for (uint j = 0; j < 4; ++j) {
+                float4 acc = float4(0.0f);
+                [ForceUnroll]
+                for (uint k = 0; k < 11; ++k)
+                    acc += q[j + k] * W11[k];
+                sStat[row * STAT_STRIDE + col0 + j] = acc;
+            }
         }
         GroupMemoryBarrierWithGroupSync();
 
-        /* Forward pass: vertical convolution and derivative computation */
-
-        ly = groupThreadID.y + HALO;
-        lx = groupThreadID.x;
-        
-        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f, out4 = 0.0f;
-        
-        [ForceUnroll]
-        for (int d = 1; d <= int(HALO); ++d) {
-            float w = GAUSS_COEFFS[HALO - d];
-            out0 += (xconv[ly-d][lx][0] + xconv[ly+d][lx][0]) * w;
-            out1 += (xconv[ly-d][lx][1] + xconv[ly+d][lx][1]) * w;
-            out2 += (xconv[ly-d][lx][2] + xconv[ly+d][lx][2]) * w;
-            out3 += (xconv[ly-d][lx][3] + xconv[ly+d][lx][3]) * w;
-            out4 += (xconv[ly-d][lx][4] + xconv[ly+d][lx][4]) * w;
+        // Vertical pass and SSIM partial derivatives: 8 blocks of 2 rows x 16 columns.
+        if (tid < 8 * BLOCK) {
+            uint col = tid % BLOCK;
+            uint row0 = (tid / BLOCK) * 2;
+            float4 q[12];
+            [ForceUnroll]
+            for (uint k = 0; k < 12; ++k)
+                q[k] = sStat[(row0 + k) * STAT_STRIDE + col];
+            [ForceUnroll]
+            for (uint j = 0; j < 2; ++j) {
+                int gx = originX + int(col);
+                int gy = originY + int(row0 + j);
+                if (gx >= int(HALO) && gx < gridW - int(HALO) && gy >= int(HALO) && gy < gridH - int(HALO)) {
+                    float4 acc = float4(0.0f);
+                    [ForceUnroll]
+                    for (uint k = 0; k < 11; ++k)
+                        acc += q[j + k] * W11[k];
+                    float mu1 = acc.x;
+                    float mu2 = acc.y;
+                    float mu1Sq = mu1 * mu1;
+                    float mu2Sq = mu2 * mu2;
+                    float A = mu1Sq + mu2Sq + C1;
+                    float B = acc.z - mu1Sq - mu2Sq + C2;  // sigma1^2 + sigma2^2 + C2
+                    float C_ = 2.0f * mu1 * mu2 + C1;
+                    float D_ = 2.0f * (acc.w - mu1 * mu2) + C2;
+                    float invA = 1.0f / A;
+                    float invB = 1.0f / B;
+                    float invAB = invA * invB;
+                    uint base = 3u * (ci * uint(gridW * gridH) + uint(gy * gridW + gx));
+                    mapBuffer[base] = 2.0f * invAB * (mu2 * (D_ - C_) + C_ * D_ * mu1 * (invB - invA));
+                    mapBuffer[base + 1u] = -C_ * D_ * invAB * invB;
+                    mapBuffer[base + 2u] = 2.0f * C_ * invAB;
+                }
+            }
         }
-        
-        float wC = GAUSS_COEFFS[HALO];
-        out0 += xconv[ly][lx][0] * wC;
-        out1 += xconv[ly][lx][1] * wC;
-        out2 += xconv[ly][lx][2] * wC;
-        out3 += xconv[ly][lx][3] * wC;
-        out4 += xconv[ly][lx][4] * wC;
-        
-        // Compute partial derivatives
-        float outSSIM = 0.0;
-        float dMdmu1 = 0.0;
-        float dMdsigma1Sq = 0.0;
-        float dMdsigma12 = 0.0;
-        if (pixX < imageWidth && pixY < imageHeight) {
-            float mu1 = out0;
-            float mu2 = out2;
-            float mu1Sq = mu1 * mu1;
-            float mu2Sq = mu2 * mu2;
-            float sigma1Sq = out1 - mu1Sq;
-            float sigma2Sq = out3 - mu2Sq;
-            float sigma12 = out4 - mu1 * mu2;
-            
-            float A = mu1Sq + mu2Sq + C1;
-            float B = sigma1Sq + sigma2Sq + C2;
-            float C_ = 2.0f * mu1 * mu2 + C1;
-            float D_ = 2.0f * sigma12 + C2;
-
-            outSSIM = (C_ * D_) / (A * B);
-            
-            dMdmu1 = (mu2 * 2.0f * D_) / (A * B) - (mu2 * 2.0f * C_) / (A * B) -
-                        (mu1 * 2.0f * C_ * D_) / (A * A * B) + (mu1 * 2.0f * C_ * D_) / (A * B * B);
-            dMdsigma1Sq = (-C_ * D_) / (A * B * B);
-            dMdsigma12 = (2.0f * C_) / (A * B);
-
-            ssimMapBuffer[ci * numPixels + pixId] = float4(
-                outSSIM, dMdmu1, dMdsigma1Sq, dMdsigma12
-            );
-        }
-
     }
 }
 
+#else  // STAGE == 2
 
-// Backward gradient computation
-[numthreads(BLOCK_X, BLOCK_Y, 1)]
-void ssimBackward(
-    uint3 dispatchThreadID : SV_DispatchThreadID,
+layout(binding=0) StructuredBuffer<float4> img1Buffer;
+layout(binding=1) StructuredBuffer<uint32_t> img2Buffer;
+layout(binding=2) StructuredBuffer<float> mapBuffer;
+layout(binding=3) RWStructuredBuffer<float4> dLdimg1Buffer;
+
+groupshared float4 sMap[TILE * IMG_STRIDE];        // (dmu1, dsigma1^2, dsigma12), [TILE][TILE]
+groupshared float4 sRow[TILE * STAT_STRIDE];       // horizontally filtered maps, [TILE][BLOCK]
+
+[numthreads(BLOCK, BLOCK, 1)]
+void main(
     uint3 groupThreadID : SV_GroupThreadID,
     uint3 groupID : SV_GroupID,
     uniform Uniforms uniforms
 ) {
-    const uint imageWidth = uniforms.imageWidth;
-    const uint imageHeight = uniforms.imageHeight;
-    const float gradWeightL1 = uniforms.gradWeightL1;
-    const float gradWeightSSIM = uniforms.gradWeightSSIM;
+    const uint w = uniforms.imageWidth;
+    const uint h = uniforms.imageHeight;
+    const int gridW = int(w / ds);
+    const int gridH = int(h / ds);
+    const uint gridPixels = uint(gridW * gridH);
+    const int originX = int(groupID.x * BLOCK);
+    const int originY = int(groupID.y * BLOCK);
+    const uint tx = groupThreadID.x;
+    const uint ty = groupThreadID.y;
+    const uint tid = ty * BLOCK + tx;
+    const bool useSsim = uniforms.useSsim != 0;
 
-    uint pixX = dispatchThreadID.x;
-    uint pixY = dispatchThreadID.y;
-    uint pixId = pixY * imageWidth + pixX;
-    const uint numPixels = imageWidth * imageHeight;
-
-    const uint tileSize = SHARED_Y * SHARED_X;
-    const uint totalThreads = BLOCK_X * BLOCK_Y;
-    const uint startY = groupID.y * BLOCK_Y;
-    const uint startX = groupID.x * BLOCK_X;
-    const uint tid = groupThreadID.y * BLOCK_X + groupThreadID.x;
-
-    float3 p1_rgb = float3(0.0f);
-    float3 p2_rgb = float3(0.0f);
-    if (pixX < imageWidth && pixY < imageHeight) {
-        float alpha;
-        p1_rgb = getPixelValue(img1Buffer, int(pixX), int(pixY), imageWidth, imageHeight);
-        p2_rgb = getPixelValue(img2Buffer, int(pixX), int(pixY), imageWidth, imageHeight, alpha);
-        p1_rgb *= alpha;
-        p2_rgb *= alpha;
+    // The full-resolution pixels of this thread's grid pixel (ds x ds of them) and their box average.
+    float3 own1[ds * ds];
+    float3 own2[ds * ds];
+    float3 avg1 = float3(0.0f);
+    float3 avg2 = float3(0.0f);
+    [ForceUnroll]
+    for (uint s = 0; s < ds * ds; ++s) {
+        float2x3 p = fetchPixel(img1Buffer, img2Buffer, (originX + int(tx)) * int(ds) + int(s % ds),
+                                (originY + int(ty)) * int(ds) + int(s / ds), w, h);
+        own1[s] = p[0];
+        own2[s] = p[1];
+        avg1 += p[0];
+        avg2 += p[1];
     }
-    float3 dLdpix_rgb = float3(0.0f);
+    avg1 *= 1.0f / float(ds * ds);
+    avg2 *= 1.0f / float(ds * ds);
 
-    for (uint ci = 0; ci < numChannels; ++ci) {
+    float3 gradSsim = float3(0.0f);
+
+    if (useSsim) {
         [ForceUnroll]
-        for (uint s = 0; s < 3; ++s) {
-            uint idx = s * totalThreads + tid;
-            if (idx < tileSize) {
-                uint row = idx / SHARED_X;
-                uint col = idx % SHARED_X;
-                int gy = int(startY + row) - int(HALO);
-                int gx = int(startX + col) - int(HALO);
-                
-                float4 forwardReturns =
-                    (gx >= int(HALO) && gx < int(imageWidth-HALO) && gy >= int(HALO) && gy < int(imageHeight-HALO)) ?
-                    ssimMapBuffer[ci * numPixels + (gy * imageWidth + gx)] : float4(0,0,0,0);
-                
-                sData[0][row][col] = forwardReturns.y;
-                sData[1][row][col] = forwardReturns.z;
-                sData[2][row][col] = forwardReturns.w;
-            }
-        }
-        
-        GroupMemoryBarrierWithGroupSync();
-        
-        // Horizontal pass
-        uint ly = groupThreadID.y;
-        uint lx = groupThreadID.x + HALO;
-        
-        [ForceUnroll]
-        for (uint pass = 0; pass < 2; ++pass) {
-            uint yy = ly + pass * BLOCK_Y;
-            if (yy < CONV_Y) {
-                float accum0 = 0.0f, accum1 = 0.0f, accum2 = 0.0f;
-                
-                [ForceUnroll]
-                for (int d = 1; d <= int(HALO); ++d) {
-                    float w = GAUSS_COEFFS[HALO - d];
-                    accum0 += float((sData[0][yy][lx - d] + sData[0][yy][lx + d]) * w);
-                    accum1 += float((sData[1][yy][lx - d] + sData[1][yy][lx + d]) * w);
-                    accum2 += float((sData[2][yy][lx - d] + sData[2][yy][lx + d]) * w);
-                }
-                
-                float wc = GAUSS_COEFFS[HALO];
-                accum0 += float(sData[0][yy][lx] * wc);
-                accum1 += float(sData[1][yy][lx] * wc);
-                accum2 += float(sData[2][yy][lx] * wc);
-                
-                sScratch[yy][groupThreadID.x][0] = accum0;
-                sScratch[yy][groupThreadID.x][1] = accum1;
-                sScratch[yy][groupThreadID.x][2] = accum2;
-            }
-        }
-        
-        GroupMemoryBarrierWithGroupSync();
-        
-        // Vertical pass and finalize
-        if (pixX < imageWidth && pixY < imageHeight) {
-            ly = groupThreadID.y + HALO;
-            lx = groupThreadID.x;
-            
-            float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f;
-            
+        for (uint ci = 0; ci < 3; ++ci) {
+            // Map tile with a 5-pixel halo; zero outside the interior [5, size - 5).
             [ForceUnroll]
-            for (int d = 1; d <= int(HALO); ++d) {
-                float w = GAUSS_COEFFS[HALO - d];
-                sum0 += (sScratch[ly - d][lx][0] + sScratch[ly + d][lx][0]) * w;
-                sum1 += (sScratch[ly - d][lx][1] + sScratch[ly + d][lx][1]) * w;
-                sum2 += (sScratch[ly - d][lx][2] + sScratch[ly + d][lx][2]) * w;
+            for (uint s = 0; s < 3; ++s) {
+                uint i = s * NUM_THREADS + tid;
+                if (i < TILE * TILE) {
+                    int gx = originX + int(i % TILE) - int(HALO);
+                    int gy = originY + int(i / TILE) - int(HALO);
+                    float4 d = float4(0.0f);
+                    if (gx >= int(HALO) && gx < gridW - int(HALO) && gy >= int(HALO) && gy < gridH - int(HALO)) {
+                        uint base = 3u * (ci * gridPixels + uint(gy * gridW + gx));
+                        d = float4(mapBuffer[base], mapBuffer[base + 1u], mapBuffer[base + 2u], 0.0f);
+                    }
+                    sMap[(i / TILE) * IMG_STRIDE + i % TILE] = d;
+                }
             }
-            
-            float wc = GAUSS_COEFFS[HALO];
-            sum0 += sScratch[ly][lx][0] * wc;
-            sum1 += sScratch[ly][lx][1] * wc;
-            sum2 += sScratch[ly][lx][2] * wc;
-            
-            float p1 = p1_rgb[ci];
-            float p2 = p2_rgb[ci];
-            float g_l1 = sign(p1 - p2) * gradWeightL1;
-            float g_ssim = (sum0 + (2.0f * p1) * sum1 + p2 * sum2) * gradWeightSSIM;
-            float clampDerivative = (p1 > 0.0f) ? 1.0f : 0.0f;
-            dLdpix_rgb[ci] = (g_l1 + g_ssim) * clampDerivative;
-        }
-        
-        if (ci + 1 < numChannels)
             GroupMemoryBarrierWithGroupSync();
+
+            // Horizontal pass: 8 blocks of 2 columns x 26 rows.
+            if (tid < (BLOCK / 2) * TILE) {
+                uint row = tid % TILE;
+                uint col0 = (tid / TILE) * 2;
+                float3 q[12];
+                [ForceUnroll]
+                for (uint k = 0; k < 12; ++k)
+                    q[k] = sMap[row * IMG_STRIDE + col0 + k].xyz;
+                [ForceUnroll]
+                for (uint j = 0; j < 2; ++j) {
+                    float3 acc = float3(0.0f);
+                    [ForceUnroll]
+                    for (uint k = 0; k < 11; ++k)
+                        acc += q[j + k] * W11[k];
+                    sRow[row * STAT_STRIDE + col0 + j] = float4(acc, 0.0f);
+                }
+            }
+            GroupMemoryBarrierWithGroupSync();
+
+            // Vertical pass: dSSIM / d(grid pixel), chain rule through mu, sigma1^2 and sigma12.
+            float3 acc = float3(0.0f);
+            [ForceUnroll]
+            for (uint k = 0; k < 11; ++k)
+                acc += sRow[(ty + k) * STAT_STRIDE + tx].xyz * W11[k];
+            gradSsim[ci] = acc.x + 2.0f * avg1[ci] * acc.y + avg2[ci] * acc.z;
+        }
     }
 
-    if (pixX < imageWidth && pixY < imageHeight) {
-        dLdimg1Buffer[pixId] = float4(dLdpix_rgb, 0.0f);
+    // L1 + SSIM gradient of the full-resolution pixels of this grid pixel.
+    const bool inGrid = int(tx) + originX < gridW && int(ty) + originY < gridH;
+    [ForceUnroll]
+    for (uint s = 0; s < ds * ds; ++s) {
+        int x = (originX + int(tx)) * int(ds) + int(s % ds);
+        int y = (originY + int(ty)) * int(ds) + int(s / ds);
+        if (x < int(w) && y < int(h)) {
+            float3 g = sign(own1[s] - own2[s]) * uniforms.gradWeightL1;
+            if (useSsim && inGrid)
+                g += gradSsim * uniforms.gradWeightSSIM;
+            g *= float3(own1[s] > 0.0f);
+            dLdimg1Buffer[y * int(w) + x] = float4(g, 0.0f);
+        }
     }
 }
+
+#endif
