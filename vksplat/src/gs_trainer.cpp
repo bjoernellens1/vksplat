@@ -95,6 +95,9 @@ void VulkanGSTrainer::cleanup() {
     }
     dataset_val.clear();
 
+    destroyBuffer(group_op_rows.deviceBuffer);
+    destroyBuffer(group_op_vals.deviceBuffer);
+    destroyBuffer(compact_scratch.deviceBuffer);
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -134,6 +137,9 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_mcmc.update_add, spirv_paths.at("mcmc_update_add"));
     createComputePipeline(pipeline_mcmc.mask_retracted_group, spirv_paths.at("mcmc_mask_retracted_group"));
     createComputePipeline(pipeline_mcmc.clamp_scales, spirv_paths.at("mcmc_clamp_scales"));
+    createComputePipeline(pipeline_mcmc.update_group_rows, spirv_paths.at("mcmc_update_group_rows"));
+    createComputePipeline(pipeline_mcmc.compact_gather, spirv_paths.at("mcmc_compact_gather"));
+    createComputePipeline(pipeline_mcmc.compact_gather_sh, spirv_paths.at("mcmc_compact_gather_sh"));
     createComputePipeline(pipeline_morton_sort.compute_stats, spirv_paths.at("morton_sort_compute_stats"));
     createComputePipeline(pipeline_morton_sort.generate_keys, spirv_paths.at("morton_sort_generate_keys"));
     createComputePipeline(pipeline_morton_sort.apply_indices, spirv_paths.at("morton_sort_apply_indices"));
@@ -2432,6 +2438,168 @@ void VulkanGSTrainer::clamp_scales(
     bufferMemoryBarrier({
         { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
+}
+
+void VulkanGSTrainer::update_group_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    int32_t group_id,
+    const float* xyz,
+    const float* scales,
+    const float* quats,
+    size_t count
+) {
+    std::vector<uint32_t> rows;
+    const size_t n_splats = std::min(buffers.num_splats, splat_group_ids.size());
+    for (size_t i = 0; i < n_splats; ++i) {
+        if (splat_group_ids[i] == group_id)
+            rows.push_back(static_cast<uint32_t>(i));
+    }
+    if (rows.size() != count)
+        throw std::invalid_argument("update_group_sparse: group " + std::to_string(group_id) + " has " +
+            std::to_string(rows.size()) + " splats, got " + std::to_string(count) + " rows");
+    if (count == 0)
+        return;
+
+    std::vector<float> values(10 * count);
+    for (size_t k = 0; k < count; ++k) {
+        std::memcpy(&values[10 * k + 0], xyz + 3 * k, 3 * sizeof(float));
+        std::memcpy(&values[10 * k + 3], scales + 3 * k, 3 * sizeof(float));
+        std::memcpy(&values[10 * k + 6], quats + 4 * k, 4 * sizeof(float));
+    }
+    resizeDeviceBuffer(group_op_rows, count);
+    resizeDeviceBuffer(group_op_vals, 10 * count);
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, rows.data(), count * sizeof(uint32_t));
+    uploadDeviceSlice(group_op_vals.deviceBuffer, 0, values.data(), values.size() * sizeof(float));
+
+    DEVICE_GUARD;
+    Uniform32_t uniforms[1];
+    uniforms[0].u = static_cast<uint32_t>(count);
+    bufferMemoryBarrier({
+        { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+        { group_op_vals.deviceBuffer, TRANSFER_WRITE },
+        { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.g_xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.g_rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.g_scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+    executeCompute(
+        {{count, 64}},
+        &uniforms, sizeof(uniforms),
+        pipeline_mcmc.update_group_rows,
+        {
+            group_op_rows.deviceBuffer,
+            group_op_vals.deviceBuffer,
+            buffers.xyz_ws.deviceBuffer,
+            buffers.rotations.deviceBuffer,
+            buffers.scales_opacs.deviceBuffer,
+            buffers.g_xyz_ws.deviceBuffer,
+            buffers.g_rotations.deviceBuffer,
+            buffers.g_scales_opacs.deviceBuffer,
+        }
+    );
+    bufferMemoryBarrier({
+        { buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.rotations.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.g_xyz_ws.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.g_rotations.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+    }, COMPUTE_SHADER_READ_WRITE);
+}
+
+std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers& buffers) {
+    const size_t old_n = buffers.num_splats;
+    std::vector<int32_t> index_map(old_n, -1);
+    std::vector<uint32_t> keep;
+    keep.reserve(old_n);
+    for (size_t i = 0; i < old_n; ++i) {
+        const int32_t gid = i < splat_group_ids.size() ? splat_group_ids[i] : -1;
+        const bool retracted = gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u;
+        if (!retracted) {
+            index_map[i] = static_cast<int32_t>(keep.size());
+            keep.push_back(static_cast<uint32_t>(i));
+        }
+    }
+    const size_t new_n = keep.size();
+    if (new_n == old_n)
+        return index_map;
+    if (new_n == 0)
+        throw std::invalid_argument("compact_retracted: every splat is retracted");
+    if (num_anchored_splats > 0)
+        throw std::invalid_argument("compact_retracted: not supported with an anchored-splat snapshot");
+
+    ensureGroupBuffersOnDevice(buffers, old_n);
+    resizeDeviceBuffer(group_op_rows, new_n);
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, keep.data(), new_n * sizeof(uint32_t));
+
+    // (buffer, 32-bit words per splat, SH block layout) of every per-splat buffer
+    const std::vector<std::tuple<_VulkanBuffer*, uint32_t, bool>> targets = {
+        {&buffers.sh_coeffs.deviceBuffer, 0, true}, {&buffers.g_sh_coeffs_1.deviceBuffer, 0, true},
+        {&buffers.g_sh_coeffs_2.deviceBuffer, 0, true}, {&buffers.xyz_ws.deviceBuffer, 3, false},
+        {&buffers.rotations.deviceBuffer, 4, false}, {&buffers.scales_opacs.deviceBuffer, 4, false},
+        {&buffers.group_ids.deviceBuffer, 1, false}, {&buffers.g_xyz_ws.deviceBuffer, 6, false},
+        {&buffers.g_rotations.deviceBuffer, 8, false}, {&buffers.g_scales_opacs.deviceBuffer, 8, false},
+        {&buffers.default_grad.deviceBuffer, 2, false}, {&buffers.default_radii.deviceBuffer, 1, false},
+    };
+    auto new_bytes_of = [&](uint32_t words, bool sh) {
+        return sh ? _CEIL_ROUND(new_n, SH_REORDER_SIZE) * 12 * 4 * sizeof(float) : new_n * words * sizeof(uint32_t);
+    };
+    size_t scratch_bytes = 0;
+    for (auto& [db, words, sh] : targets) {
+        if (db->buffer != VK_NULL_HANDLE && new_bytes_of(words, sh) <= db->size)
+            scratch_bytes = std::max(scratch_bytes, (size_t)db->size);
+    }
+    resizeDeviceBuffer(compact_scratch, _CEIL_DIV(scratch_bytes, sizeof(uint32_t)));
+
+    {
+        DEVICE_GUARD;
+        // per buffer: copy the old contents to the scratch buffer, then gather the survivors back in place
+        for (auto& [db, words, sh] : targets) {
+            const size_t new_bytes = new_bytes_of(words, sh);
+            if (db->buffer == VK_NULL_HANDLE || new_bytes > db->size)
+                continue;  // never sized for all splats (e.g. unused densification statistics)
+            const size_t padded = _CEIL_ROUND(new_n, SH_REORDER_SIZE);
+            bufferMemoryBarrier({
+                { *db, COMPUTE_SHADER_READ_WRITE },
+                { compact_scratch.deviceBuffer, COMPUTE_SHADER_READ },
+                { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+            }, TRANSFER_READ_WRITE);
+            copyFromDeviceToDevice(*db, compact_scratch.deviceBuffer);
+            bufferMemoryBarrier({
+                { compact_scratch.deviceBuffer, TRANSFER_WRITE },
+                { *db, TRANSFER_READ },
+                { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+            Uniform32_t uniforms[2];
+            uniforms[0].u = static_cast<uint32_t>(new_n);
+            uniforms[1].u = sh ? static_cast<uint32_t>(padded) : words;
+            executeCompute(
+                {{sh ? padded * 12 : new_n * words, 256}},
+                &uniforms, sizeof(uniforms),
+                sh ? pipeline_mcmc.compact_gather_sh : pipeline_mcmc.compact_gather,
+                { group_op_rows.deviceBuffer, compact_scratch.deviceBuffer, *db }
+            );
+            db->size = new_bytes;  // logical size follows the splat count; growth later zero-fills
+        }
+        barrierAllGaussParams(buffers);
+        bufferMemoryBarrier({{ buffers.group_ids.deviceBuffer, COMPUTE_SHADER_WRITE }}, COMPUTE_SHADER_READ);
+    }
+
+    auto remap = [&](std::vector<int32_t>& v) {
+        if (v.empty())
+            return;
+        v.resize(old_n, -1);
+        std::vector<int32_t> out(new_n);
+        for (size_t k = 0; k < new_n; ++k)
+            out[k] = v[keep[k]];
+        v = std::move(out);
+    };
+    remap(splat_group_ids);
+    remap(splat_entity_ids);
+    buffers.num_splats = new_n;
+    return index_map;
 }
 
 // Reserved-capacity append. The logical splat count (buffers.num_splats, uniforms, dispatch sizes) is

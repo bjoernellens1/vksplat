@@ -95,6 +95,8 @@ struct TrainerConfig {
     float grow_factor;
     int cap_max;
     bool mcmc_protect_structural_groups = false;
+    // raster backward drops the geometry/opacity (IMAGINED) or all (protected LOCKED) gradient atomics of frozen splats
+    bool freeze_skip_backward = true;
     // Sparse backward: on non-sentinel steps only the tiles whose residual is at least the
     // `sparse_tile_quantile`-quantile of all tile residuals (plus `sparse_tile_halo` tiles of dilation) get
     // a raster/SSIM backward pass. 0 = dense. Every `sparse_full_every`-th step (step % k == 0) is dense.
@@ -251,6 +253,13 @@ public:
     void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
     void clamp_scales(VulkanGSPipelineBuffers& buffers, float max_scale, float tangent_cap);
+    // Rewrites geometry (xyz, scales, quats; rows in ascending splat index of the group) and resets the geometry
+    // Adam moments of one group's splats on the GPU. Throws when `count` differs from the group's splat count.
+    void update_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id,
+                             const float* xyz, const float* scales, const float* quats, size_t count);
+    // Removes every splat of a RETRACTED (3) group from all per-splat buffers (one GPU gather per buffer, no
+    // readback; the keep list comes from the host group mirror). Returns old index -> new index (-1 = removed).
+    std::vector<int32_t> compact_retracted(VulkanGSPipelineBuffers& buffers);
 
 private:
     std::default_random_engine rng;
@@ -266,6 +275,9 @@ private:
     float pre_freeze_grad_ema = 0.0f;
     std::vector<int32_t> splat_group_ids;
     std::vector<int32_t> splat_entity_ids;
+    Buffer<uint32_t> group_op_rows;  // splat indices of update_group_sparse / keep list of compact_retracted
+    Buffer<float> group_op_vals;
+    Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     Buffer<float> anchored_xyz_ws;
@@ -297,6 +309,9 @@ private:
         _ComputePipeline update_add = _ComputePipeline(10);
         _ComputePipeline mask_retracted_group = _ComputePipeline(3);
         _ComputePipeline clamp_scales = _ComputePipeline(2);
+        _ComputePipeline update_group_rows = _ComputePipeline(8);
+        _ComputePipeline compact_gather = _ComputePipeline(3);
+        _ComputePipeline compact_gather_sh = _ComputePipeline(3);
     } pipeline_mcmc;
     struct _MortonSortComputePipeline {
         _ComputePipeline compute_stats = _ComputePipeline(2);

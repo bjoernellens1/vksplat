@@ -22,8 +22,8 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float dist_coeffs[4];
     float world_view_transform[16];
     uint32_t use_tile_list;  // 1: backward kernels run over the compacted active-tile list
-    float _pad_tile0;
-    float _pad_tile1;
+    uint32_t freeze_flags;  // bit 0: IMAGINED groups present, bit 1: protected LOCKED groups present (backward skips their atomics)
+    uint32_t num_groups;
     float _pad_tile2;
 });
 
@@ -139,11 +139,11 @@ protected:
     };
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
-        _ComputePipelinePair(12),  // per pixel
-        _ComputePipelinePair(12),  // per splat
-        _ComputePipelinePair(12),  // tensor
-        _ComputePipelinePair(12),  // tensor
-        _ComputePipelinePair(12),  // tensor
+        _ComputePipelinePair(14),  // per pixel
+        _ComputePipelinePair(14),  // per splat
+        _ComputePipelinePair(14),  // tensor
+        _ComputePipelinePair(14),  // tensor
+        _ComputePipelinePair(14),  // tensor
     };
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);

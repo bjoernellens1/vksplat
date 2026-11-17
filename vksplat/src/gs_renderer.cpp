@@ -405,6 +405,9 @@ void VulkanGSRenderer::executeRasterizeBackward(
             buffers.v_inv_cov_vs_opacity.deviceBuffer,
             buffers.v_rgb.deviceBuffer,
             sparse_active_tiles,
+            // group tables (read only when uniforms.freeze_flags != 0; any valid buffer is bound otherwise)
+            uniforms.freeze_flags ? buffers.group_ids.deviceBuffer : sparse_active_tiles,
+            uniforms.freeze_flags ? buffers.group_state.deviceBuffer : sparse_active_tiles,
         },
         GATE_RASTER_BWD,
         sparse ? &sparse_args : nullptr

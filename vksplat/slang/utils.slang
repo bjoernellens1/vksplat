@@ -767,7 +767,24 @@ struct Uniforms {
     float4 dist_coeffs;
     float4x4 world_view_transform;
     uint use_tile_list;
-    float _pad_tile0;
-    float _pad_tile1;
+    uint freeze_flags;  // bit 0: IMAGINED groups present, bit 1: protected LOCKED groups present (0: no lookup)
+    uint num_groups;
     float _pad_tile2;
+}
+
+// Backward-accumulation mode of a splat: 0 normal, 1 IMAGINED (geometry/opacity gradients dropped, rgb kept),
+// 2 protected LOCKED (nothing accumulated). The per-pixel transmittance recurrence still includes every splat.
+uint splat_freeze_mode(int32_t splat_id, uint freeze_flags, uint num_groups,
+                       StructuredBuffer<int32_t> group_ids, StructuredBuffer<uint32_t> group_state) {
+    if (freeze_flags == 0 || splat_id < 0)
+        return 0;
+    const int32_t gid = group_ids[splat_id];
+    if (gid < 0 || uint32_t(gid) >= num_groups)
+        return 0;
+    const uint32_t state = group_state[gid];
+    if (state == 1u && (freeze_flags & 1u) != 0)
+        return 1;
+    if (state == 2u && (freeze_flags & 2u) != 0)
+        return 2;
+    return 0;
 }

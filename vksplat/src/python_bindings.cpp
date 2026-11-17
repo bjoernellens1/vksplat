@@ -162,6 +162,9 @@ public:
             "mcmc_update_add",
             "mcmc_mask_retracted_group",
             "mcmc_clamp_scales",
+            "mcmc_update_group_rows",
+            "mcmc_compact_gather",
+            "mcmc_compact_gather_sh",
             "morton_sort_compute_stats",
             "morton_sort_generate_keys",
             "morton_sort_apply_indices",
@@ -276,6 +279,8 @@ public:
         config.cap_max = train_config["cap_max"].cast<int>();
         config.mcmc_protect_structural_groups = train_config.contains(py::str("mcmc_protect_structural_groups"))
             ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
+        config.freeze_skip_backward = train_config.contains(py::str("freeze_skip_backward"))
+            ? train_config["freeze_skip_backward"].cast<bool>() : true;
         set_sparse_backward(
             train_config.contains(py::str("sparse_tile_quantile")) ? train_config["sparse_tile_quantile"].cast<float>() : 0.0f,
             train_config.contains(py::str("sparse_tile_halo")) ? train_config["sparse_tile_halo"].cast<int>() : 1,
@@ -379,10 +384,24 @@ public:
             throw std::invalid_argument("group_ids and states must have the same length");
         trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
     }
+    void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void force_backward_variant(int impl) { trainer.forceBackwardImpl(impl); }
     std::vector<int> backward_variants() { return trainer.backwardImplCandidates(); }
     void clamp_scales(float max_scale, float tangent_cap) {
         trainer.clamp_scales(buffers, max_scale, tangent_cap);
+    }
+    void update_group_sparse(int32_t group_id,
+                             py::array_t<float, py::array::c_style | py::array::forcecast> xyz,
+                             py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+                             py::array_t<float, py::array::c_style | py::array::forcecast> quats) {
+        const size_t n = static_cast<size_t>(xyz.size()) / 3;
+        if (xyz.size() != (py::ssize_t)(3 * n) || scales.size() != (py::ssize_t)(3 * n) || quats.size() != (py::ssize_t)(4 * n))
+            throw std::invalid_argument("update_group_sparse expects xyz (n,3), scales (n,3), quats (n,4)");
+        trainer.update_group_sparse(buffers, group_id, xyz.data(), scales.data(), quats.data(), n);
+    }
+    py::array_t<int32_t> compact_retracted() {
+        std::vector<int32_t> index_map = trainer.compact_retracted(buffers);
+        return py::array_t<int32_t>({index_map.size()}, {sizeof(int32_t)}, index_map.data());
     }
     void retract_group_sparse(int32_t group_id) {
         trainer.retract_group_sparse(buffers, group_id);
@@ -601,6 +620,19 @@ public:
             gid_ptr,
             n_add
         );
+    }
+
+    // Device readback of the Adam moments and densification statistics (test/diagnostic)
+    py::dict get_optimizer_moments() {
+        py::dict d;
+        d["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws);
+        d["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1);
+        d["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2);
+        d["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations);
+        d["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs);
+        d["default_grad"] = buffer_to_array<float, float>(buffers.default_grad);
+        d["default_radii"] = buffer_to_array<float, float>(buffers.default_radii);
+        return d;
     }
 
     py::dict snapshot_optimizer_state() {
@@ -884,6 +916,7 @@ public:
     }
     
     void rasterize_backward() {
+        set_freeze_flags();
         try {
             trainer.executeRasterizeBackward(uniforms, buffers);
         } catch (const std::runtime_error& err) {
@@ -960,6 +993,25 @@ public:
     void set_train_image(size_t train_idx) {
         trainer.get_train_camera(train_idx, uniforms);
         uniforms.use_tile_list = 0;
+    }
+
+    // Tells the raster backward which frozen groups exist so that it skips their gradient atomics. The group
+    // table is a small host mirror; the device tables are made resident here (inside the open batch if any).
+    void set_freeze_flags() {
+        uint32_t flags = 0;
+        if (config.freeze_skip_backward) {
+            for (uint32_t state : buffers.group_state) {
+                if (state == 1u) flags |= 1u;
+                else if (state == 2u && config.mcmc_protect_structural_groups) flags |= 2u;
+            }
+        }
+        uniforms.freeze_flags = flags;
+        uniforms.num_groups = (uint32_t)buffers.group_state.size();
+        if (flags) {
+            auto deviceGuard = DeviceGuard(&trainer);
+            trainer.ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+            uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+        }
     }
 
     // per-step uniforms shared by the synchronous and the gated path
@@ -1226,6 +1278,9 @@ PYBIND11_MODULE(vksplat, m) {
         .def("force_backward_variant", &VkSplat::force_backward_variant, "Pin one rasterize-backward variant (0 PerPixel, 1 PerSplat, 2/3/4 Tensor); -1 restores the scheduler", py::arg("impl"))
         .def("backward_variants", &VkSplat::backward_variants, "Backward variants available on this device")
         .def("clamp_scales", &VkSplat::clamp_scales, "GPU clamp of scales without readback: ungrouped splats to max_scale on all axes; grouped splats (group_id >= 0) to tangent_cap on x, y and max_scale on z", py::arg("max_scale"), py::arg("tangent_cap"), py::call_guard<py::gil_scoped_release>())
+        .def("update_group_sparse", &VkSplat::update_group_sparse, "Rewrite xyz/scales/quats of one group's splats (rows in ascending splat index) and reset their geometry Adam moments, on GPU without readback", py::arg("group_id"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"))
+        .def("compact_retracted", &VkSplat::compact_retracted, "Remove all splats of RETRACTED groups from every per-splat buffer; returns the old->new index map (int32, -1 = removed). One host-side keep-list build, GPU gather, no readback.")
+        .def("set_freeze_skip_backward", &VkSplat::set_freeze_skip_backward, "Enable/disable skipping the raster-backward gradient atomics of frozen (IMAGINED/protected LOCKED) splats", py::arg("enabled"))
         .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
         .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))
         .def("get_scales_opacities_packed", &VkSplat::get_scales_opacities_packed, "Read packed (N, 4) scales+opacities in a single device transfer")
@@ -1245,6 +1300,7 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("train_idx"), py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
         .def("append_splats_preserving_optimizer", &VkSplat::append_splats_preserving_optimizer, "Append new Gaussians while preserving Adam optimizer state of existing splats",
              py::arg("xyz_ws"), py::arg("sh_coeffs"), py::arg("rotations"), py::arg("scales"), py::arg("opacities"), py::arg("group_ids"))
+        .def("get_optimizer_moments", &VkSplat::get_optimizer_moments, "Device readback of the Adam moments and densification statistics (diagnostic)")
         .def("snapshot_optimizer_state", &VkSplat::snapshot_optimizer_state, "Take a non-destructive snapshot of Gaussian parameters and Adam optimizer state")
         .def("restore_optimizer_state", &VkSplat::restore_optimizer_state, "Restore a non-destructive snapshot of Gaussian parameters and Adam optimizer state", py::arg("snap"))
         .def("cleanup", &VkSplat::cleanup, "Cleanup Vulkan resources")

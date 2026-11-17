@@ -14,6 +14,9 @@
 
 #define MCMC_PHASE_MaskRetractedGroup 30
 #define MCMC_PHASE_ClampScales 31
+#define MCMC_PHASE_UpdateGroupRows 32
+#define MCMC_PHASE_CompactGather 33
+#define MCMC_PHASE_CompactGatherSH 34
 
 #ifndef MCMC_PHASE
 #define MCMC_PHASE -1
@@ -54,6 +57,15 @@ bool mcmc_protected(int32_t gid, uint32_t protect_all, uint32_t num_groups, Stru
 struct MaskGroupUniforms {
     uint32_t array_size;
     uint32_t num_groups;
+};
+
+struct UpdateGroupRowsUniforms {
+    uint32_t num_rows;
+};
+
+struct CompactUniforms {
+    uint32_t new_n;  // surviving splats
+    uint32_t words;  // 32-bit words per splat (plain gather) or padded splat count (SH gather)
 };
 
 struct ClampScalesUniforms {
@@ -564,3 +576,86 @@ void clampScales(
 #endif  // MCMC_PHASE == MCMC_PHASE_ClampScales
 
 
+#if MCMC_PHASE == MCMC_PHASE_UpdateGroupRows
+
+// Rewrites geometry of listed splats (update_group_sparse) and resets their geometry Adam moments;
+// opacity, its moments, SH and SH moments are untouched.
+layout(binding=0) StructuredBuffer<uint32_t> rows;  // (R,) splat indices
+layout(binding=1) StructuredBuffer<float> values;  // (R, 10): xyz(3), scales(3), quat(4)
+layout(binding=2) RWStructuredBuffer<float> means;  // (N, 3)
+layout(binding=3) RWStructuredBuffer<float4> rotations;  // (N, 4)
+layout(binding=4) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
+layout(binding=5) RWStructuredBuffer<float> g_means;  // (N, 2, 3)
+layout(binding=6) RWStructuredBuffer<float4> g_rotations;  // (N, 2, 4)
+layout(binding=7) RWStructuredBuffer<float4> g_scales_opacs;  // (N, 2, 4)
+
+#define updateGroupRows main
+
+[numthreads(GROUP_SIZE_SPARSE, 1, 1)]
+void updateGroupRows(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform UpdateGroupRowsUniforms uniforms
+) {
+    const uint32_t t = thread_id.x;
+    if (t >= uniforms.num_rows)
+        return;
+    const uint32_t r = rows[t];
+    const uint32_t v = 10 * t;
+    write_mean(float3(values[v+0], values[v+1], values[v+2]), r, means);
+    rotations[r] = float4(values[v+6], values[v+7], values[v+8], values[v+9]);
+    scales_opacs[r] = float4(values[v+3], values[v+4], values[v+5], scales_opacs[r].w);
+    _FOR_LOOP(i, 2) write_mean(float3(0.0), r, g_means, 2, i);
+    _FOR_LOOP(i, 2) g_rotations[r*2+i] = float4(0.0);
+    _FOR_LOOP(i, 2) g_scales_opacs[r*2+i] = float4(0.0, 0.0, 0.0, g_scales_opacs[r*2+i].w);
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_UpdateGroupRows
+
+
+#if MCMC_PHASE == MCMC_PHASE_CompactGather
+
+// dst[i] = src[keep[i]] over `words` 32-bit words per splat (src is a copy of dst's old contents)
+layout(binding=0) StructuredBuffer<uint32_t> keep;  // (new_n,) old index of each surviving splat
+layout(binding=1) StructuredBuffer<uint32_t> src;
+layout(binding=2) RWStructuredBuffer<uint32_t> dst;
+
+#define compactGather main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void compactGather(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform CompactUniforms uniforms
+) {
+    const uint32_t t = thread_id.x;
+    if (t >= uniforms.new_n * uniforms.words)
+        return;
+    const uint32_t i = t / uniforms.words;
+    dst[t] = src[keep[i] * uniforms.words + (t - i * uniforms.words)];
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_CompactGather
+
+
+#if MCMC_PHASE == MCMC_PHASE_CompactGatherSH
+
+// SH-layout (reordered blocks) gather; lanes past new_n in the last block are zeroed.
+layout(binding=0) StructuredBuffer<uint32_t> keep;
+layout(binding=1) StructuredBuffer<float4> src;
+layout(binding=2) RWStructuredBuffer<float4> dst;
+
+#define compactGatherSH main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void compactGatherSH(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform CompactUniforms uniforms  // words = padded splat count
+) {
+    const uint32_t t = thread_id.x;
+    if (t >= uniforms.words * 12)
+        return;
+    const uint32_t i = t / 12;
+    const uint32_t sid = t % 12;
+    dst[shAt(i, sid)] = (i < uniforms.new_n) ? src[shAt(keep[i], sid)] : float4(0.0);
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_CompactGatherSH

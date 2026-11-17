@@ -27,6 +27,8 @@ layout(binding=8) RWByteAddressBuffer v_xy_vs;
 layout(binding=9) RWByteAddressBuffer v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer v_rgb;
 layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
+layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
+layout(binding=13) StructuredBuffer<uint32_t> group_state;
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -107,6 +109,8 @@ void main(
                 continue;
 
             uint32_t g_idx = collected_idx[j];
+            // wave-uniform: every lane processes the same splat j
+            const uint freeze = splat_freeze_mode(int32_t(g_idx), uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state);
             DifferentialPair<Splat_2D_AlphaBlend> dp_g;
             #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
                 float2 d_xy_vs = float2(0.0);
@@ -131,15 +135,17 @@ void main(
 
                     bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
                     d_current_pixel_state = dp_current_pixel_state.getDifferential();
-                    bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
-                    d_xy_vs = dp_g.d.xy_vs;
-                    d_inv_cov_vs_opacity = dp_g.d.inv_cov_vs_opacity;
-                    d_rgb = dp_g.d.rgb;
+                    if (freeze != 2) {  // protected LOCKED: the recurrence above is all that is needed
+                        bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
+                        d_xy_vs = dp_g.d.xy_vs;
+                        d_inv_cov_vs_opacity = dp_g.d.inv_cov_vs_opacity;
+                        d_rgb = dp_g.d.rgb;
+                    }
                 }
             }
 
             // Skip all 9 subgroup reductions and atomics if no lane in this subgroup contributed to splat j
-            if (!WaveActiveAnyTrue(active))
+            if (freeze == 2 || !WaveActiveAnyTrue(active))
                 continue;
 
             // add back
@@ -162,12 +168,15 @@ void main(
             float temp_p0, temp_p1;
             float temp_s0, temp_s1, temp_s2, temp_s3;
             float temp_c0, temp_c1, temp_c2;
-            subgroupSumF32(temp_p0, d_xy_vs.x);
-            subgroupSumF32(temp_p1, d_xy_vs.y);
-            subgroupSumF32(temp_s0, d_inv_cov_vs_opacity.x);
-            subgroupSumF32(temp_s1, d_inv_cov_vs_opacity.y);
-            subgroupSumF32(temp_s2, d_inv_cov_vs_opacity.z);
-            subgroupSumF32(temp_s3, d_inv_cov_vs_opacity.w);
+            temp_p0 = 0.0; temp_p1 = 0.0; temp_s0 = 0.0; temp_s1 = 0.0; temp_s2 = 0.0; temp_s3 = 0.0;
+            if (freeze == 0) {
+                subgroupSumF32(temp_p0, d_xy_vs.x);
+                subgroupSumF32(temp_p1, d_xy_vs.y);
+                subgroupSumF32(temp_s0, d_inv_cov_vs_opacity.x);
+                subgroupSumF32(temp_s1, d_inv_cov_vs_opacity.y);
+                subgroupSumF32(temp_s2, d_inv_cov_vs_opacity.z);
+                subgroupSumF32(temp_s3, d_inv_cov_vs_opacity.w);
+            }
             subgroupSumF32(temp_c0, float(d_rgb.x));
             subgroupSumF32(temp_c1, float(d_rgb.y));
             subgroupSumF32(temp_c2, float(d_rgb.z));

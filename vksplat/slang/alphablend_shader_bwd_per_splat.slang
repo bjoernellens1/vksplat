@@ -30,6 +30,8 @@ layout(binding=8) RWByteAddressBuffer out_v_xy_vs;
 layout(binding=9) RWByteAddressBuffer out_v_inv_cov_vs_opacity;
 layout(binding=10) RWByteAddressBuffer out_v_rgb;
 layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
+layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
+layout(binding=13) StructuredBuffer<uint32_t> group_state;
 
 
 [shader("compute")]
@@ -195,15 +197,20 @@ void main(
             if (value != 0.0) buffer.InterlockedAddF32((address)*sizeof(float), value);
       #endif
         if (active) {
-            _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+0, v_xy_vs.x);
-            _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+1, v_xy_vs.y);
-            _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+0, v_inv_cov_vs_opacity.x);
-            _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+1, v_inv_cov_vs_opacity.y);
-            _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+2, v_inv_cov_vs_opacity.z);
-            _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+3, v_inv_cov_vs_opacity.w);
-            _ATOMIC_ADD(out_v_rgb, 3*splat_id+0, float(v_rgb.x));
-            _ATOMIC_ADD(out_v_rgb, 3*splat_id+1, float(v_rgb.y));
-            _ATOMIC_ADD(out_v_rgb, 3*splat_id+2, float(v_rgb.z));
+            const uint freeze = splat_freeze_mode(splat_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state);
+            if (freeze == 0) {
+                _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+0, v_xy_vs.x);
+                _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+1, v_xy_vs.y);
+                _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+0, v_inv_cov_vs_opacity.x);
+                _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+1, v_inv_cov_vs_opacity.y);
+                _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+2, v_inv_cov_vs_opacity.z);
+                _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+3, v_inv_cov_vs_opacity.w);
+            }
+            if (freeze != 2) {
+                _ATOMIC_ADD(out_v_rgb, 3*splat_id+0, float(v_rgb.x));
+                _ATOMIC_ADD(out_v_rgb, 3*splat_id+1, float(v_rgb.y));
+                _ATOMIC_ADD(out_v_rgb, 3*splat_id+2, float(v_rgb.z));
+            }
         }
 
     }  // for (int i = 0; i < rounds; i++)

@@ -251,6 +251,7 @@ class ShaderCompiler:
                 ("compute_relocation_index_map", 10), ("compute_relocation", 11), ("update_relocation", 12),
                 ("compute_add_index_map", 20), ("compute_add", 21), ("update_add", 22),
                 ("mask_retracted_group", 30), ("clamp_scales", 31),
+                ("update_group_rows", 32), ("compact_gather", 33), ("compact_gather_sh", 34),
             ]
         ], ["strategy_utils.slang", "config.slang"]))
 
