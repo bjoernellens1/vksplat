@@ -200,6 +200,7 @@ public:
     }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
+    void uploadFrameImage(Buffer<uint8_t>& image, const uint8_t* rgba_pixels, size_t n_bytes);
     void clear_train_images();
     void clear_val_images();
     size_t append_train_image_from_memory(

@@ -84,6 +84,7 @@ struct WorkCounters {
     uint64_t append_reallocs = 0;
     uint64_t append_fence_waits = 0;
     uint64_t step_buffer_reallocs = 0;
+    uint64_t frame_upload_waits = 0;  // blocking waits for a keyframe upload staging slot (or an in-flight upload)
     uint64_t fence_waits_total = 0;  // every blocking fence wait (any submit path)
     // Batched steps: batches whose tile-intersection count exceeded the buffer capacity, and the steps the
     // gate skipped on the GPU in them (recorded again after the buffers were grown).

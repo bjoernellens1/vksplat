@@ -2107,6 +2107,21 @@ void VulkanGSTrainer::clear_val_images() {
     dataset_val.clear();
 }
 
+// Keyframe image to the device. Async: one memcpy into a persistent staging slot and a fence-free transfer
+// submission (no host copy is kept; the device buffer is the only copy). Sync: host copy + blocking upload.
+void VulkanGSTrainer::uploadFrameImage(Buffer<uint8_t>& image, const uint8_t* rgba_pixels, size_t n_bytes) {
+    if (!async_frame_upload) {
+        image.resize(n_bytes);
+        image.assign(rgba_pixels, rgba_pixels + n_bytes);
+        copyToDevice(image);
+        return;
+    }
+    image.clear();
+    image.shrink_to_fit();  // a stale host copy of a replaced slot must not be served by get_train_image
+    resizeDeviceBuffer(image.deviceBuffer, n_bytes);
+    uploadDeviceAsync(image.deviceBuffer, rgba_pixels, n_bytes);
+}
+
 size_t VulkanGSTrainer::append_train_image_from_memory(
     const std::string& image_name,
     const uint8_t* rgba_pixels,
@@ -2153,9 +2168,7 @@ size_t VulkanGSTrainer::append_train_image_from_memory(
     image.mask_path = "";
     image.camera = camera;
     const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
-    image.buffer.resize(n_bytes);
-    image.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
-    copyToDevice(image.buffer);
+    uploadFrameImage(image.buffer, rgba_pixels, n_bytes);
 
     dataset_train.push_back(std::move(image));
     return dataset_train.size() - 1;
@@ -2204,9 +2217,7 @@ size_t VulkanGSTrainer::append_val_image_from_memory(
     image.mask_path = "";
     image.camera = camera;
     const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
-    image.buffer.resize(n_bytes);
-    image.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
-    copyToDevice(image.buffer);
+    uploadFrameImage(image.buffer, rgba_pixels, n_bytes);
 
     dataset_val.push_back(std::move(image));
     return dataset_val.size() - 1;
@@ -2256,9 +2267,7 @@ void VulkanGSTrainer::replace_train_image_from_memory(
     slot.camera.world_view_transform = glm::inverse(c2w_norm);
 
     const size_t n_bytes = static_cast<size_t>(h) * static_cast<size_t>(w) * 4;
-    slot.buffer.resize(n_bytes);
-    slot.buffer.assign(rgba_pixels, rgba_pixels + n_bytes);
-    copyToDevice(slot.buffer);
+    uploadFrameImage(slot.buffer, rgba_pixels, n_bytes);
 }
 
 void VulkanGSTrainer::syncGroupStateSize(

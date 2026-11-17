@@ -385,6 +385,7 @@ public:
         trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
     }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
+    void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
     void force_backward_variant(int impl) { trainer.forceBackwardImpl(impl); }
     std::vector<int> backward_variants() { return trainer.backwardImplCandidates(); }
     void clamp_scales(float max_scale, float tangent_cap) {
@@ -510,6 +511,7 @@ public:
         auto pose_buf = c2w_world.request();
         if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
             throw std::runtime_error("c2w_world must be (4, 4) float32 array");
+        py::gil_scoped_release release;  // the staging memcpy runs without the GIL
         return trainer.append_train_image_from_memory(
             image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
         );
@@ -577,6 +579,7 @@ public:
         auto pose_buf = c2w_world.request();
         if (pose_buf.ndim != 2 || pose_buf.shape[0] != 4 || pose_buf.shape[1] != 4)
             throw std::runtime_error("c2w_world must be (4, 4) float32 array");
+        py::gil_scoped_release release;  // the staging memcpy runs without the GIL
         trainer.replace_train_image_from_memory(
             train_idx, image_name, rgba_ptr, h, w, fx, fy, cx, cy, static_cast<const float*>(pose_buf.ptr)
         );
@@ -697,10 +700,14 @@ public:
 
     py::array_t<uint8_t> get_train_image(size_t &idx) {
         auto& im = trainer.get_train_image(idx);
+        if (im.buffer.empty() && im.buffer.deviceBuffer.buffer != VK_NULL_HANDLE)
+            trainer.copyFromDevice(im.buffer);  // async uploads keep no host copy
         return buffer_to_array<uint8_t, uint8_t, false>(im.buffer, im.camera.w, 4);
     }
     py::array_t<uint8_t> get_val_image(size_t &idx) {
         auto& im = trainer.get_val_image(idx);
+        if (im.buffer.empty() && im.buffer.deviceBuffer.buffer != VK_NULL_HANDLE)
+            trainer.copyFromDevice(im.buffer);  // async uploads keep no host copy
         return buffer_to_array<uint8_t, uint8_t, false>(im.buffer, im.camera.w, 4);
     }
 
@@ -1280,6 +1287,7 @@ PYBIND11_MODULE(vksplat, m) {
         .def("clamp_scales", &VkSplat::clamp_scales, "GPU clamp of scales without readback: ungrouped splats to max_scale on all axes; grouped splats (group_id >= 0) to tangent_cap on x, y and max_scale on z", py::arg("max_scale"), py::arg("tangent_cap"), py::call_guard<py::gil_scoped_release>())
         .def("update_group_sparse", &VkSplat::update_group_sparse, "Rewrite xyz/scales/quats of one group's splats (rows in ascending splat index) and reset their geometry Adam moments, on GPU without readback", py::arg("group_id"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"))
         .def("compact_retracted", &VkSplat::compact_retracted, "Remove all splats of RETRACTED groups from every per-splat buffer; returns the old->new index map (int32, -1 = removed). One host-side keep-list build, GPU gather, no readback.")
+        .def("set_async_frame_upload", &VkSplat::set_async_frame_upload, "Asynchronous keyframe upload (staging ring + fence-free transfer submit, default on); off = old blocking copy", py::arg("enabled"))
         .def("set_freeze_skip_backward", &VkSplat::set_freeze_skip_backward, "Enable/disable skipping the raster-backward gradient atomics of frozen (IMAGINED/protected LOCKED) splats", py::arg("enabled"))
         .def("retract_group_sparse", &VkSplat::retract_group_sparse, "Retract a structural group on GPU without full-map host readback", py::arg("group_id"), py::call_guard<py::gil_scoped_release>())
         .def("set_sh_coeffs_reordered", &VkSplat::set_sh_coeffs_reordered, "Reorder and upload ONLY sh_coeffs without touching other Gaussian buffers or optimizer moments", py::arg("sh_coeffs"))

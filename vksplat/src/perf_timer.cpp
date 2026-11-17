@@ -159,6 +159,7 @@ std::map<std::string, uint64_t> get_work_counters() {
         {"append_reallocs", w.append_reallocs},
         {"append_fence_waits", w.append_fence_waits},
         {"step_buffer_reallocs", w.step_buffer_reallocs},
+        {"frame_upload_waits", w.frame_upload_waits},
         {"fence_waits_total", w.fence_waits_total},
         {"gate_overflows", w.gate_overflows},
         {"gate_steps_redone", w.gate_steps_redone},

@@ -254,6 +254,113 @@ void VulkanGSPipeline::freeAppendStage() {
 }
 
 
+void VulkanGSPipeline::createHostStaging(size_t size, VkBuffer& buffer, VkDeviceMemory& memory, uint8_t*& mapped) {
+    VkBufferCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    info.size = size;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS)
+        _THROW_ERROR("Failed to create host staging buffer");
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(device, buffer, &req);
+    uint32_t type = findMemoryType(physical_device, req.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (type == UINT32_MAX)
+        _THROW_ERROR("Failed to find host staging memory type");
+    VkMemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = req.size;
+    alloc_info.memoryTypeIndex = type;
+    if (vkAllocateMemory(device, &alloc_info, nullptr, &memory) != VK_SUCCESS)
+        throw std::runtime_error("Failed to allocate host staging memory");
+    vkBindBufferMemory(device, buffer, memory, 0);
+    void* ptr = nullptr;
+    vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &ptr);
+    mapped = static_cast<uint8_t*>(ptr);
+}
+
+
+void VulkanGSPipeline::destroyUploadStage(_UploadSlot& slot) {
+    if (slot.buffer != VK_NULL_HANDLE) {
+        vkUnmapMemory(device, slot.memory);
+        vkDestroyBuffer(device, slot.buffer, nullptr);
+        vkFreeMemory(device, slot.memory, nullptr);
+    }
+    slot.buffer = VK_NULL_HANDLE;
+    slot.memory = VK_NULL_HANDLE;
+    slot.mapped = nullptr;
+    slot.allocSize = 0;
+}
+
+
+void VulkanGSPipeline::waitUploadSlot(_UploadSlot& slot) {
+    if (!slot.pending)
+        return;
+    if (vkGetFenceStatus(device, slot.fence) != VK_SUCCESS) {
+        PerfTimer::work_counters.frame_upload_waits++;
+        PerfTimer::work_counters.fence_waits_total++;
+        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+    }
+    vkResetFences(device, 1, &slot.fence);
+    slot.pending = false;
+}
+
+
+void VulkanGSPipeline::waitUploads() {
+    for (auto& slot : upload_slots)
+        waitUploadSlot(slot);
+}
+
+
+void VulkanGSPipeline::uploadDeviceAsync(_VulkanBuffer& dst, const void* src, size_t byte_size) {
+    HOST_GUARD;  // the upload command buffer must be ordered against any open main batch
+    if (byte_size == 0)
+        return;
+    if (dst.buffer == VK_NULL_HANDLE || byte_size > dst.size)
+        _THROW_ERROR("uploadDeviceAsync out of bounds");
+    _UploadSlot& slot = upload_slots[upload_cursor];
+    upload_cursor = (upload_cursor + 1) % kUploadSlots;
+    waitUploadSlot(slot);
+    if (slot.allocSize < byte_size) {
+        destroyUploadStage(slot);
+        createHostStaging(byte_size, slot.buffer, slot.memory, slot.mapped);
+        slot.allocSize = byte_size;
+    }
+    std::memcpy(slot.mapped, src, byte_size);
+
+    VkCommandBufferBeginInfo begin_info = {};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(slot.cb, 0);
+    if (vkBeginCommandBuffer(slot.cb, &begin_info) != VK_SUCCESS)
+        _THROW_ERROR("Failed to begin upload command buffer");
+    // order after everything already submitted (train steps that read the previous image, earlier uploads)
+    VkMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(slot.cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    VkBufferCopy region = {0, 0, byte_size};
+    vkCmdCopyBuffer(slot.cb, slot.buffer, dst.buffer, 1, &region);
+    // make the copy visible to every later command on this queue (next train step)
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(slot.cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+        0, 1, &barrier, 0, nullptr, 0, nullptr);
+    if (vkEndCommandBuffer(slot.cb) != VK_SUCCESS)
+        _THROW_ERROR("Failed to end upload command buffer");
+    VkSubmitInfo submit = {};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &slot.cb;
+    if (vkQueueSubmit(command_queue, 1, &submit, slot.fence) != VK_SUCCESS)
+        _THROW_ERROR("Failed to submit upload batch");
+    slot.pending = true;
+}
+
+
 uint8_t* VulkanGSPipeline::beginAppendRecording(size_t staging_bytes) {
     HOST_GUARD;  // the append command buffer must be ordered against any open main batch
     waitAppendFence();
@@ -261,29 +368,7 @@ uint8_t* VulkanGSPipeline::beginAppendRecording(size_t staging_bytes) {
     if (append_stage.allocSize < staging_bytes) {
         freeAppendStage();
         const size_t alloc = std::max<size_t>(2 * staging_bytes, 1 << 20);
-        VkBufferCreateInfo info = {};
-        info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        info.size = alloc;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        if (vkCreateBuffer(device, &info, nullptr, &append_stage.buffer) != VK_SUCCESS)
-            _THROW_ERROR("Failed to create append staging buffer");
-        VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(device, append_stage.buffer, &req);
-        uint32_t type = findMemoryType(physical_device, req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        if (type == UINT32_MAX)
-            _THROW_ERROR("Failed to find append staging memory type");
-        VkMemoryAllocateInfo alloc_info = {};
-        alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = req.size;
-        alloc_info.memoryTypeIndex = type;
-        if (vkAllocateMemory(device, &alloc_info, nullptr, &append_stage.memory) != VK_SUCCESS)
-            throw std::runtime_error("Failed to allocate append staging memory");
-        vkBindBufferMemory(device, append_stage.buffer, append_stage.memory, 0);
-        void* ptr = nullptr;
-        vkMapMemory(device, append_stage.memory, 0, VK_WHOLE_SIZE, 0, &ptr);
-        append_stage.mapped = static_cast<uint8_t*>(ptr);
+        createHostStaging(alloc, append_stage.buffer, append_stage.memory, append_stage.mapped);
         append_stage.allocSize = alloc;
     }
 
@@ -329,6 +414,7 @@ void VulkanGSPipeline::destroyBuffer(_VulkanBuffer &buffer) {
     if (commandBatchInProgress)
         _THROW_ERROR("destroyBuffer called when command batch in progress");
     if (buffer.buffer != VK_NULL_HANDLE) {
+        waitUploads();  // an in-flight upload may still target this buffer
         vkDestroyBuffer(device, buffer.buffer, nullptr);
         vkFreeMemory(device, buffer.memory, nullptr);
         buffer.buffer = VK_NULL_HANDLE;

@@ -135,6 +135,14 @@ void VulkanGSPipeline::cleanup() {
         vkDeviceWaitIdle(device);
         destroyGateBuffers();
         append_pending = false;
+        for (auto& slot : upload_slots) {
+            slot.pending = false;
+            destroyUploadStage(slot);
+            if (slot.fence != VK_NULL_HANDLE) vkDestroyFence(device, slot.fence, nullptr);
+            if (slot.cb != VK_NULL_HANDLE) vkFreeCommandBuffers(device, command_pool, 1, &slot.cb);
+            slot.fence = VK_NULL_HANDLE;
+            slot.cb = VK_NULL_HANDLE;
+        }
         for (auto& b : retired_buffers)
             destroyBuffer(b);
         retired_buffers.clear();
@@ -490,6 +498,9 @@ void VulkanGSPipeline::createCommandPool() {
         _THROW_ERROR("Failed to allocate command buffer");
     if (vkAllocateCommandBuffers(device, &alloc_info, &append_cb) != VK_SUCCESS)
         _THROW_ERROR("Failed to allocate append command buffer");
+    for (auto& slot : upload_slots)
+        if (vkAllocateCommandBuffers(device, &alloc_info, &slot.cb) != VK_SUCCESS)
+            _THROW_ERROR("Failed to allocate upload command buffer");
 }
 
 void VulkanGSPipeline::createFence() {
@@ -502,6 +513,9 @@ void VulkanGSPipeline::createFence() {
         _THROW_ERROR("Failed to create fence");
     if (vkCreateFence(device, &fenceInfo, nullptr, &append_fence) != VK_SUCCESS)
         _THROW_ERROR("Failed to create append fence");
+    for (auto& slot : upload_slots)
+        if (vkCreateFence(device, &fenceInfo, nullptr, &slot.fence) != VK_SUCCESS)
+            _THROW_ERROR("Failed to create upload fence");
 }
 
 void VulkanGSPipeline::createQueryPools() {

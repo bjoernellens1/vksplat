@@ -55,6 +55,13 @@ public:
     void submitAppendRecording();
     VkCommandBuffer appendCommandBuffer() const { return append_cb; }
     VkBuffer appendStagingBuffer() const { return append_stage.buffer; }
+    // Asynchronous keyframe upload: copies `byte_size` bytes once into a persistent host-visible staging ring
+    // slot and submits a dedicated transfer command buffer without a host wait (queue order plus a trailing
+    // barrier serialize it before the next submit). A slot is reused only after its fence has signalled; a
+    // wait is counted in `frame_upload_waits`. `dst` must already have capacity for `byte_size`.
+    void uploadDeviceAsync(_VulkanBuffer& dst, const void* src, size_t byte_size);
+    void waitUploads();
+    bool async_frame_upload = true;
     // Destroys buffers replaced by an append once the GPU is done with them.
     void retireDeviceBuffer(const _VulkanBuffer& old_buffer) { retired_buffers.push_back(old_buffer); }
 
@@ -144,6 +151,21 @@ protected:
     };
     _AppendStage append_stage;
     std::vector<_VulkanBuffer> retired_buffers;
+    static constexpr int kUploadSlots = 3;
+    struct _UploadSlot {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        uint8_t* mapped = nullptr;
+        size_t allocSize = 0;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+        bool pending = false;
+    };
+    _UploadSlot upload_slots[kUploadSlots];
+    int upload_cursor = 0;
+    void waitUploadSlot(_UploadSlot& slot);
+    void destroyUploadStage(_UploadSlot& slot);
+    void createHostStaging(size_t size, VkBuffer& buffer, VkDeviceMemory& memory, uint8_t*& mapped);
     void waitAppendFence();
     void freeAppendStage();
     VkQueryPool timestamp_query_pool;
