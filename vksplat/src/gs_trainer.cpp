@@ -1249,6 +1249,31 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                 }, COMPUTE_SHADER_READ);
             }
+            if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
+                copyFromDevice(buffers.default_dupli_mask);
+                copyFromDevice(buffers.default_split_mask);
+                bool modified_grow = false;
+                for (size_t i = 0; i < num_splats && i < splat_group_ids.size(); ++i) {
+                    if (splat_group_ids[i] >= 0) {
+                        if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i] != 0) {
+                            buffers.default_dupli_mask[i] = 0;
+                            modified_grow = true;
+                        }
+                        if (i < buffers.default_split_mask.size() && buffers.default_split_mask[i] != 0) {
+                            buffers.default_split_mask[i] = 0;
+                            modified_grow = true;
+                        }
+                    }
+                }
+                if (modified_grow) {
+                    copyToDevice(buffers.default_dupli_mask);
+                    copyToDevice(buffers.default_split_mask);
+                    bufferMemoryBarrier({
+                        { buffers.default_dupli_mask.deviceBuffer, TRANSFER_WRITE },
+                        { buffers.default_split_mask.deviceBuffer, TRANSFER_WRITE },
+                    }, COMPUTE_SHADER_READ);
+                }
+            }
 
             num_dupli = executeSum(buffers, buffers.default_dupli_mask);
             num_split = executeSum(buffers, buffers.default_split_mask);
@@ -1412,9 +1437,14 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             copyFromDevice(buffers.default_keep_mask);
             bool modified_keep = false;
             for (size_t i = 0; i < num_splats && i < splat_group_ids.size() && i < buffers.default_keep_mask.size(); ++i) {
-                if (splat_group_ids[i] >= 0 && buffers.default_keep_mask[i] == 0) {
-                    buffers.default_keep_mask[i] = 1;
-                    modified_keep = true;
+                int32_t gid = splat_group_ids[i];
+                if (gid >= 0) {
+                    bool is_retracted = (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u;
+                    int32_t target_keep = is_retracted ? 0 : 1;
+                    if (buffers.default_keep_mask[i] != target_keep) {
+                        buffers.default_keep_mask[i] = target_keep;
+                        modified_keep = true;
+                    }
                 }
             }
             if (modified_keep) {
@@ -1509,6 +1539,15 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
             buffers.num_splats = num_keep;
         }
+        if ((num_dupli + num_split > 0 || num_prune > 0) && !splat_group_ids.empty()) {
+            splat_group_ids.resize(buffers.num_splats, -1);
+            buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+            copyToDevice(buffers.group_ids);
+            syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
+            bufferMemoryBarrier({
+                { buffers.group_ids.deviceBuffer, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+        }
 
         // reset running states
         clearDeviceBuffer(buffers.default_grad, 2*buffers.num_splats);
@@ -1543,13 +1582,35 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         bufferMemoryBarrier({
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
             { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
-        }, COMPUTE_SHADER_READ);
+        }, COMPUTE_SHADER_READ_WRITE);
+        if (!splat_group_ids.empty() && buffers.group_state.deviceSize() > 0) {
+            ensureGroupBuffersOnDevice(buffers, num_splats);
+            Uniform32_t ret_u[2];
+            ret_u[0].u = static_cast<uint32_t>(num_splats);
+            ret_u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+            executeCompute(
+                {{num_splats, 256}},
+                &ret_u, sizeof(ret_u),
+                pipeline_mcmc.mask_retracted_group,
+                {
+                    buffers.group_ids.deviceBuffer,
+                    buffers.group_state.deviceBuffer,
+                    buffers.scales_opacs.deviceBuffer,
+                }
+            );
+            bufferMemoryBarrier({
+                { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, COMPUTE_SHADER_READ);
+        }
         printf("\nreset opacity\n");
         fflush(stdout);
     }
 
   #if 1
-    if (step % config.refine_every == 0 && !(config.selective_plane_freeze && num_anchored_splats > 0)) {
+    if (step % config.refine_every == 0
+        && !(config.selective_plane_freeze && num_anchored_splats > 0)
+        && !(config.mcmc_protect_structural_groups && !splat_group_ids.empty())
+        && splat_group_ids.empty()) {
         executeMortonSorting(renderer_uniforms, buffers);
     }
   #endif
