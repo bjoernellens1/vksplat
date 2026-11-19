@@ -1606,10 +1606,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     }
 
   #if 1
-    if (step % config.refine_every == 0
-        && !(config.selective_plane_freeze && num_anchored_splats > 0)
-        && !(config.mcmc_protect_structural_groups && !splat_group_ids.empty())
-        && splat_group_ids.empty()) {
+    if (step % config.refine_every == 0 && !(config.selective_plane_freeze && num_anchored_splats > 0)) {
         executeMortonSorting(renderer_uniforms, buffers);
     }
   #endif
