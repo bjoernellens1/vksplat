@@ -647,18 +647,18 @@ public:
         snap["scales_opacs"] = buffer_to_array<float, float>(buffers.scales_opacs, 4);
         snap["splat_group_ids"] = get_splat_group_ids();
         snap["splat_entity_ids"] = get_splat_entity_ids();
-        if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.size() > 0) {
-            snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws);
-            snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1);
-            snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2);
-            snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations);
-            snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs);
+        if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.deviceSize() > 0) {
+            snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws, 6, (size_t)-1, "mean");
+            snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1, 48, (size_t)-1, "mean");
+            snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2, 48, (size_t)-1, "mean");
+            snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations, 8, (size_t)-1, "mean");
+            snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs, 8, (size_t)-1, "mean");
         }
-        if (buffers.default_grad.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_grad.size() > 0) {
-            snap["default_grad"] = buffer_to_array<float, float>(buffers.default_grad);
+        if (buffers.default_grad.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_grad.deviceSize() > 0) {
+            snap["default_grad"] = buffer_to_array<float, float>(buffers.default_grad, 2, (size_t)-1, "mean");
         }
-        if (buffers.default_radii.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_radii.size() > 0) {
-            snap["default_radii"] = buffer_to_array<float, float>(buffers.default_radii);
+        if (buffers.default_radii.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_radii.deviceSize() > 0) {
+            snap["default_radii"] = buffer_to_array<float, float>(buffers.default_radii, 1, (size_t)-1, "mean");
         }
         return snap;
     }

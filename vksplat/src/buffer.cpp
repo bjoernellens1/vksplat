@@ -577,8 +577,11 @@ _VulkanBuffer& VulkanGSPipeline::copyToDevice(Buffer<T>& buffer) {
 
     resizeDeviceBuffer(buffer, buffer.size());
     auto& deviceBuffer = buffer.deviceBuffer;
+    const size_t copy_bytes = buffer.byteLength();
+    if (copy_bytes == 0)
+        return deviceBuffer;
 
-    allocStagingBuffer(buffer.byteLength());
+    allocStagingBuffer(copy_bytes);
     {
         std::lock_guard<std::mutex> lock(stager.mutex);
 
@@ -586,15 +589,15 @@ _VulkanBuffer& VulkanGSPipeline::copyToDevice(Buffer<T>& buffer) {
     {
         HOST_GUARD;
         void* temp;
-        vkMapMemory(device, stager.memory, 0, deviceBuffer.size, 0, &temp);
-        memcpy(temp, buffer.data(), buffer.byteLength());
+        vkMapMemory(device, stager.memory, 0, copy_bytes, 0, &temp);
+        memcpy(temp, buffer.data(), copy_bytes);
         vkUnmapMemory(device, stager.memory);
     }
 
         // Copy from staging to device buffer
         DEVICE_GUARD;
         VkBufferCopy copy_region = {};
-        copy_region.size = deviceBuffer.size;
+        copy_region.size = copy_bytes;
         vkCmdCopyBuffer(command_buffer, stager.buffer, deviceBuffer.buffer, 1, &copy_region);
     }
     
