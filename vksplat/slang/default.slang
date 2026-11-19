@@ -39,6 +39,8 @@ struct Uniforms {
     int32_t reset_every;
     int32_t refine_every;
     int32_t pause_refine_after_reset;
+    uint32_t num_groups;
+    uint32_t protect_structural_groups;
 };
 
 
@@ -408,6 +410,9 @@ void prune(
 
 layout(binding=0) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
 layout(binding=1) RWStructuredBuffer<float4> g_scales_opacs;  // (N, 2, 4)
+layout(binding=2) StructuredBuffer<int32_t> group_ids;  // (N,)
+layout(binding=3) StructuredBuffer<uint32_t> group_state;  // (G,) 0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED
+layout(binding=4) StructuredBuffer<uint32_t> splat_state;  // (N,) per-splat evidence state
 
 #define resetOpacity main
 
@@ -420,6 +425,23 @@ void resetOpacity(
     const uint32_t gid = thread_id.x;
     if (gid >= num_splats)
         return;
+
+    {
+        const uint32_t st = splat_state[gid];
+        const int32_t sgid = group_ids[gid];
+        const bool grp_retracted = (sgid >= 0) && (uint32_t(sgid) < uniforms.num_groups) && (group_state[sgid] == 3u);
+        if (grp_retracted || st == 4u) {
+            scales_opacs[gid].a = 0.0;
+            g_scales_opacs[2*gid+0].a = 0.0;
+            g_scales_opacs[2*gid+1].a = 0.0;
+            return;
+        }
+        // State-aware exemption (V17.7): protect ONLY unobserved/occluded (0u) or uncertain (1u) per-splat predictions.
+        // Legacy group mode (st == 0xFFFFFFFFu) reproduces pre-V17.7 unexempted ADC reset; OBSERVED_TRAINABLE (2u),
+        // METRIC_VERIFIED (3u), and MEASURED_FREE (5u) undergo normal ADC reset and recover via active gradients.
+        if (st == 0u || st == 1u)
+            return;
+    }
 
     scales_opacs[gid].a = min(scales_opacs[gid].w, 2.0*uniforms.prune_opa);
     g_scales_opacs[2*gid+0].a = 0.0;

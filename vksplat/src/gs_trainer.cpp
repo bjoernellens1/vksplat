@@ -42,8 +42,8 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     float world_view_transform[16];
     uint32_t num_groups;
     uint32_t protect_locked_groups;
-    uint32_t _pad_opt0;
-    uint32_t _pad_opt1;
+    uint32_t num_anchors;
+    float normal_scale_cap;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -65,6 +65,8 @@ PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
     int32_t reset_every;
     int32_t refine_every;
     int32_t pause_refine_after_reset;
+    uint32_t num_groups;
+    uint32_t protect_structural_groups;
 });
 
 
@@ -104,6 +106,10 @@ void VulkanGSTrainer::cleanup() {
     num_anchored_splats = 0;
     anchored_xyz_snapshot_valid = false;
     selective_freeze_unfrozen = false;
+    splat_states.clear();
+    splat_states.shrink_to_fit();
+    splat_anchors_host.clear();
+    splat_anchors_host.shrink_to_fit();
 
     VulkanGSRenderer::cleanup();
 }
@@ -1068,8 +1074,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     ensureGroupBuffersOnDevice(buffers, num_splats);
     shaderUniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
     shaderUniforms.protect_locked_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
-    shaderUniforms._pad_opt0 = 0u;
-    shaderUniforms._pad_opt1 = 0u;
+    shaderUniforms.num_anchors = static_cast<uint32_t>(buffers.splat_anchor.deviceSize() / 8);
+    shaderUniforms.normal_scale_cap = config.surfel_normal_cap_m * scene_scale;
 
     // execute compute
     size_t alloc_size = num_splats;
@@ -1095,6 +1101,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2*4*alloc_size, true),
             buffers.group_ids.deviceBuffer,
             buffers.group_state.deviceBuffer,
+            buffers.splat_state.deviceBuffer,
+            buffers.splat_anchor.deviceBuffer,
         },
         GATE_OPTIMIZER
     );
@@ -1172,6 +1180,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     uniforms.pause_refine_after_reset = config.pause_refine_after_reset >= 0 ?
         config.pause_refine_after_reset :
         (int32_t)dataset_train.size() + uniforms.refine_every;
+    uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+    uniforms.protect_structural_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
 
     const bool freeze_active = (config.freeze_geometry_after_iter > 0 &&
                                 step >= config.freeze_geometry_after_iter);
@@ -1249,12 +1259,28 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                 }, COMPUTE_SHADER_READ);
             }
-            if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
+            const bool need_host_grow_filter =
+                (config.mcmc_protect_structural_groups && (!splat_group_ids.empty() || !splat_states.empty())) ||
+                (config.cap_max > 0) || (config.cap_speculative_max > 0);
+            if (need_host_grow_filter) {
                 copyFromDevice(buffers.default_dupli_mask);
                 copyFromDevice(buffers.default_split_mask);
                 bool modified_grow = false;
-                for (size_t i = 0; i < num_splats && i < splat_group_ids.size(); ++i) {
-                    if (splat_group_ids[i] >= 0) {
+                size_t cur_spec = 0;
+                for (size_t i = 0; i < num_splats; ++i) {
+                    const int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
+                    const uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
+                    if (gid >= 0)
+                        ++cur_spec;
+                    bool disallow = false;
+                    if (st != 0xFFFFFFFFu) {
+                        // Allow OBSERVED_TRAINABLE (2u), METRIC_VERIFIED (3u), MEASURED_FREE (5u);
+                        // block PREDICTED_UNOBSERVED (0u), OBSERVED_UNCERTAIN (1u), CONTRADICTED (4u).
+                        disallow = (st == 0u || st == 1u || st == 4u);
+                    } else if (config.mcmc_protect_structural_groups && gid >= 0) {
+                        disallow = true;
+                    }
+                    if (disallow) {
                         if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i] != 0) {
                             buffers.default_dupli_mask[i] = 0;
                             modified_grow = true;
@@ -1263,6 +1289,72 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                             buffers.default_split_mask[i] = 0;
                             modified_grow = true;
                         }
+                    }
+                }
+                // Count proposed growth and enforce explicit cap_speculative_max and cap_max
+                size_t prop_total = 0, prop_spec = 0;
+                for (size_t i = 0; i < num_splats; ++i) {
+                    int g = ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ? 1 : 0) +
+                            ((i < buffers.default_split_mask.size() && buffers.default_split_mask[i]) ? 1 : 0);
+                    prop_total += (size_t)g;
+                    if (i < splat_group_ids.size() && splat_group_ids[i] >= 0)
+                        prop_spec += (size_t)g;
+                }
+                const bool over_spec = (config.cap_speculative_max > 0) && (cur_spec + prop_spec > (size_t)config.cap_speculative_max);
+                const bool over_tot = (config.cap_max > 0) && (num_splats + prop_total > (size_t)config.cap_max);
+                if (over_spec || over_tot) {
+                    copyFromDevice(buffers.default_grad);
+                    auto score_of = [&](size_t i) -> float {
+                        if (2 * i + 1 >= buffers.default_grad.size())
+                            return 0.0f;
+                        return buffers.default_grad[2 * i] / std::max(buffers.default_grad[2 * i + 1], 1.0f);
+                    };
+                    if (over_spec) {
+                        size_t allow_spec = (cur_spec < (size_t)config.cap_speculative_max) ? ((size_t)config.cap_speculative_max - cur_spec) : 0;
+                        std::vector<std::pair<float, size_t>> cand;
+                        for (size_t i = 0; i < num_splats; ++i) {
+                            if (i < splat_group_ids.size() && splat_group_ids[i] >= 0 &&
+                                ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ||
+                                 (i < buffers.default_split_mask.size() && buffers.default_split_mask[i]))) {
+                                cand.push_back({score_of(i), i});
+                            }
+                        }
+                        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                        for (size_t c = allow_spec; c < cand.size(); ++c) {
+                            size_t idx = cand[c].second;
+                            buffers.default_dupli_mask[idx] = 0;
+                            buffers.default_split_mask[idx] = 0;
+                        }
+                        modified_grow = true;
+                    }
+                    // Recompute total after speculative cap
+                    prop_total = 0;
+                    for (size_t i = 0; i < num_splats; ++i) {
+                        if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ++prop_total;
+                        if (i < buffers.default_split_mask.size() && buffers.default_split_mask[i]) ++prop_total;
+                    }
+                    if (config.cap_max > 0 && num_splats + prop_total > (size_t)config.cap_max) {
+                        size_t allow_tot = (num_splats < (size_t)config.cap_max) ? ((size_t)config.cap_max - num_splats) : 0;
+                        std::vector<std::pair<float, size_t>> cand;
+                        cand.reserve(prop_total);
+                        for (size_t i = 0; i < num_splats; ++i) {
+                            if ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ||
+                                (i < buffers.default_split_mask.size() && buffers.default_split_mask[i])) {
+                                cand.push_back({score_of(i), i});
+                            }
+                        }
+                        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                        size_t used = 0;
+                        for (const auto& [sc, idx] : cand) {
+                            int want = (buffers.default_dupli_mask[idx] ? 1 : 0) + (buffers.default_split_mask[idx] ? 1 : 0);
+                            if (used + (size_t)want <= allow_tot) {
+                                used += (size_t)want;
+                            } else {
+                                buffers.default_dupli_mask[idx] = 0;
+                                buffers.default_split_mask[idx] = 0;
+                            }
+                        }
+                        modified_grow = true;
                     }
                 }
                 if (modified_grow) {
@@ -1329,7 +1421,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
                 copyFromDevice(buffers._temp_indices);
                 if (!splat_group_ids.empty()) {
                     size_t base_n = splat_group_ids.size();
@@ -1347,6 +1439,24 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                         int32_t src = buffers._temp_indices[k];
                         if (src >= 0 && (size_t)src < base_n)
                             splat_entity_ids[base_n + k] = splat_entity_ids[src];
+                    }
+                }
+                if (!splat_states.empty()) {
+                    size_t base_n = splat_states.size();
+                    splat_states.resize(base_n + num_dupli, 5u);
+                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_states[base_n + k] = splat_states[src];
+                    }
+                }
+                if (!splat_anchors_host.empty()) {
+                    size_t base_n = splat_anchors_host.size() / 8;
+                    splat_anchors_host.resize(8 * (base_n + num_dupli), 0.0f);
+                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
                     }
                 }
             }
@@ -1380,7 +1490,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
                 copyFromDevice(buffers._temp_indices);
                 if (!splat_group_ids.empty()) {
                     size_t base_n = splat_group_ids.size();
@@ -1398,6 +1508,24 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                         int32_t src = buffers._temp_indices[k];
                         if (src >= 0 && (size_t)src < base_n)
                             splat_entity_ids[base_n + k] = splat_entity_ids[src];
+                    }
+                }
+                if (!splat_states.empty()) {
+                    size_t base_n = splat_states.size();
+                    splat_states.resize(base_n + num_split, 5u);
+                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            splat_states[base_n + k] = splat_states[src];
+                    }
+                }
+                if (!splat_anchors_host.empty()) {
+                    size_t base_n = splat_anchors_host.size() / 8;
+                    splat_anchors_host.resize(8 * (base_n + num_split), 0.0f);
+                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
+                        int32_t src = buffers._temp_indices[k];
+                        if (src >= 0 && (size_t)src < base_n)
+                            std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
                     }
                 }
             }
@@ -1433,16 +1561,26 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, COMPUTE_SHADER_READ);
         }
-        if (config.mcmc_protect_structural_groups && !splat_group_ids.empty()) {
+        if (!splat_states.empty() || (config.mcmc_protect_structural_groups && !splat_group_ids.empty())) {
             copyFromDevice(buffers.default_keep_mask);
             bool modified_keep = false;
-            for (size_t i = 0; i < num_splats && i < splat_group_ids.size() && i < buffers.default_keep_mask.size(); ++i) {
-                int32_t gid = splat_group_ids[i];
-                if (gid >= 0) {
-                    bool is_retracted = (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u;
-                    int32_t target_keep = is_retracted ? 0 : 1;
-                    if (buffers.default_keep_mask[i] != target_keep) {
-                        buffers.default_keep_mask[i] = target_keep;
+            for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
+                int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
+                uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
+                bool grp_ret = (gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u);
+                if (grp_ret) {
+                    if (buffers.default_keep_mask[i] != 0) {
+                        buffers.default_keep_mask[i] = 0;
+                        modified_keep = true;
+                    }
+                } else if (st == 0u || st == 1u) {
+                    if (buffers.default_keep_mask[i] != 1) {
+                        buffers.default_keep_mask[i] = 1;
+                        modified_keep = true;
+                    }
+                } else if (st == 0xFFFFFFFFu && config.mcmc_protect_structural_groups && gid >= 0) {
+                    if (buffers.default_keep_mask[i] != 1) {
+                        buffers.default_keep_mask[i] = 1;
                         modified_keep = true;
                     }
                 }
@@ -1459,7 +1597,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         int num_prune = (int)num_splats - num_keep;
 
         if (num_prune > 0) {
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
                 copyFromDevice(buffers.default_keep_mask);
                 if (!splat_group_ids.empty()) {
                     std::vector<int32_t> kept_gids;
@@ -1482,6 +1620,30 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     }
                     kept_eids.resize(num_keep, -1);
                     splat_entity_ids = std::move(kept_eids);
+                }
+                if (!splat_states.empty()) {
+                    std::vector<uint32_t> kept_st;
+                    kept_st.reserve(num_keep);
+                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
+                        if (buffers.default_keep_mask[i]) {
+                            kept_st.push_back(i < splat_states.size() ? splat_states[i] : 0xFFFFFFFFu);
+                        }
+                    }
+                    kept_st.resize(num_keep, 0xFFFFFFFFu);
+                    splat_states = std::move(kept_st);
+                }
+                if (!splat_anchors_host.empty()) {
+                    std::vector<float> kept_anc(8 * num_keep, 0.0f);
+                    size_t dst_k = 0;
+                    size_t n_anc = splat_anchors_host.size() / 8;
+                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size() && dst_k < (size_t)num_keep; ++i) {
+                        if (buffers.default_keep_mask[i]) {
+                            if (i < n_anc)
+                                std::memcpy(&kept_anc[8 * dst_k], &splat_anchors_host[8 * i], 8 * sizeof(float));
+                            ++dst_k;
+                        }
+                    }
+                    splat_anchors_host = std::move(kept_anc);
                 }
             }
             executeCumsum(buffers, buffers.default_keep_mask, buffers._temp_indices);
@@ -1538,14 +1700,32 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
             buffers.num_splats = num_keep;
         }
-        if ((num_dupli + num_split > 0 || num_prune > 0) && !splat_group_ids.empty()) {
-            splat_group_ids.resize(buffers.num_splats, -1);
-            buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
-            copyToDevice(buffers.group_ids);
-            syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
-            bufferMemoryBarrier({
-                { buffers.group_ids.deviceBuffer, TRANSFER_WRITE },
-            }, COMPUTE_SHADER_READ_WRITE);
+        if (num_dupli + num_split > 0 || num_prune > 0) {
+            if (!splat_group_ids.empty()) {
+                splat_group_ids.resize(buffers.num_splats, -1);
+                buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+                copyToDevice(buffers.group_ids);
+                syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
+                bufferMemoryBarrier({
+                    { buffers.group_ids.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ_WRITE);
+            }
+            if (!splat_states.empty()) {
+                splat_states.resize(buffers.num_splats, 0xFFFFFFFFu);
+                buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                copyToDevice(buffers.splat_state);
+                bufferMemoryBarrier({
+                    { buffers.splat_state.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ_WRITE);
+            }
+            if (!splat_anchors_host.empty()) {
+                splat_anchors_host.resize(8 * buffers.num_splats, 0.0f);
+                buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+                copyToDevice(buffers.splat_anchor);
+                bufferMemoryBarrier({
+                    { buffers.splat_anchor.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ_WRITE);
+            }
         }
 
         // reset running states
@@ -1567,8 +1747,11 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         (config.stop_reset_at == -1 || step <= config.stop_reset_at)
     ) {
         num_splats = buffers.num_splats;
+        ensureGroupBuffersOnDevice(buffers, num_splats);
         uniforms.num_splats = (uint32_t)num_splats;
         uniforms.old_num_splats = (uint32_t)num_splats;
+        uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+        uniforms.protect_structural_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
         executeCompute(
             {{num_splats, 256}},
             &uniforms, sizeof(uniforms),
@@ -1576,13 +1759,16 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             {
                 buffers.scales_opacs.deviceBuffer,
                 buffers.g_scales_opacs.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
             }
         );
         bufferMemoryBarrier({
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
             { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
         }, COMPUTE_SHADER_READ_WRITE);
-        if (!splat_group_ids.empty() && buffers.group_state.deviceSize() > 0) {
+        if ((!splat_group_ids.empty() || !splat_states.empty()) && buffers.group_state.deviceSize() > 0) {
             ensureGroupBuffersOnDevice(buffers, num_splats);
             Uniform32_t ret_u[2];
             ret_u[0].u = static_cast<uint32_t>(num_splats);
@@ -1595,6 +1781,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     buffers.group_ids.deviceBuffer,
                     buffers.group_state.deviceBuffer,
                     buffers.scales_opacs.deviceBuffer,
+                    buffers.splat_state.deviceBuffer,
                 }
             );
             bufferMemoryBarrier({
@@ -1649,6 +1836,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
             { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ);
         executeCompute(
             {{num_splats, kGroupSize}},
@@ -1659,6 +1847,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 resizeDeviceBuffer(buffers.mcmc_sample_probs, num_splats),
                 buffers.group_ids.deviceBuffer,
                 buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
             }
         );
 
@@ -1682,6 +1871,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 { buffers.mcmc_n_idx_buffer.deviceBuffer, TRANSFER_WRITE },
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ_WRITE);
             executeCompute(
                 {{num_splats, kGroupSize}},
@@ -1694,6 +1884,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
                     buffers.group_ids.deviceBuffer,
                     buffers.group_state.deviceBuffer,
+                    buffers.splat_state.deviceBuffer,
                 }
             );
 
@@ -1741,29 +1932,50 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }
             );
 
-            // MC-1: Update splat_group_ids and splat_entity_ids for relocated dead splats
-            if (!splat_group_ids.empty()) {
+            // MC-1: Update splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host for relocated dead splats
+            if (!splat_group_ids.empty() || !splat_states.empty()) {
                 copyFromDevice(buffers.mcmc_index_map);
                 if (splat_group_ids.size() < num_splats)
                     splat_group_ids.resize(num_splats, -1);
                 if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
                     splat_entity_ids.resize(num_splats, -1);
+                if (!splat_states.empty() && splat_states.size() < num_splats)
+                    splat_states.resize(num_splats, 0xFFFFFFFFu);
+                if (!splat_anchors_host.empty() && splat_anchors_host.size() < 8 * num_splats)
+                    splat_anchors_host.resize(8 * num_splats, 0.0f);
                 std::vector<int32_t> old_gids = splat_group_ids;
                 std::vector<int32_t> old_eids = splat_entity_ids;
+                std::vector<uint32_t> old_sts = splat_states;
+                std::vector<float> old_anc = splat_anchors_host;
                 for (size_t i = 0; i < num_splats && i < buffers.mcmc_index_map.size(); ++i) {
                     int32_t src = buffers.mcmc_index_map[i];
                     if (src >= 0 && (size_t)src < num_splats && (size_t)src != i) {
-                        if (protect_groups && old_gids[i] >= 0) {
+                        uint32_t st_i = (!old_sts.empty() && i < old_sts.size()) ? old_sts[i] : 0xFFFFFFFFu;
+                        if (st_i == 0u || st_i == 1u || (st_i == 0xFFFFFFFFu && protect_groups && old_gids[i] >= 0)) {
                             continue;
                         }
                         splat_group_ids[i] = old_gids[src];
                         if (!splat_entity_ids.empty()) {
                             splat_entity_ids[i] = old_eids[src];
                         }
+                        if (!splat_states.empty()) {
+                            splat_states[i] = old_sts[src];
+                        }
+                        if (!splat_anchors_host.empty()) {
+                            std::memcpy(&splat_anchors_host[8 * i], &old_anc[8 * src], 8 * sizeof(float));
+                        }
                     }
                 }
                 buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
                 copyToDevice(buffers.group_ids);
+                if (!splat_states.empty()) {
+                    buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                    copyToDevice(buffers.splat_state);
+                }
+                if (!splat_anchors_host.empty()) {
+                    buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+                    copyToDevice(buffers.splat_anchor);
+                }
             }
             mcmc_relocated_count += (size_t)num_relocate;
         }
@@ -1780,6 +1992,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ);
             executeCompute(
                 {{num_splats, kGroupSize}},
@@ -1790,6 +2003,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     buffers.mcmc_sample_probs.deviceBuffer,
                     buffers.group_ids.deviceBuffer,
                     buffers.group_state.deviceBuffer,
+                    buffers.splat_state.deviceBuffer,
                 }
             );
 
@@ -1860,19 +2074,38 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 );
 
                 resizeAndCopyDeviceBuffer(buffers.group_ids, alloc_size, false);
-                if (!splat_group_ids.empty()) {
+                resizeAndCopyDeviceBuffer(buffers.splat_state, alloc_size, false);
+                if (!splat_anchors_host.empty())
+                    resizeAndCopyDeviceBuffer(buffers.splat_anchor, 8 * alloc_size, false);
+                if (!splat_group_ids.empty() || !splat_states.empty()) {
                     copyFromDevice(buffers.mcmc_index_map);
                     if (splat_group_ids.size() < num_splats)
                         splat_group_ids.resize(num_splats, -1);
                     splat_group_ids.resize(new_num_splats, -1);
                     if (!splat_entity_ids.empty())
                         splat_entity_ids.resize(new_num_splats, -1);
+                    if (!splat_states.empty()) {
+                        if (splat_states.size() < num_splats)
+                            splat_states.resize(num_splats, 0xFFFFFFFFu);
+                        splat_states.resize(new_num_splats, 5u);
+                    }
+                    if (!splat_anchors_host.empty()) {
+                        if (splat_anchors_host.size() < 8 * num_splats)
+                            splat_anchors_host.resize(8 * num_splats, 0.0f);
+                        splat_anchors_host.resize(8 * new_num_splats, 0.0f);
+                    }
                     for (size_t k = 0; k < num_add && k < buffers.mcmc_index_map.size(); ++k) {
                         int32_t src = buffers.mcmc_index_map[k];
                         if (src >= 0 && (size_t)src < num_splats) {
                             splat_group_ids[num_splats + k] = splat_group_ids[src];
                             if (!splat_entity_ids.empty()) {
                                 splat_entity_ids[num_splats + k] = splat_entity_ids[src];
+                            }
+                            if (!splat_states.empty()) {
+                                splat_states[num_splats + k] = splat_states[src];
+                            }
+                            if (!splat_anchors_host.empty()) {
+                                std::memcpy(&splat_anchors_host[8 * (num_splats + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
                             }
                         }
                     }
@@ -1882,6 +2115,30 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                         splat_group_ids.data() + num_splats,
                         num_add * sizeof(int32_t)
                     );
+                    if (!splat_states.empty()) {
+                        uploadDeviceSlice(
+                            buffers.splat_state.deviceBuffer,
+                            num_splats * sizeof(uint32_t),
+                            splat_states.data() + num_splats,
+                            num_add * sizeof(uint32_t)
+                        );
+                    } else {
+                        std::vector<uint32_t> def_st(num_add, 0xFFFFFFFFu);
+                        uploadDeviceSlice(
+                            buffers.splat_state.deviceBuffer,
+                            num_splats * sizeof(uint32_t),
+                            def_st.data(),
+                            num_add * sizeof(uint32_t)
+                        );
+                    }
+                    if (!splat_anchors_host.empty()) {
+                        uploadDeviceSlice(
+                            buffers.splat_anchor.deviceBuffer,
+                            8 * num_splats * sizeof(float),
+                            splat_anchors_host.data() + 8 * num_splats,
+                            8 * num_add * sizeof(float)
+                        );
+                    }
                 } else {
                     std::vector<int32_t> neg_ones(num_add, -1);
                     uploadDeviceSlice(
@@ -1889,6 +2146,13 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                         num_splats * sizeof(int32_t),
                         neg_ones.data(),
                         num_add * sizeof(int32_t)
+                    );
+                    std::vector<uint32_t> def_st(num_add, 0xFFFFFFFFu);
+                    uploadDeviceSlice(
+                        buffers.splat_state.deviceBuffer,
+                        num_splats * sizeof(uint32_t),
+                        def_st.data(),
+                        num_add * sizeof(uint32_t)
                     );
                 }
                 buffers.num_splats = new_num_splats;
@@ -1923,6 +2187,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
         { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
     executeCompute(
         {{buffers.num_splats, kGroupSize}},
@@ -1935,6 +2200,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             buffers.scales_opacs.deviceBuffer,
             buffers.group_ids.deviceBuffer,
             buffers.group_state.deviceBuffer,
+            buffers.splat_state.deviceBuffer,
         },
         GATE_POST
     );
@@ -2042,8 +2308,8 @@ void VulkanGSTrainer::executeMortonSorting(
     applyIndex(buffers.default_grad, 2*2);
     barrierAllGaussParams(buffers);
 
-    // MC-1: Permute splat_group_ids and splat_entity_ids to match Morton-sorted order
-    if (!splat_group_ids.empty() || !splat_entity_ids.empty()) {
+    // MC-1: Permute splat_group_ids, splat_entity_ids, splat_states, and splat_anchors_host to match Morton-sorted order
+    if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
         copyFromDevice(buffers.sorted_gauss_idx());
         const auto& idx_buf = buffers.sorted_gauss_idx();
         if (!splat_group_ids.empty()) {
@@ -2071,6 +2337,35 @@ void VulkanGSTrainer::executeMortonSorting(
                 }
             }
             splat_entity_ids = std::move(new_eids);
+        }
+        if (!splat_states.empty()) {
+            if (splat_states.size() < num_splats)
+                splat_states.resize(num_splats, 0xFFFFFFFFu);
+            std::vector<uint32_t> new_sts(num_splats, 0xFFFFFFFFu);
+            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
+                int32_t src = idx_buf[i];
+                if (src >= 0 && (size_t)src < splat_states.size()) {
+                    new_sts[i] = splat_states[src];
+                }
+            }
+            splat_states = std::move(new_sts);
+            buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+            copyToDevice(buffers.splat_state);
+        }
+        if (!splat_anchors_host.empty()) {
+            if (splat_anchors_host.size() < 8 * num_splats)
+                splat_anchors_host.resize(8 * num_splats, 0.0f);
+            std::vector<float> new_anc(8 * num_splats, 0.0f);
+            size_t n_anc = splat_anchors_host.size() / 8;
+            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
+                int32_t src = idx_buf[i];
+                if (src >= 0 && (size_t)src < n_anc) {
+                    std::memcpy(&new_anc[8 * i], &splat_anchors_host[8 * src], 8 * sizeof(float));
+                }
+            }
+            splat_anchors_host = std::move(new_anc);
+            buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+            copyToDevice(buffers.splat_anchor);
         }
     }
 
@@ -2385,6 +2680,47 @@ void VulkanGSTrainer::ensureGroupBuffersOnDevice(
         copyToDevice(buffers.group_ids);
     }
     syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
+
+    // Ensure splat_state on device (defaults to 0xFFFFFFFFu = LEGACY_GROUP fallback when unset)
+    if (num_splats > 0 && (buffers.splat_state.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        buffers.splat_state.deviceBuffer.size < num_splats * sizeof(uint32_t))) {
+        size_t old_dev_count = buffers.splat_state.deviceSize();
+        if (!splat_states.empty()) {
+            if (splat_states.size() < num_splats)
+                splat_states.resize(num_splats, 0xFFFFFFFFu);
+            buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+            copyToDevice(buffers.splat_state);
+        } else {
+            resizeAndCopyDeviceBuffer(buffers.splat_state, num_splats, false);
+            if (num_splats > old_dev_count) {
+                std::vector<uint32_t> def_st(num_splats - old_dev_count, 0xFFFFFFFFu);
+                uploadDeviceSlice(
+                    buffers.splat_state.deviceBuffer,
+                    old_dev_count * sizeof(uint32_t),
+                    def_st.data(),
+                    def_st.size() * sizeof(uint32_t)
+                );
+            }
+        }
+    } else if (buffers.splat_state.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        buffers.splat_state.assign(1, 0xFFFFFFFFu);
+        copyToDevice(buffers.splat_state);
+    }
+
+    // Ensure splat_anchor has at least a valid dummy 8-float allocation when empty, or full 8*N when populated
+    if (!splat_anchors_host.empty()) {
+        if (splat_anchors_host.size() < 8 * num_splats)
+            splat_anchors_host.resize(8 * num_splats, 0.0f);
+        if (buffers.splat_anchor.deviceBuffer.buffer == VK_NULL_HANDLE ||
+            buffers.splat_anchor.deviceBuffer.size < 8 * num_splats * sizeof(float)) {
+            buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.begin() + 8 * num_splats);
+            copyToDevice(buffers.splat_anchor);
+        }
+    } else if (buffers.splat_anchor.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        buffers.splat_anchor.assign(8, 0.0f);
+        copyToDevice(buffers.splat_anchor);
+        buffers.splat_anchor.deviceBuffer.size = 0;  // num_anchors = 0 in shader
+    }
 }
 
 void VulkanGSTrainer::set_group_states(
@@ -2437,6 +2773,217 @@ void VulkanGSTrainer::set_group_state(
     set_group_states(buffers, &group_id, &state, 1);
 }
 
+void VulkanGSTrainer::set_splat_states_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    const uint32_t* rows,
+    const uint32_t* states,
+    size_t count
+) {
+    if (count == 0 || buffers.num_splats == 0)
+        return;
+    HOST_GUARD;
+    if (splat_states.size() < buffers.num_splats)
+        splat_states.resize(buffers.num_splats, 0xFFFFFFFFu);
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+    uint32_t lo = buffers.num_splats, hi = 0;
+    bool any_contra = false;
+    for (size_t k = 0; k < count; ++k) {
+        uint32_t r = rows[k];
+        if (r < buffers.num_splats) {
+            splat_states[r] = states[k];
+            lo = std::min(lo, r);
+            hi = std::max(hi, r);
+            if (states[k] == 4u)
+                any_contra = true;
+        }
+    }
+    if (lo <= hi) {
+        uploadDeviceSlice(
+            buffers.splat_state.deviceBuffer,
+            static_cast<size_t>(lo) * sizeof(uint32_t),
+            &splat_states[lo],
+            static_cast<size_t>(hi - lo + 1) * sizeof(uint32_t)
+        );
+    }
+    if (any_contra) {
+        DEVICE_GUARD;
+        Uniform32_t u[2];
+        u[0].u = static_cast<uint32_t>(buffers.num_splats);
+        u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+        bufferMemoryBarrier({
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+        executeCompute(
+            {{buffers.num_splats, 256}},
+            &u, sizeof(u),
+            pipeline_mcmc.mask_retracted_group,
+            {
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.scales_opacs.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+            }
+        );
+        bufferMemoryBarrier({{ buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE }}, COMPUTE_SHADER_READ_WRITE);
+    }
+}
+
+void VulkanGSTrainer::set_splat_anchors(
+    VulkanGSPipelineBuffers& buffers,
+    const float* anchors_8,
+    size_t count
+) {
+    HOST_GUARD;
+    if (count == 0) {
+        splat_anchors_host.clear();
+        if (buffers.splat_anchor.deviceBuffer.buffer != VK_NULL_HANDLE)
+            buffers.splat_anchor.deviceBuffer.size = 0;
+        return;
+    }
+    splat_anchors_host.assign(anchors_8, anchors_8 + 8 * count);
+    if (splat_anchors_host.size() < 8 * buffers.num_splats)
+        splat_anchors_host.resize(8 * buffers.num_splats, 0.0f);
+    buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+    copyToDevice(buffers.splat_anchor);
+}
+
+void VulkanGSTrainer::set_splat_anchors_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    const uint32_t* rows,
+    const float* anchors_8,
+    size_t count
+) {
+    if (count == 0 || buffers.num_splats == 0)
+        return;
+    HOST_GUARD;
+    if (splat_anchors_host.size() < 8 * buffers.num_splats)
+        splat_anchors_host.resize(8 * buffers.num_splats, 0.0f);
+    if (buffers.splat_anchor.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        buffers.splat_anchor.deviceBuffer.allocSize < 8 * buffers.num_splats * sizeof(float)) {
+        buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.begin() + 8 * buffers.num_splats);
+        copyToDevice(buffers.splat_anchor);
+    }
+    buffers.splat_anchor.deviceBuffer.size = 8 * buffers.num_splats * sizeof(float);
+    uint32_t lo = buffers.num_splats, hi = 0;
+    for (size_t k = 0; k < count; ++k) {
+        uint32_t r = rows[k];
+        if (r < buffers.num_splats) {
+            std::memcpy(&splat_anchors_host[8 * r], &anchors_8[8 * k], 8 * sizeof(float));
+            lo = std::min(lo, r);
+            hi = std::max(hi, r);
+        }
+    }
+    if (lo <= hi) {
+        uploadDeviceSlice(
+            buffers.splat_anchor.deviceBuffer,
+            8 * static_cast<size_t>(lo) * sizeof(float),
+            &splat_anchors_host[8 * lo],
+            8 * static_cast<size_t>(hi - lo + 1) * sizeof(float)
+        );
+    }
+}
+
+void VulkanGSTrainer::reanchor_splats_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    const uint32_t* rows,
+    const float* xyz,
+    const float* scales,
+    const float* quats,
+    const float* sh_dc,
+    const uint32_t* states,
+    size_t count
+) {
+    if (count == 0 || buffers.num_splats == 0)
+        return;
+    std::vector<uint32_t> valid_rows;
+    std::vector<float> values;
+    valid_rows.reserve(count);
+    values.reserve(10 * count);
+    for (size_t k = 0; k < count; ++k) {
+        uint32_t r = rows[k];
+        if (r >= buffers.num_splats)
+            continue;
+        valid_rows.push_back(r);
+        size_t base = values.size();
+        values.resize(base + 10);
+        std::memcpy(&values[base + 0], xyz + 3 * k, 3 * sizeof(float));
+        std::memcpy(&values[base + 3], scales + 3 * k, 3 * sizeof(float));
+        std::memcpy(&values[base + 6], quats + 4 * k, 4 * sizeof(float));
+    }
+    const size_t n_valid = valid_rows.size();
+    if (n_valid == 0)
+        return;
+
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+    const size_t alloc_n = buffers.num_splats;
+    resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 2 * 3 * alloc_n, true);
+    resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * alloc_n, true);
+    resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * alloc_n, true);
+
+    resizeDeviceBuffer(group_op_rows, n_valid);
+    resizeDeviceBuffer(group_op_vals, 10 * n_valid);
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, valid_rows.data(), n_valid * sizeof(uint32_t));
+    uploadDeviceSlice(group_op_vals.deviceBuffer, 0, values.data(), values.size() * sizeof(float));
+
+    {
+        DEVICE_GUARD;
+        Uniform32_t uniforms[1];
+        uniforms[0].u = static_cast<uint32_t>(n_valid);
+        bufferMemoryBarrier({
+            { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+            { group_op_vals.deviceBuffer, TRANSFER_WRITE },
+            { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+        executeCompute(
+            {{n_valid, 64}},
+            &uniforms, sizeof(uniforms),
+            pipeline_mcmc.update_group_rows,
+            {
+                group_op_rows.deviceBuffer,
+                group_op_vals.deviceBuffer,
+                buffers.xyz_ws.deviceBuffer,
+                buffers.rotations.deviceBuffer,
+                buffers.scales_opacs.deviceBuffer,
+                buffers.g_xyz_ws.deviceBuffer,
+                buffers.g_rotations.deviceBuffer,
+                buffers.g_scales_opacs.deviceBuffer,
+            }
+        );
+        bufferMemoryBarrier({
+            { buffers.xyz_ws.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.rotations.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.g_xyz_ws.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.g_rotations.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+    }
+
+    if (sh_dc != nullptr) {
+        HOST_GUARD;
+        static constexpr size_t kShDim = 12;
+        for (size_t k = 0; k < count; ++k) {
+            uint32_t r = rows[k];
+            if (r >= buffers.num_splats)
+                continue;
+            size_t block = r / SH_REORDER_SIZE;
+            size_t lane = r % SH_REORDER_SIZE;
+            size_t byte_off = (block * kShDim * SH_REORDER_SIZE + lane) * 4 * sizeof(float);
+            uploadDeviceSlice(buffers.sh_coeffs.deviceBuffer, byte_off, sh_dc + 3 * k, 3 * sizeof(float));
+        }
+    }
+
+    if (states != nullptr) {
+        set_splat_states_sparse(buffers, rows, states, count);
+    }
+}
+
 void VulkanGSTrainer::retract_group_sparse(
     VulkanGSPipelineBuffers& buffers,
     int32_t group_id
@@ -2457,6 +3004,7 @@ void VulkanGSTrainer::retract_group_sparse(
         { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
     }, COMPUTE_SHADER_READ_WRITE);
     executeCompute(
         {{buffers.num_splats, kGroupSize}},
@@ -2466,6 +3014,7 @@ void VulkanGSTrainer::retract_group_sparse(
             buffers.group_ids.deviceBuffer,
             buffers.group_state.deviceBuffer,
             buffers.scales_opacs.deviceBuffer,
+            buffers.splat_state.deviceBuffer,
         }
     );
     bufferMemoryBarrier({
@@ -2582,7 +3131,8 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
     keep.reserve(old_n);
     for (size_t i = 0; i < old_n; ++i) {
         const int32_t gid = i < splat_group_ids.size() ? splat_group_ids[i] : -1;
-        const bool retracted = gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u;
+        const uint32_t st = i < splat_states.size() ? splat_states[i] : 0xFFFFFFFFu;
+        const bool retracted = (gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u) || (st == 4u);
         if (!retracted) {
             index_map[i] = static_cast<int32_t>(keep.size());
             keep.push_back(static_cast<uint32_t>(i));
@@ -2605,7 +3155,8 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
         {&buffers.sh_coeffs.deviceBuffer, 0, true}, {&buffers.g_sh_coeffs_1.deviceBuffer, 0, true},
         {&buffers.g_sh_coeffs_2.deviceBuffer, 0, true}, {&buffers.xyz_ws.deviceBuffer, 3, false},
         {&buffers.rotations.deviceBuffer, 4, false}, {&buffers.scales_opacs.deviceBuffer, 4, false},
-        {&buffers.group_ids.deviceBuffer, 1, false}, {&buffers.g_xyz_ws.deviceBuffer, 6, false},
+        {&buffers.group_ids.deviceBuffer, 1, false}, {&buffers.splat_state.deviceBuffer, 1, false},
+        {&buffers.splat_anchor.deviceBuffer, 8, false}, {&buffers.g_xyz_ws.deviceBuffer, 6, false},
         {&buffers.g_rotations.deviceBuffer, 8, false}, {&buffers.g_scales_opacs.deviceBuffer, 8, false},
         {&buffers.default_grad.deviceBuffer, 2, false}, {&buffers.default_radii.deviceBuffer, 1, false},
     };
@@ -2664,6 +3215,20 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
     };
     remap(splat_group_ids);
     remap(splat_entity_ids);
+    if (!splat_states.empty()) {
+        splat_states.resize(old_n, 0xFFFFFFFFu);
+        std::vector<uint32_t> out_st(new_n);
+        for (size_t k = 0; k < new_n; ++k)
+            out_st[k] = splat_states[keep[k]];
+        splat_states = std::move(out_st);
+    }
+    if (!splat_anchors_host.empty()) {
+        splat_anchors_host.resize(8 * old_n, 0.0f);
+        std::vector<float> out_anc(8 * new_n, 0.0f);
+        for (size_t k = 0; k < new_n; ++k)
+            std::memcpy(&out_anc[8 * k], &splat_anchors_host[8 * keep[k]], 8 * sizeof(float));
+        splat_anchors_host = std::move(out_anc);
+    }
     buffers.num_splats = new_n;
     return index_map;
 }
@@ -2682,7 +3247,8 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     const float* new_scales,
     const float* new_opacities,
     const int32_t* new_group_ids,
-    size_t n_add
+    size_t n_add,
+    const uint32_t* new_splat_states
 ) {
     HOST_GUARD;
     if (n_add == 0)
@@ -2715,8 +3281,17 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     const size_t off_rot = off_xyz + 3 * n_add * sizeof(float);
     const size_t off_so = off_rot + 4 * n_add * sizeof(float);
     const size_t off_gid = off_so + 4 * n_add * sizeof(float);
-    const size_t off_sh = off_gid + n_add * sizeof(int32_t);
+    const size_t off_sst = off_gid + n_add * sizeof(int32_t);
+    const size_t off_sh = off_sst + n_add * sizeof(uint32_t);
     const size_t staging_bytes = off_sh + sh_vec4 * 4 * sizeof(float);
+
+    std::vector<uint32_t> add_sst(n_add, 0xFFFFFFFFu);
+    if (new_splat_states != nullptr) {
+        std::memcpy(add_sst.data(), new_splat_states, n_add * sizeof(uint32_t));
+    } else if (!splat_states.empty()) {
+        for (size_t i = 0; i < n_add; ++i)
+            add_sst[i] = (add_gids[i] >= 0) ? 0u : 5u;
+    }
 
     uint8_t* stage = beginAppendRecording(staging_bytes);
     const VkCommandBuffer cb = appendCommandBuffer();
@@ -2734,6 +3309,7 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         st_so[4 * i + 3] = new_opacities[i];
     }
     std::memcpy(stage + off_gid, add_gids.data(), n_add * sizeof(int32_t));
+    std::memcpy(stage + off_sst, add_sst.data(), n_add * sizeof(uint32_t));
 
     struct Vec4 { float v[4]; };
     Vec4* st_sh = reinterpret_cast<Vec4*>(stage + off_sh);
@@ -2798,6 +3374,9 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     grow(buffers.rotations, 4 * new_n, false);
     grow(buffers.scales_opacs, 4 * new_n, false);
     grow(buffers.group_ids, new_n, false);
+    grow(buffers.splat_state, new_n, false);
+    if (!splat_anchors_host.empty())
+        grow(buffers.splat_anchor, 8 * new_n, true);
     // optimizer moments and densification statistics of existing splats are preserved, new ones start at zero
     grow(buffers.g_xyz_ws, 2 * 3 * new_n, true);
     grow(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), true);
@@ -2824,6 +3403,10 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         VkBufferCopy region{off_gid, old_n * sizeof(int32_t), n_add * sizeof(int32_t)};
         vkCmdCopyBuffer(cb, src, buffers.group_ids.deviceBuffer.buffer, 1, &region);
     }
+    {
+        VkBufferCopy region{off_sst, old_n * sizeof(uint32_t), n_add * sizeof(uint32_t)};
+        vkCmdCopyBuffer(cb, src, buffers.splat_state.deviceBuffer.buffer, 1, &region);
+    }
     vkCmdCopyBuffer(cb, src, buffers.sh_coeffs.deviceBuffer.buffer, (uint32_t)sh_regions.size(), sh_regions.data());
 
     submitAppendRecording();
@@ -2832,6 +3415,14 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         splat_group_ids.resize(old_n, -1);
     splat_group_ids.resize(new_n, -1);
     std::memcpy(splat_group_ids.data() + old_n, add_gids.data(), n_add * sizeof(int32_t));
+    if (new_splat_states != nullptr || !splat_states.empty()) {
+        if (splat_states.size() < old_n)
+            splat_states.resize(old_n, 0xFFFFFFFFu);
+        splat_states.resize(new_n, 0xFFFFFFFFu);
+        std::memcpy(splat_states.data() + old_n, add_sst.data(), n_add * sizeof(uint32_t));
+    }
+    if (!splat_anchors_host.empty())
+        splat_anchors_host.resize(8 * new_n, 0.0f);
     buffers.num_splats = new_n;
 
     if (reallocated)

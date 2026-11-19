@@ -29,6 +29,7 @@ layout(binding=10) RWByteAddressBuffer v_rgb;
 layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
 layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
 layout(binding=13) StructuredBuffer<uint32_t> group_state;
+layout(binding=14) StructuredBuffer<uint32_t> splat_state;
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -110,7 +111,7 @@ void main(
 
             uint32_t g_idx = collected_idx[j];
             // wave-uniform: every lane processes the same splat j
-            const uint freeze = splat_freeze_mode(int32_t(g_idx), uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state);
+            const uint freeze = splat_freeze_mode(int32_t(g_idx), uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state);
             DifferentialPair<Splat_2D_AlphaBlend> dp_g;
             #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
                 float2 d_xy_vs = float2(0.0);

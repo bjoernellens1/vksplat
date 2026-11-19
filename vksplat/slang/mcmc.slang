@@ -44,9 +44,15 @@ struct Uniforms {
     uint32_t num_groups;
 };
 
-// A splat is immune to MCMC noise/relocation when its group is IMAGINED (state 1, always) or
-// when structural protection is on and it belongs to any group.
-bool mcmc_protected(int32_t gid, uint32_t protect_all, uint32_t num_groups, StructuredBuffer<uint32_t> group_state) {
+// Per-splat MCMC protection: protect PREDICTED_UNOBSERVED (0u) and OBSERVED_UNCERTAIN (1u);
+// OBSERVED_TRAINABLE (2u) and METRIC_VERIFIED (3u) are eligible for refinement; CONTRADICTED (4u) is recycled.
+bool mcmc_protected(uint32_t tid, int32_t gid, uint32_t protect_all, uint32_t num_groups,
+                    StructuredBuffer<uint32_t> group_state, StructuredBuffer<uint32_t> splat_state) {
+    const uint32_t st = splat_state[tid];
+    if (st == 0u || st == 1u)
+        return true;
+    if (st == 2u || st == 3u || st == 4u || st == 5u)
+        return false;
     if (gid < 0)
         return false;
     if (protect_all != 0)
@@ -85,6 +91,7 @@ layout(binding=2) RWStructuredBuffer<float> means;  // (N, 3)
 layout(binding=3) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
 layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=5) StructuredBuffer<uint32_t> group_state;  // (G,)
+layout(binding=6) StructuredBuffer<uint32_t> splat_state;  // (N,)
 
 #define injectNoise main
 
@@ -103,7 +110,7 @@ void injectNoise(
     const uint32_t tid = thread_id.x;
     if (tid >= num_splats)
         return;
-    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state))
+    if (splat_state[tid] == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state))
         return;
     
     float4 quat = normalize(rotations[tid]);
@@ -112,13 +119,16 @@ void injectNoise(
     float opac = scale_opac.w;
 
     // inject noise
+    if (!all(isfinite(scale)) || !isfinite(opac) || !all(isfinite(quat)))
+        return;
     float3x3 cov = sqrt_cov_from_quat_scales(quat, scale);
     cov = mul(cov, transpose(cov));
     float3 noise = randn3(tid, uniforms.seed);
     noise = mul(cov, noise);
     noise *= op_sigmoid(1.0-opac) * uniforms.noise_lr;
-
-    write_mean(read_mean(tid, means) + noise, tid, means);
+    if (all(isfinite(noise))) {
+        write_mean(read_mean(tid, means) + noise, tid, means);
+    }
 }
 
 #endif  // MCMC_PHASE == MCMC_PHASE_InjectNoise
@@ -131,6 +141,7 @@ layout(binding=0) StructuredBuffer<float4> scales_opacs;  // (N,)
 layout(binding=1) RWStructuredBuffer<uint32_t> sample_probs;  // (N,)
 layout(binding=2) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=3) StructuredBuffer<uint32_t> group_state;  // (G,)
+layout(binding=4) StructuredBuffer<uint32_t> splat_state;  // (N,)
 #define computeProbabilities main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -143,7 +154,7 @@ void computeProbabilities(
     if (tid >= num_splats)
         return;
 
-    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state)) {
+    if (splat_state[tid] == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state)) {
         sample_probs[tid] = 0;
         return;
     }
@@ -198,22 +209,27 @@ float binom(float n, float k) {
 
 
 void relocation(inout float opacity, inout float3 scale, int n_idx) {
-    n_idx = min(n_idx, 50);  // log_factorial only fits to 50
+    n_idx = clamp(n_idx, 1, 16);  // binom(15, 7) = 6435 avoids float32 catastrophic cancellation
+    opacity = clamp(opacity, 1e-5f, 0.9999f);
 
-    float new_opacity = 1.0 - pow(1.0-opacity, 1.0 / n_idx);
+    float new_opacity = 1.0f - pow(max(1.0f - opacity, 1e-8f), 1.0f / float(n_idx));
+    new_opacity = clamp(new_opacity, 1e-5f, 0.9999f);
 
-    float denom_sum = 0.0;
+    float denom_sum = 0.0f;
     for (int i = 1; i <= n_idx; ++i) {
         for (int k = 0; k <= (i - 1); ++k) {
-            denom_sum += binom(i-1, k) * 
-                (cos(M_PI*k) / sqrt(k+1)) *  // (-1)^k / sqrt(k+1)
-                pow(new_opacity, k+1);
+            float sign_k = ((k & 1) != 0) ? -1.0f : 1.0f;
+            denom_sum += binom(i - 1, k) *
+                (sign_k / sqrt(float(k + 1))) *
+                pow(new_opacity, float(k + 1));
         }
     }
-    float coeff = (opacity / denom_sum);
+    float coeff = (denom_sum > 1e-5f && isfinite(denom_sum))
+        ? clamp(opacity / denom_sum, 0.05f, 1.0f)
+        : (1.0f / sqrt(float(n_idx)));
 
     opacity = new_opacity;
-    scale = coeff * scale;
+    scale = clamp(coeff * scale, float3(1e-6f), float3(10.0f));
 }
 
 
@@ -226,6 +242,7 @@ layout(binding=2) RWStructuredBuffer<uint32_t> index_map;  // (N,)
 layout(binding=3) RWByteAddressBuffer n_idx_buffer;  // (N,)
 layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=5) StructuredBuffer<uint32_t> group_state;  // (G,)
+layout(binding=6) StructuredBuffer<uint32_t> splat_state;  // (N,)
 #define computeRelocationIndexMap main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -238,7 +255,7 @@ void computeRelocationIndexMap(
     if (tid >= array_size)
         return;
 
-    if (mcmc_protected(group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state)) {
+    if (mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state)) {
         index_map[tid] = tid;
         return;
     }
@@ -529,6 +546,7 @@ void updateAdd(
 layout(binding=0) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=1) StructuredBuffer<uint32_t> group_state;  // (G,) 0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED
 layout(binding=2) RWStructuredBuffer<float4> scales_opacs;  // (N, 4)
+layout(binding=3) StructuredBuffer<uint32_t> splat_state;  // (N,)
 
 #define maskRetractedGroup main
 
@@ -542,7 +560,8 @@ void maskRetractedGroup(
         return;
 
     int32_t gid = group_ids[tid];
-    if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u) {
+    bool grp_ret = (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u);
+    if (grp_ret || splat_state[tid] == 4u) {
         scales_opacs[tid].w = 0.0;
     }
 }

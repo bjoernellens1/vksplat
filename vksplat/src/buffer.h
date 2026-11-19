@@ -137,9 +137,11 @@ struct VulkanGSPipelineBuffers {
     Buffer<int32_t> mcmc_index_map;  // (N,)
     Buffer<int32_t> mcmc_n_idx_buffer;  // (N,)
 
-    // structural group state (device-authoritative)
+    // structural group & per-splat evidence state (device-authoritative)
     Buffer<int32_t> group_ids;     // (N,) -1 = ungrouped, >= 0 = group ID
     Buffer<uint32_t> group_state;  // (G,) 0 = normal, 1 = IMAGINED, 2 = LOCKED/PROTECTED, 3 = RETRACTED
+    Buffer<uint32_t> splat_state;  // (N,) per-splat evidence state (0xFFFFFFFF = fallback to group_state)
+    Buffer<float> splat_anchor;    // (N, 8) [p_x, p_y, p_z, w_depth, n_x, n_y, n_z, w_plane]
 
     // intermediate buffers
     Buffer<float> _temp_gauss_attr;

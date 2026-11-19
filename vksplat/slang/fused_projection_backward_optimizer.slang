@@ -25,6 +25,8 @@ layout(binding=11) RWStructuredBuffer<float4> g_rotations;  // 2*4
 layout(binding=12) RWStructuredBuffer<float4> g_scales_opacs;  // 2*4
 layout(binding=13) StructuredBuffer<int32_t> group_ids;
 layout(binding=14) StructuredBuffer<uint32_t> group_state;
+layout(binding=15) StructuredBuffer<uint32_t> splat_state;
+layout(binding=16) StructuredBuffer<float4> splat_anchor;  // (N, 2): [0]=(p_meas_xyz, w_depth), [1]=(normal_xyz, w_plane)
 
 
 // Adam optimizer
@@ -71,8 +73,8 @@ struct ShaderUniforms {
     float4x4 world_view_transform;
     uint32_t num_groups;
     uint32_t protect_locked_groups;
-    uint32_t _pad_opt0;
-    uint32_t _pad_opt1;
+    uint32_t num_anchors;
+    float normal_scale_cap;
 };
 
 
@@ -95,15 +97,28 @@ void main(
     
     if (g_idx >= uniforms.num_splats)
         return;
-    // group states: 0 normal, 1 IMAGINED (geometry/opacity frozen, SH trains), 2 LOCKED (fully frozen, gated)
+    // Per-splat evidence policy (Sub-Plan V17.7):
+    // 0: PREDICTED_UNOBSERVED (freeze geom/opac), 1: OBSERVED_UNCERTAIN (trainable w/ strong geom + cautious opac),
+    // 2: OBSERVED_TRAINABLE (full optimization), 3: METRIC_VERIFIED (full optimization, NOT frozen),
+    // 4: CONTRADICTED (skip), 5: MEASURED_FREE (full optimization), 0xFFFFFFFF: fallback to group_state.
     bool imagined = false;
+    bool uncertain_obs = false;
     {
-        int32_t gid = group_ids[g_idx];
-        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
-            const uint32_t state = group_state[gid];
-            if (state == 2u && uniforms.protect_locked_groups != 0u)
+        const uint32_t st = splat_state[g_idx];
+        const int32_t gid = group_ids[g_idx];
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u)
+            return;
+        if (st == SPLAT_STATE_CONTRADICTED)
+            return;
+        if (st == SPLAT_STATE_PREDICTED_UNOBSERVED) {
+            imagined = true;
+        } else if (st == SPLAT_STATE_OBSERVED_UNCERTAIN) {
+            uncertain_obs = true;
+        } else if (st == SPLAT_STATE_LEGACY_GROUP && gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
+            const uint32_t gstate = group_state[gid];
+            if (gstate == 2u && uniforms.protect_locked_groups != 0u)
                 return;
-            imagined = (state == 1u);
+            imagined = (gstate == 1u);
         }
     }
 
@@ -121,6 +136,10 @@ void main(
         is_zero_grad = all(v_out_xy_vs == 0.0f) && all(v_out_inv_cov_vs_opac == 0.0f) && all(v_out_rgb == 0.0f);
     }
 
+    // Freeze Adam momentum and regularization on unobserved steps (zero pixel differential)
+    if (is_zero_grad)
+        return;
+
     // load stuff
     Gaussian_3D gauss = {
         read_mean(g_idx, xyz_ws),
@@ -135,7 +154,7 @@ void main(
     float4 v_rotation = float4(0);
     float4 v_scale_opac = float4(0);
 
-    if (!is_zero_grad) {
+    {
         Camera cam = load_camera(world_view_transform,
             uniforms.fx, uniforms.fy, uniforms.cx, uniforms.cy, camera_model, uniforms.dist_coeffs,
             image_height, image_width);
@@ -151,6 +170,30 @@ void main(
         v_xyz_ws = v_gauss.d.xyz_ws;
         v_rotation = v_gauss.d.rotations;
         v_scale_opac = float4(v_gauss.d.scales, v_gauss.d.opacities);
+    }
+
+    // Robust measured-surface geometric guidance: L_depth + L_normal + L_plane
+    if (!imagined && g_idx < uniforms.num_anchors) {
+        float4 anc0 = splat_anchor[2*g_idx + 0];  // (p_meas_xyz, w_depth)
+        float4 anc1 = splat_anchor[2*g_idx + 1];  // (normal_xyz, w_plane)
+        if (anc0.w > 0.0f) {
+            float3 dp = gauss.xyz_ws - anc0.xyz;
+            float dlen = length(dp);
+            float huber = (dlen > 0.025f) ? (0.025f / dlen) : 1.0f;
+            v_xyz_ws += (anc0.w * huber) * dp;
+        }
+        if (anc1.w > 0.0f) {
+            float3 nrm = anc1.xyz;
+            float nlen = length(nrm);
+            if (nlen > 1e-5f) {
+                nrm /= nlen;
+                float dn = dot(nrm, gauss.xyz_ws - anc0.xyz);
+                v_xyz_ws += (2.0f * anc1.w * dn) * nrm;
+                if (uniforms.normal_scale_cap > 0.0f && gauss.scales.z > uniforms.normal_scale_cap) {
+                    v_scale_opac.z += anc1.w * (gauss.scales.z - uniforms.normal_scale_cap);
+                }
+            }
+        }
     }
 
     // optimizers
@@ -210,10 +253,11 @@ void main(
         );
 
         // update
-        float4 lr = float4(float3(uniforms.lr_scales), uniforms.lr_opacities);
+        float opac_lr = uncertain_obs ? (0.25f * uniforms.lr_opacities) : uniforms.lr_opacities;
+        float4 lr = float4(float3(uniforms.lr_scales), opac_lr);
         optimizer_update(u, dLdu, g1, g2, g1_sc, g2_sc, lr);
 
-        // map
+        // map (no blanket opacity floor: false priors remain retractable!)
         x.xyz = exp(u.xyz);  // scale: x = exp(u)
         x.w = 1.0 / (1.0+exp(-u.w));  // opacity: x = sigmoid(u)
 

@@ -89,11 +89,13 @@ struct TrainerConfig {
     int stop_reset_at;
     int pause_refine_after_reset;
 
-    // MCMC strategy
+    // MCMC & capacity strategy
     float noise_lr;
     float min_opacity;
     float grow_factor;
     int cap_max;
+    int cap_speculative_max = 0;  // >0 caps structural (gid >= 0) splats during ADC
+    float surfel_normal_cap_m = 0.03f;  // world-metric normal thickness cap for L_normal
     bool mcmc_protect_structural_groups = false;
     // raster backward drops the geometry/opacity (IMAGINED) or all (protected LOCKED) gradient atomics of frozen splats
     bool freeze_skip_backward = true;
@@ -177,6 +179,7 @@ public:
     bool is_selective_freeze_unfrozen() const { return selective_freeze_unfrozen; }
     const std::vector<int32_t>& get_splat_group_ids() const { return splat_group_ids; }
     const std::vector<int32_t>& get_splat_entity_ids() const { return splat_entity_ids; }
+    const std::vector<uint32_t>& get_splat_states() const { return splat_states; }
     size_t get_mcmc_relocated_count() const { return mcmc_relocated_count; }
     size_t get_mcmc_added_count() const { return mcmc_added_count; }
     void set_selective_freeze_unfrozen(bool unfrozen) {
@@ -197,6 +200,9 @@ public:
     }
     void set_splat_entity_ids(const std::vector<int32_t>& eids) {
         splat_entity_ids = eids;
+    }
+    void set_splat_states_vec(const std::vector<uint32_t>& states) {
+        splat_states = states;
     }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
@@ -245,13 +251,20 @@ public:
         const float* new_scales,
         const float* new_opacities,
         const int32_t* new_group_ids,
-        size_t n_add
+        size_t n_add,
+        const uint32_t* new_splat_states = nullptr
     );
 
     void ensureGroupBuffersOnDevice(VulkanGSPipelineBuffers& buffers, size_t num_splats);
     void syncGroupStateSize(VulkanGSPipelineBuffers& buffers, const int32_t* gids, size_t count);
     void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
     void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
+    void set_splat_states_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, const uint32_t* states, size_t count);
+    void set_splat_anchors(VulkanGSPipelineBuffers& buffers, const float* anchors_8, size_t count);
+    void set_splat_anchors_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, const float* anchors_8, size_t count);
+    void reanchor_splats_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows,
+                                const float* xyz, const float* scales, const float* quats,
+                                const float* sh_dc, const uint32_t* states, size_t count);
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
     void clamp_scales(VulkanGSPipelineBuffers& buffers, float max_scale, float tangent_cap);
     // Rewrites geometry (xyz, scales, quats; rows in ascending splat index of the group) and resets the geometry
@@ -276,6 +289,8 @@ private:
     float pre_freeze_grad_ema = 0.0f;
     std::vector<int32_t> splat_group_ids;
     std::vector<int32_t> splat_entity_ids;
+    std::vector<uint32_t> splat_states;     // (N,) per-splat evidence state mirror
+    std::vector<float> splat_anchors_host;  // (8*N,) host mirror of per-splat geometric anchors
     Buffer<uint32_t> group_op_rows;  // splat indices of update_group_sparse / keep list of compact_retracted
     Buffer<float> group_op_vals;
     Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
@@ -287,7 +302,7 @@ private:
     _ComputePipeline pipeline_ssim_grad = _ComputePipeline(5);
     _ComputePipeline pipeline_ssim_stats_ds2 = _ComputePipeline(3);  // SSIM on the 2x2 box-averaged images
     _ComputePipeline pipeline_ssim_grad_ds2 = _ComputePipeline(5);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(15);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(17);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
         _ComputePipeline compute_grow_mask = _ComputePipeline(5);
@@ -297,18 +312,18 @@ private:
         _ComputePipeline prune = _ComputePipeline(4);
         _ComputePipeline prune_mean = _ComputePipeline(4);
         _ComputePipeline prune_sh = _ComputePipeline(4);
-        _ComputePipeline reset_opa = _ComputePipeline(2);
+        _ComputePipeline reset_opa = _ComputePipeline(5);
     } pipeline_default;
     struct _MCMCComputePipeline {
-        _ComputePipeline inject_noise = _ComputePipeline(6);
-        _ComputePipeline compute_probs = _ComputePipeline(4);
-        _ComputePipeline compute_relocation_index_map = _ComputePipeline(6);
+        _ComputePipeline inject_noise = _ComputePipeline(7);
+        _ComputePipeline compute_probs = _ComputePipeline(5);
+        _ComputePipeline compute_relocation_index_map = _ComputePipeline(7);
         _ComputePipeline compute_relocation = _ComputePipeline(7);
         _ComputePipeline update_relocation = _ComputePipeline(10);
         _ComputePipeline compute_add_index_map = _ComputePipeline(3);
         _ComputePipeline compute_add = _ComputePipeline(2);
         _ComputePipeline update_add = _ComputePipeline(10);
-        _ComputePipeline mask_retracted_group = _ComputePipeline(3);
+        _ComputePipeline mask_retracted_group = _ComputePipeline(4);
         _ComputePipeline clamp_scales = _ComputePipeline(2);
         _ComputePipeline update_group_rows = _ComputePipeline(8);
         _ComputePipeline compact_gather = _ComputePipeline(3);

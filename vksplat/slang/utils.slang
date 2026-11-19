@@ -772,16 +772,38 @@ struct Uniforms {
     float _pad_tile2;
 }
 
-// Backward-accumulation mode of a splat: 0 normal, 1 IMAGINED (geometry/opacity gradients dropped, rgb kept),
-// 2 protected LOCKED (nothing accumulated). The per-pixel transmittance recurrence still includes every splat.
+// Per-splat evidence states (Sub-Plan V17.7)
+static const uint SPLAT_STATE_PREDICTED_UNOBSERVED = 0u;
+static const uint SPLAT_STATE_OBSERVED_UNCERTAIN   = 1u;
+static const uint SPLAT_STATE_OBSERVED_TRAINABLE   = 2u;
+static const uint SPLAT_STATE_METRIC_VERIFIED      = 3u;
+static const uint SPLAT_STATE_CONTRADICTED         = 4u;
+static const uint SPLAT_STATE_MEASURED_FREE        = 5u;
+static const uint SPLAT_STATE_LEGACY_GROUP         = 0xFFFFFFFFu;
+
+// Backward-accumulation mode of a splat: 0 normal (full xyz/cov/opac/rgb gradients),
+// 1 IMAGINED / PREDICTED_UNOBSERVED (geometry/opacity gradients dropped, rgb kept),
+// 2 protected LOCKED or CONTRADICTED (nothing accumulated). The per-pixel transmittance recurrence still includes every splat.
 uint splat_freeze_mode(int32_t splat_id, uint freeze_flags, uint num_groups,
-                       StructuredBuffer<int32_t> group_ids, StructuredBuffer<uint32_t> group_state) {
+                       StructuredBuffer<int32_t> group_ids, StructuredBuffer<uint32_t> group_state,
+                       StructuredBuffer<uint32_t> splat_state) {
     if (freeze_flags == 0 || splat_id < 0)
         return 0;
+    if ((freeze_flags & 4u) != 0) {
+        const uint32_t st = splat_state[splat_id];
+        if (st == SPLAT_STATE_PREDICTED_UNOBSERVED)
+            return 1;
+        if (st == SPLAT_STATE_CONTRADICTED)
+            return 2;
+        if (st != SPLAT_STATE_LEGACY_GROUP)
+            return 0;  // OBSERVED_UNCERTAIN, OBSERVED_TRAINABLE, METRIC_VERIFIED, MEASURED_FREE: full gradients!
+    }
     const int32_t gid = group_ids[splat_id];
     if (gid < 0 || uint32_t(gid) >= num_groups)
         return 0;
     const uint32_t state = group_state[gid];
+    if (state == 3u)
+        return 2;
     if (state == 1u && (freeze_flags & 1u) != 0)
         return 1;
     if (state == 2u && (freeze_flags & 2u) != 0)

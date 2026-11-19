@@ -139,11 +139,11 @@ protected:
     };
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
-        _ComputePipelinePair(14),  // per pixel
-        _ComputePipelinePair(14),  // per splat
-        _ComputePipelinePair(14),  // tensor
-        _ComputePipelinePair(14),  // tensor
-        _ComputePipelinePair(14),  // tensor
+        _ComputePipelinePair(15),  // per pixel
+        _ComputePipelinePair(15),  // per splat
+        _ComputePipelinePair(15),  // tensor
+        _ComputePipelinePair(15),  // tensor
+        _ComputePipelinePair(15),  // tensor
     };
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);

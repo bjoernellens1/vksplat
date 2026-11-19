@@ -32,6 +32,7 @@ layout(binding=10) RWByteAddressBuffer out_v_rgb;
 layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile list when uniforms.use_tile_list
 layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
 layout(binding=13) StructuredBuffer<uint32_t> group_state;
+layout(binding=14) StructuredBuffer<uint32_t> splat_state;
 
 
 [shader("compute")]
@@ -197,7 +198,7 @@ void main(
             if (value != 0.0) buffer.InterlockedAddF32((address)*sizeof(float), value);
       #endif
         if (active) {
-            const uint freeze = splat_freeze_mode(splat_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state);
+            const uint freeze = splat_freeze_mode(splat_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state);
             if (freeze == 0) {
                 _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+0, v_xy_vs.x);
                 _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+1, v_xy_vs.y);

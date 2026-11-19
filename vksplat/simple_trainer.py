@@ -93,11 +93,13 @@ class TrainerConfig:
     stop_reset_at: int = -1  # -1 (inf) in most works, 12000 in older version of nerfstudio
     pause_refine_after_reset: int = 0  # 0 in inria and gsplat, num_train+refine_every in nerfstudio, leave -1 to use nerfstudio
 
-    # MCMC strategy
+    # MCMC & capacity strategy
     noise_lr: float = 5e5
     min_opacity: float = 0.005
     grow_factor: float = 1.05
     cap_max: int = 1000000
+    cap_speculative_max: int = 0
+    surfel_normal_cap_m: float = 0.03
 
 
 @dataclass

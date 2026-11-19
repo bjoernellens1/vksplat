@@ -114,7 +114,7 @@ void VulkanGSPipeline::cleanupBuffers(VulkanGSPipelineBuffers& buffers) {
     _(g_xyz_ws)_(g_sh_coeffs_1)_(g_sh_coeffs_2)_(g_rotations)_(g_scales_opacs)
     _(default_grad)_(default_radii)_(default_dupli_mask)_(default_split_mask)_(default_keep_mask)
     _(mcmc_sample_probs)_(mcmc_sample_probs_cumsum)_(mcmc_index_map)_(mcmc_n_idx_buffer)
-    _(group_ids)_(group_state)
+    _(group_ids)_(group_state)_(splat_state)_(splat_anchor)
     _(_temp_gauss_attr)_(_temp_indices)_(_temp_sum)_(_temp_cumsum)
     _(_cumsum_blockSums)_(_cumsum_blockSums2)_(_sorting_histogram)_(_sorting_histogram_cumsum)
     #undef _

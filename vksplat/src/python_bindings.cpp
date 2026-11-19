@@ -272,11 +272,15 @@ public:
         config.stop_reset_at = train_config["stop_reset_at"].cast<int>();
         config.pause_refine_after_reset = train_config["pause_refine_after_reset"].cast<int>();
 
-        // MCMC strategy
+        // MCMC & capacity strategy
         config.noise_lr = train_config["noise_lr"].cast<float>();
         config.min_opacity = train_config["min_opacity"].cast<float>();
         config.grow_factor = train_config["grow_factor"].cast<float>();
         config.cap_max = train_config["cap_max"].cast<int>();
+        config.cap_speculative_max = train_config.contains(py::str("cap_speculative_max"))
+            ? train_config["cap_speculative_max"].cast<int>() : 0;
+        config.surfel_normal_cap_m = train_config.contains(py::str("surfel_normal_cap_m"))
+            ? train_config["surfel_normal_cap_m"].cast<float>() : 0.03f;
         config.mcmc_protect_structural_groups = train_config.contains(py::str("mcmc_protect_structural_groups"))
             ? train_config["mcmc_protect_structural_groups"].cast<bool>() : false;
         config.freeze_skip_backward = train_config.contains(py::str("freeze_skip_backward"))
@@ -383,6 +387,71 @@ public:
         if (gids.size() != states.size())
             throw std::invalid_argument("group_ids and states must have the same length");
         trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
+    }
+    py::array_t<uint32_t> get_splat_states() {
+        const auto& sts = trainer.get_splat_states();
+        if (sts.empty()) {
+            std::vector<uint32_t> def_sts(buffers.num_splats, 0xFFFFFFFFu);
+            return py::array_t<uint32_t>({def_sts.size()}, {sizeof(uint32_t)}, def_sts.data());
+        }
+        size_t n = std::min(buffers.num_splats, sts.size());
+        std::vector<uint32_t> out(buffers.num_splats, 0xFFFFFFFFu);
+        std::memcpy(out.data(), sts.data(), n * sizeof(uint32_t));
+        return py::array_t<uint32_t>({out.size()}, {sizeof(uint32_t)}, out.data());
+    }
+    void set_splat_states(py::array_t<uint32_t, py::array::c_style | py::array::forcecast> states_arr) {
+        auto buf = states_arr.request();
+        std::vector<uint32_t> vec((uint32_t*)buf.ptr, (uint32_t*)buf.ptr + buf.size);
+        trainer.set_splat_states_vec(vec);
+        buffers.splat_state.assign(vec.begin(), vec.end());
+        if (!buffers.splat_state.empty()) {
+            trainer.copyToDevice(buffers.splat_state);
+        }
+    }
+    void set_splat_states_sparse(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> states
+    ) {
+        if (rows.size() != states.size())
+            throw std::invalid_argument("rows and states must have the same length");
+        trainer.set_splat_states_sparse(buffers, rows.data(), states.data(), static_cast<size_t>(rows.size()));
+    }
+    void set_splat_anchors(py::array_t<float, py::array::c_style | py::array::forcecast> anchors) {
+        auto buf = anchors.request();
+        if (buf.size == 0) {
+            trainer.set_splat_anchors(buffers, nullptr, 0);
+            return;
+        }
+        if ((buf.ndim == 2 && buf.shape[1] != 8) || (buf.size % 8 != 0))
+            throw std::invalid_argument("anchors must have shape (N, 8)");
+        trainer.set_splat_anchors(buffers, static_cast<const float*>(buf.ptr), static_cast<size_t>(buf.size / 8));
+    }
+    void set_splat_anchors_sparse(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
+        py::array_t<float, py::array::c_style | py::array::forcecast> anchors
+    ) {
+        auto abuf = anchors.request();
+        size_t n = static_cast<size_t>(rows.size());
+        if ((size_t)abuf.size != 8 * n)
+            throw std::invalid_argument("anchors must have shape (len(rows), 8)");
+        trainer.set_splat_anchors_sparse(buffers, rows.data(), static_cast<const float*>(abuf.ptr), n);
+    }
+    void reanchor_splats_sparse(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
+        py::array_t<float, py::array::c_style | py::array::forcecast> xyz,
+        py::array_t<float, py::array::c_style | py::array::forcecast> scales,
+        py::array_t<float, py::array::c_style | py::array::forcecast> quats,
+        py::array_t<float, py::array::c_style | py::array::forcecast> sh_dc,
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> states
+    ) {
+        size_t n = static_cast<size_t>(rows.size());
+        if (n == 0)
+            return;
+        if ((size_t)xyz.size() != 3 * n || (size_t)scales.size() != 3 * n || (size_t)quats.size() != 4 * n)
+            throw std::invalid_argument("reanchor_splats_sparse expects xyz(R,3), scales(R,3), quats(R,4)");
+        const float* dc_ptr = (sh_dc.size() == (py::ssize_t)(3 * n)) ? sh_dc.data() : nullptr;
+        const uint32_t* st_ptr = (states.size() == (py::ssize_t)n) ? states.data() : nullptr;
+        trainer.reanchor_splats_sparse(buffers, rows.data(), xyz.data(), scales.data(), quats.data(), dc_ptr, st_ptr, n);
     }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
@@ -591,7 +660,8 @@ public:
         py::array_t<float, py::array::c_style | py::array::forcecast> rotations,
         py::array_t<float, py::array::c_style | py::array::forcecast> scales,
         py::array_t<float, py::array::c_style | py::array::forcecast> opacities,
-        py::array_t<int32_t, py::array::c_style | py::array::forcecast> group_ids
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> group_ids,
+        py::object splat_states_obj = py::none()
     ) {
         auto xyz_buf = xyz_ws.request();
         auto sh_buf = sh_coeffs.request();
@@ -613,6 +683,13 @@ public:
         if ((size_t)opac_buf.size != n_add)
             throw std::runtime_error("opacities must have M elements");
         const int32_t* gid_ptr = (gid_buf.size == (py::ssize_t)n_add) ? static_cast<const int32_t*>(gid_buf.ptr) : nullptr;
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> st_arr;
+        const uint32_t* st_ptr = nullptr;
+        if (!splat_states_obj.is_none()) {
+            st_arr = splat_states_obj.cast<py::array_t<uint32_t, py::array::c_style | py::array::forcecast>>();
+            if ((size_t)st_arr.size() == n_add)
+                st_ptr = st_arr.data();
+        }
         return trainer.append_splats_preserving_optimizer(
             buffers,
             static_cast<const float*>(xyz_buf.ptr),
@@ -621,7 +698,8 @@ public:
             static_cast<const float*>(scale_buf.ptr),
             static_cast<const float*>(opac_buf.ptr),
             gid_ptr,
-            n_add
+            n_add,
+            st_ptr
         );
     }
 
@@ -647,6 +725,12 @@ public:
         snap["scales_opacs"] = buffer_to_array<float, float>(buffers.scales_opacs, 4);
         snap["splat_group_ids"] = get_splat_group_ids();
         snap["splat_entity_ids"] = get_splat_entity_ids();
+        if (!trainer.get_splat_states().empty()) {
+            snap["splat_states"] = get_splat_states();
+        }
+        if (buffers.splat_anchor.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.splat_anchor.deviceSize() > 0) {
+            snap["splat_anchor"] = buffer_to_array<float, float>(buffers.splat_anchor, 8, (size_t)-1, "mean");
+        }
         if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.deviceSize() > 0) {
             snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws, 6, (size_t)-1, "mean");
             snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1, 48, (size_t)-1, "mean");
@@ -679,6 +763,16 @@ public:
         }
         if (snap.contains(py::str("splat_entity_ids"))) {
             set_splat_entity_ids(snap["splat_entity_ids"].cast<py::array_t<int32_t>>());
+        }
+        if (snap.contains(py::str("splat_states"))) {
+            set_splat_states(snap["splat_states"].cast<py::array_t<uint32_t>>());
+        } else {
+            trainer.set_splat_states_vec({});
+        }
+        if (snap.contains(py::str("splat_anchor"))) {
+            set_splat_anchors(snap["splat_anchor"].cast<py::array_t<float>>());
+        } else {
+            trainer.set_splat_anchors(buffers, nullptr, 0);
         }
         if (snap.contains(py::str("g_xyz_ws"))) {
             array_to_buffer(snap["g_xyz_ws"].cast<py::array_t<float>>(), buffers.g_xyz_ws);
@@ -1010,7 +1104,10 @@ public:
             for (uint32_t state : buffers.group_state) {
                 if (state == 1u) flags |= 1u;
                 else if (state == 2u && config.mcmc_protect_structural_groups) flags |= 2u;
+                else if (state == 3u) flags |= 2u;
             }
+            if (!trainer.get_splat_states().empty())
+                flags |= 4u;
         }
         uniforms.freeze_flags = flags;
         uniforms.num_groups = (uint32_t)buffers.group_state.size();
@@ -1278,6 +1375,13 @@ PYBIND11_MODULE(vksplat, m) {
         .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
         .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
         .def("set_group_states", &VkSplat::set_group_states, "Batched set_group_state: one device upload for all (group_id, state) pairs", py::arg("group_ids"), py::arg("states"))
+        .def("get_splat_states", &VkSplat::get_splat_states, "Get per-splat evidence states (uint32)")
+        .def("set_splat_states", &VkSplat::set_splat_states, "Set per-splat evidence states (uint32)", py::arg("states"))
+        .def("set_splat_states_sparse", &VkSplat::set_splat_states_sparse, "Sparse update of per-splat evidence states", py::arg("rows"), py::arg("states"))
+        .def("set_splat_anchors", &VkSplat::set_splat_anchors, "Set per-splat (N, 8) normalized anchors [p_xyz, w_depth, n_xyz, w_plane]", py::arg("anchors"))
+        .def("set_splat_anchors_sparse", &VkSplat::set_splat_anchors_sparse, "Sparse update of per-splat (R, 8) normalized anchors", py::arg("rows"), py::arg("anchors"))
+        .def("reanchor_splats_sparse", &VkSplat::reanchor_splats_sparse, "Pre-step sparse re-anchoring of observed structural surfels onto measured depth + RGB",
+             py::arg("rows"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"), py::arg("sh_dc"), py::arg("states"))
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
         .def("set_sparse_backward", &VkSplat::set_sparse_backward,
              "Sparse tile backward: quantile in [0,1) (0 = dense), halo tiles, every full_every-th step dense",
@@ -1307,7 +1411,7 @@ PYBIND11_MODULE(vksplat, m) {
         .def("replace_train_frame", &VkSplat::replace_train_frame, "Replace an existing training frame slot in-place",
              py::arg("train_idx"), py::arg("image_rgba"), py::arg("c2w_world"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"), py::arg("image_name") = "stream_frame.png")
         .def("append_splats_preserving_optimizer", &VkSplat::append_splats_preserving_optimizer, "Append new Gaussians while preserving Adam optimizer state of existing splats",
-             py::arg("xyz_ws"), py::arg("sh_coeffs"), py::arg("rotations"), py::arg("scales"), py::arg("opacities"), py::arg("group_ids"))
+             py::arg("xyz_ws"), py::arg("sh_coeffs"), py::arg("rotations"), py::arg("scales"), py::arg("opacities"), py::arg("group_ids"), py::arg("splat_states") = py::none())
         .def("get_optimizer_moments", &VkSplat::get_optimizer_moments, "Device readback of the Adam moments and densification statistics (diagnostic)")
         .def("snapshot_optimizer_state", &VkSplat::snapshot_optimizer_state, "Take a non-destructive snapshot of Gaussian parameters and Adam optimizer state")
         .def("restore_optimizer_state", &VkSplat::restore_optimizer_state, "Restore a non-destructive snapshot of Gaussian parameters and Adam optimizer state", py::arg("snap"))
