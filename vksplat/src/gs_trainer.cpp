@@ -1489,8 +1489,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             enum PruneType {
                 Default, Sh, Mean
             };
-            auto applyPrune = [&](Buffer<float> &buffer, PruneType type=Default) {
-                uint32_t stride = (uint32_t)(buffer.deviceSize() / num_splats);
+            auto applyPrune = [&](Buffer<float> &buffer, uint32_t stride, PruneType type=Default) {
                 uniforms.old_num_splats = (uint32_t)(num_splats);
                 uniforms.num_splats = stride / (type == Sh ? 12*4 : type == Mean ? 3 : 1);  // stride
                 size_t num_keep_ceil = num_keep,
@@ -1522,18 +1521,18 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffer.deviceBuffer, COMPUTE_SHADER_WRITE }
                 }, TRANSFER_READ_WRITE);
             };
-            applyPrune(buffers.sh_coeffs, Sh);  // do the largest first since buffers._temp_indices reallocs are lazy
-            applyPrune(buffers.g_sh_coeffs_1, Sh);
-            applyPrune(buffers.g_sh_coeffs_2, Sh);
-            applyPrune(buffers.xyz_ws, Mean);
-            applyPrune(buffers.rotations);
-            applyPrune(buffers.scales_opacs);
-            applyPrune(buffers.g_xyz_ws, Mean);
-            applyPrune(buffers.g_rotations);
-            applyPrune(buffers.g_scales_opacs);
+            applyPrune(buffers.sh_coeffs, 16*3, Sh);  // do the largest first since buffers._temp_indices reallocs are lazy
+            applyPrune(buffers.g_sh_coeffs_1, 16*3, Sh);
+            applyPrune(buffers.g_sh_coeffs_2, 16*3, Sh);
+            applyPrune(buffers.xyz_ws, 3, Mean);
+            applyPrune(buffers.rotations, 4);
+            applyPrune(buffers.scales_opacs, 4);
+            applyPrune(buffers.g_xyz_ws, 3*2, Mean);
+            applyPrune(buffers.g_rotations, 4*2);
+            applyPrune(buffers.g_scales_opacs, 4*2);
             // running states - default_grad will be cleared anyway, default_radii might be needed
             if (!(config.refine_scale2d_stop_iter > 0))
-                applyPrune(buffers.default_radii);
+                applyPrune(buffers.default_radii, 1);
             #undef applyPrune
             barrierAllGaussParams(buffers);
 
