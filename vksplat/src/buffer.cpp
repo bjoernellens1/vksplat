@@ -510,7 +510,7 @@ _VulkanBuffer& VulkanGSPipeline::resizeAndCopyDeviceBuffer(
                 size -= prefix;
                 DEVICE_GUARD;
                 vkCmdFillBuffer(command_buffer, deviceBuffer.buffer, offset, size, 0u);
-                HOST_GUARD;  // will apply fence
+                bufferMemoryBarrier({{deviceBuffer, TRANSFER_WRITE}}, TRANSFER_COMPUTE_SHADER_READ_WRITE);
             }
         }
 

@@ -277,6 +277,7 @@ public:
         config.min_opacity = train_config["min_opacity"].cast<float>();
         config.grow_factor = train_config["grow_factor"].cast<float>();
         config.cap_max = train_config["cap_max"].cast<int>();
+        config.cap_alloc_max = std::max(config.cap_alloc_max, config.cap_max);
         config.cap_speculative_max = train_config.contains(py::str("cap_speculative_max"))
             ? train_config["cap_speculative_max"].cast<int>() : 0;
         config.surfel_normal_cap_m = train_config.contains(py::str("surfel_normal_cap_m"))
@@ -349,9 +350,42 @@ public:
         st["added_count"] = trainer.get_mcmc_added_count();
         st["num_splats"] = buffers.num_splats;
         st["cap_max"] = config.cap_max;
+        st["cap_alloc_max"] = config.cap_alloc_max;
+        st["growth_cap"] = trainer.get_growth_cap();
+        st["grow_factor"] = config.grow_factor;
+        st["refine_every"] = config.refine_every;
         st["mcmc_protect_structural_groups"] = config.mcmc_protect_structural_groups;
         st["imagined_protection"] = true;
         return st;
+    }
+    void set_growth_cap(size_t cap) {
+        trainer.set_growth_cap(cap);
+    }
+    void set_densification_budget(
+        int cap_max,
+        int cap_speculative_max = -1,
+        float grow_factor = -1.0f,
+        int refine_every = -1
+    ) {
+        if (cap_max >= 0) {
+            config.cap_max = cap_max;
+            config.cap_alloc_max = std::max(config.cap_alloc_max, cap_max);
+        }
+        if (cap_speculative_max >= 0)
+            config.cap_speculative_max = cap_speculative_max;
+        if (grow_factor > 0.0f)
+            config.grow_factor = grow_factor;
+        if (refine_every >= 1)
+            config.refine_every = refine_every;
+    }
+    py::dict get_densification_budget() const {
+        py::dict d;
+        d["cap_max"] = config.cap_max;
+        d["cap_alloc_max"] = config.cap_alloc_max;
+        d["cap_speculative_max"] = config.cap_speculative_max;
+        d["grow_factor"] = config.grow_factor;
+        d["refine_every"] = config.refine_every;
+        return d;
     }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         trainer.set_selective_freeze_unfrozen(unfrozen);
@@ -719,6 +753,11 @@ public:
     py::dict snapshot_optimizer_state() {
         py::dict snap;
         snap["num_splats"] = buffers.num_splats;
+        snap["cap_max"] = config.cap_max;
+        snap["growth_cap"] = trainer.get_growth_cap();
+        snap["cap_speculative_max"] = config.cap_speculative_max;
+        snap["grow_factor"] = config.grow_factor;
+        snap["refine_every"] = config.refine_every;
         snap["xyz_ws"] = buffer_to_array<float, float>(buffers.xyz_ws, 3, (size_t)-1, "mean");
         snap["sh_coeffs"] = buffer_to_array<float, float>(buffers.sh_coeffs, 16, 3, "sh");
         snap["rotations"] = buffer_to_array<float, float>(buffers.rotations, 4);
@@ -786,6 +825,31 @@ public:
         }
         if (snap.contains(py::str("default_radii"))) {
             array_to_buffer(snap["default_radii"].cast<py::array_t<float>>(), buffers.default_radii);
+        }
+        if (snap.contains(py::str("growth_cap"))) {
+            trainer.set_growth_cap(snap["growth_cap"].cast<size_t>());
+        }
+        if (snap.contains(py::str("cap_max"))) {
+            set_densification_budget(
+                snap["cap_max"].cast<int>(),
+                snap.contains(py::str("cap_speculative_max")) ? snap["cap_speculative_max"].cast<int>() : -1,
+                snap.contains(py::str("grow_factor")) ? snap["grow_factor"].cast<float>() : -1.0f,
+                snap.contains(py::str("refine_every")) ? snap["refine_every"].cast<int>() : -1
+            );
+        }
+        if (config.strategy == TrainerConfig::Strategy::MCMC) {
+            const size_t alloc_size = std::max(n, config.mcmc_alloc_cap());
+            trainer.resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3 * alloc_size, false);
+            trainer.resizeAndCopyDeviceBuffer(buffers.sh_coeffs, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), false);
+            trainer.resizeAndCopyDeviceBuffer(buffers.rotations, 4 * alloc_size, false);
+            trainer.resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4 * alloc_size, false);
+            if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE) {
+                trainer.resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 2 * 3 * alloc_size, true);
+                trainer.resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), true);
+                trainer.resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), true);
+                trainer.resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * alloc_size, true);
+                trainer.resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * alloc_size, true);
+            }
         }
     }
 
@@ -912,10 +976,11 @@ public:
         buffers.reorderSH(buffers.sh_coeffs);
 
         if (config.strategy == TrainerConfig::Strategy::MCMC) {
-            trainer.resizeDeviceBuffer(buffers.xyz_ws, 3*config.cap_max);
-            trainer.resizeDeviceBuffer(buffers.sh_coeffs, 12*4*config.cap_max);
-            trainer.resizeDeviceBuffer(buffers.rotations, 4*config.cap_max);
-            trainer.resizeDeviceBuffer(buffers.scales_opacs, 4*config.cap_max);
+            const size_t alloc_cap = std::max(buffers.num_splats, config.mcmc_alloc_cap());
+            trainer.resizeDeviceBuffer(buffers.xyz_ws, 3 * alloc_cap);
+            trainer.resizeDeviceBuffer(buffers.sh_coeffs, 12 * 4 * alloc_cap);
+            trainer.resizeDeviceBuffer(buffers.rotations, 4 * alloc_cap);
+            trainer.resizeDeviceBuffer(buffers.scales_opacs, 4 * alloc_cap);
         }
         trainer.copyToDevice(buffers.xyz_ws);
         trainer.copyToDevice(buffers.sh_coeffs);
@@ -966,7 +1031,7 @@ public:
         uniforms.num_splats = (uint32_t)buffers.num_splats;
         try {
             size_t alloc_reserve = config.strategy == TrainerConfig::Strategy::MCMC ?
-                config.cap_max : 0;
+                config.mcmc_alloc_cap() : 0;
             trainer.executeProjectionForward(uniforms, buffers, alloc_reserve);
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeProjectionForward failed");
@@ -1204,8 +1269,32 @@ public:
                 w.gate_steps_redone += remaining - result.steps_done;
                 trainer.ensureIsectCapacity(buffers, result.needed + (result.needed >> 1));
             }
-            else if (result.steps_done != remaining)
-                _THROW_ERROR_ALWAYS("gated batch stopped without an overflow");
+            else if (result.steps_done != remaining) {
+                trainer.waitIdle();
+                const auto retry_res = trainer.gateResult();
+                if (retry_res.overflow) {
+                    w.gate_overflows++;
+                    w.gate_steps_redone += remaining - retry_res.steps_done;
+                    done += retry_res.steps_done - result.steps_done;
+                    trainer.ensureIsectCapacity(buffers, retry_res.needed + (retry_res.needed >> 1));
+                } else if (retry_res.steps_done == remaining) {
+                    for (uint32_t i = result.steps_done; i < retry_res.steps_done; ++i) {
+                        w.forward_passes++;
+                        w.tile_intersections_total += retry_res.isects[i];
+                        w.tile_intersections_last = retry_res.isects[i];
+                        w.tile_intersections_max = std::max<uint64_t>(w.tile_intersections_max, retry_res.isects[i]);
+                        last_isects = retry_res.isects[i];
+                    }
+                    if (retry_res.steps_done > 0)
+                        buffers.num_indices = last_isects;
+                    done += retry_res.steps_done - result.steps_done;
+                } else {
+                    _THROW_ERROR_ALWAYS(
+                        "gated batch stopped without an overflow (steps_done=" +
+                        std::to_string(retry_res.steps_done) + "/" + std::to_string(remaining) + ")"
+                    );
+                }
+            }
         }
     }
 
@@ -1400,6 +1489,15 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
         .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
+        .def("set_growth_cap", &VkSplat::set_growth_cap,
+             "Set evidence-derived densification ceiling for ADC and MCMC; does not remove existing splats",
+             py::arg("max_splats"))
+        .def("set_densification_budget", &VkSplat::set_densification_budget,
+             "Dynamically update densification budget (cap_max, cap_speculative_max, grow_factor, refine_every)",
+             py::arg("cap_max"), py::arg("cap_speculative_max") = -1,
+             py::arg("grow_factor") = -1.0f, py::arg("refine_every") = -1)
+        .def("get_densification_budget", &VkSplat::get_densification_budget,
+             "Return active densification budget dict")
         .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
         .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
         .def("clear_train_frames", &VkSplat::clear_train_frames, "Clear all loaded training frames")

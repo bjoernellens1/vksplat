@@ -1,4 +1,5 @@
 #include "gs_renderer.h"
+#include <atomic>
 
 #include <fstream>
 #include <memory>
@@ -861,6 +862,13 @@ void VulkanGSRenderer::gateEndBatch() {
 }
 
 VulkanGSRenderer::GateResult VulkanGSRenderer::gateResult() const {
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = gate_host_memory;
+    range.offset = 0;
+    range.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(device, 1, &range);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     GateResult r;
     r.steps_done = gate_host_status[0];
     r.overflow = gate_host_status[1] != 0;

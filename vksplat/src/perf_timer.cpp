@@ -135,6 +135,10 @@ std::vector<std::pair<size_t, double>> update(std::vector<double> times) {
     return results;
 }
 
+void clearIncompleteBatch() {
+    marks.clear();
+}
+
 // return a summary of timing
 std::map<std::string, std::tuple<size_t, double>> get_summary() {
     std::map<std::string, std::tuple<size_t, double>> summary;

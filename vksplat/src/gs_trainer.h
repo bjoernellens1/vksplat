@@ -5,6 +5,8 @@
 #include "colmap_reader.h"
 
 #include <random>
+#include <atomic>
+#include <limits>
 
 
 // see simple_trainer.py for details
@@ -94,7 +96,12 @@ struct TrainerConfig {
     float min_opacity;
     float grow_factor;
     int cap_max;
+    int cap_alloc_max = 0;  // monotonic device allocation reserve for MCMC when cap_max ramps dynamically
     int cap_speculative_max = 0;  // >0 caps structural (gid >= 0) splats during ADC
+
+    inline size_t mcmc_alloc_cap() const {
+        return static_cast<size_t>(std::max(cap_alloc_max, cap_max));
+    }
     float surfel_normal_cap_m = 0.03f;  // world-metric normal thickness cap for L_normal
     bool mcmc_protect_structural_groups = false;
     // raster backward drops the geometry/opacity (IMAGINED) or all (protected LOCKED) gradient atomics of frozen splats
@@ -182,6 +189,8 @@ public:
     const std::vector<uint32_t>& get_splat_states() const { return splat_states; }
     size_t get_mcmc_relocated_count() const { return mcmc_relocated_count; }
     size_t get_mcmc_added_count() const { return mcmc_added_count; }
+    void set_growth_cap(size_t ceiling) { runtime_growth_cap.store(ceiling, std::memory_order_relaxed); }
+    size_t get_growth_cap() const { return runtime_growth_cap.load(std::memory_order_relaxed); }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         selective_freeze_unfrozen = unfrozen;
         if (!unfrozen) {
@@ -296,6 +305,7 @@ private:
     Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
+    std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
     Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_stats = _ComputePipeline(3);

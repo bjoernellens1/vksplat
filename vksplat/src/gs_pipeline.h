@@ -67,6 +67,7 @@ public:
 
     void beginCommandBatch();
     void endCommandBatch(bool use_fence = true);
+    void waitIdle() { if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device); }
     bool isCommandBatchInProgress() const {
         return commandBatchInProgress;
     }

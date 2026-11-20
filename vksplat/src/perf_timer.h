@@ -65,6 +65,7 @@ void pushMarker(VulkanGSPipeline *module);
 void popMarkers(VulkanGSPipeline *module);
 
 std::vector<std::pair<size_t, double>> update(std::vector<double> times);
+void clearIncompleteBatch();
 
 std::map<std::string, std::tuple<size_t, double>> get_summary();
 

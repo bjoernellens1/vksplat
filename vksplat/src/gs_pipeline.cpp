@@ -615,19 +615,23 @@ void VulkanGSPipeline::endCommandBatch(bool use_fence) {
         double timestampPeriod = deviceProperties.limits.timestampPeriod;
 
         std::vector<uint64_t> timestamps(timestampNumWritten);
-        vkGetQueryPoolResults(
+        VkResult qr = vkGetQueryPoolResults(
             device, timestamp_query_pool,
             0, timestampNumWritten,
             sizeof(uint64_t) * timestampNumWritten,
             timestamps.data(), sizeof(uint64_t),
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+            VK_QUERY_RESULT_64_BIT
         );
-        std::vector<double> times(timestampNumWritten);
-        for (uint32_t i = 0; i < timestampNumWritten; i++)
-            times[i] = 1e-9 * double(timestamps[i] - timestamps[0]) * timestampPeriod;
-        auto time_updates = PerfTimer::update(times);
-        for (auto& callback : timerCallbacks)
-            callback(time_updates);
+        if (qr == VK_SUCCESS) {
+            std::vector<double> times(timestampNumWritten);
+            for (uint32_t i = 0; i < timestampNumWritten; i++)
+                times[i] = 1e-9 * double(timestamps[i] - timestamps[0]) * timestampPeriod;
+            auto time_updates = PerfTimer::update(times);
+            for (auto& callback : timerCallbacks)
+                callback(time_updates);
+        } else {
+            PerfTimer::clearIncompleteBatch();
+        }
 
         timestampNumWritten = 0;
     }
