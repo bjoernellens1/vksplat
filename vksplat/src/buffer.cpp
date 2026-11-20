@@ -16,6 +16,7 @@ size_t VulkanGSPipelineBuffers::getTotalAllocSize() {
     _(default_grad)_(default_radii)_(default_dupli_mask)_(default_split_mask)_(default_keep_mask)
     _(mcmc_sample_probs)_(mcmc_sample_probs_cumsum)_(mcmc_index_map)_(mcmc_n_idx_buffer)
     _(group_ids)_(group_state)_(splat_state)_(splat_anchor)
+    _(splat_cell_ids)_(cell_credits)_(cell_eligible)_(default_spec_remaining)
     _(_temp_gauss_attr)_(_temp_indices)_(_temp_sum)_(_temp_cumsum)
     _(_cumsum_blockSums)_(_cumsum_blockSums2)_(_sorting_histogram)_(_sorting_histogram_cumsum)
     #undef _
@@ -42,6 +43,7 @@ std::map<std::string, size_t> VulkanGSPipelineBuffers::getVramBreakdown() {
     _(default_grad)_(default_radii)_(default_dupli_mask)_(default_split_mask)_(default_keep_mask)
     _(mcmc_sample_probs)_(mcmc_sample_probs_cumsum)_(mcmc_index_map)_(mcmc_n_idx_buffer)
     _(group_ids)_(group_state)_(splat_state)_(splat_anchor)
+    _(splat_cell_ids)_(cell_credits)_(cell_eligible)_(default_spec_remaining)
     _(_temp_gauss_attr)_(_temp_indices)_(_temp_sum)_(_temp_cumsum)
     _(_cumsum_blockSums)_(_cumsum_blockSums2)_(_sorting_histogram)_(_sorting_histogram_cumsum)
     #undef _

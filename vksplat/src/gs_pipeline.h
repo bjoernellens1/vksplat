@@ -92,6 +92,18 @@ public:
 
     size_t getPeakAllocSize() const
         { return peak_vram; }
+    size_t getCurrentAllocSize() const
+        { return current_vram; }
+
+    struct GpuMemoryStats {
+        double device_buffers_mb = 0.0;
+        double peak_device_buffers_mb = 0.0;
+        double staging_buffers_mb = 0.0;
+        double vram_used_mb = 0.0;
+        double vram_budget_mb = 0.0;
+        std::string source = "device_buffers_fallback";
+    };
+    GpuMemoryStats getGpuMemoryStats(size_t pipeline_buffers_bytes = 0) const;
 
     enum BarrierMask {
         TRANSFER_READ,
@@ -187,6 +199,7 @@ protected:
         bool hasInt16;
         bool hasInt64;
         bool hasFloat32AtomicAdd;
+        bool hasMemoryBudget;
         DeviceVendor vendor;
         uint32_t vendorId;
         std::string name;

@@ -41,6 +41,11 @@ struct Uniforms {
     int32_t pause_refine_after_reset;
     uint32_t num_groups;
     uint32_t protect_structural_groups;
+    uint32_t has_splat_states;
+    uint32_t has_splat_gids;
+    uint32_t use_local_cell_credits;
+    uint32_t has_spec_cap;
+    uint32_t num_cells;
 };
 
 
@@ -93,6 +98,12 @@ layout(binding=2) StructuredBuffer<float4> scales_opacs;  // (N, 4)
 layout(binding=3) RWStructuredBuffer<int32_t> dupli_mask;  // (N,)
 layout(binding=4) RWStructuredBuffer<int32_t> split_mask;  // (N,)
 
+layout(binding=5) StructuredBuffer<uint32_t> splat_states;     // (N,) or (1,)
+layout(binding=6) StructuredBuffer<int32_t> splat_group_ids;   // (N,) or (1,)
+layout(binding=7) StructuredBuffer<int32_t> splat_cell_ids;    // (N,) or (1,)
+layout(binding=8) RWStructuredBuffer<int32_t> cell_credits;    // (C,) or (1,)
+layout(binding=9) RWStructuredBuffer<int32_t> spec_remaining;  // (1,)
+
 #define computeGrowMask main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -101,13 +112,13 @@ void computeGrowMask(
     uniform Uniforms uniforms
 ) {
     const uint32_t num_splats = uniforms.num_splats;
-    const uint32_t gid = thread_id.x;
-    if (gid >= num_splats)
+    const uint32_t splat_idx = thread_id.x;
+    if (splat_idx >= num_splats)
         return;
 
-    float2 grads = running_grad[gid];
+    float2 grads = running_grad[splat_idx];
     float grad = grads.x / max(grads.y, 1.0);
-    float3 scale = scales_opacs[gid].xyz;
+    float3 scale = scales_opacs[splat_idx].xyz;
 
     bool is_grad_high = grad > uniforms.grow_grad2d;
     bool is_small = max(scale.x, max(scale.y, scale.z)) <= uniforms.grow_scale3d;
@@ -116,10 +127,53 @@ void computeGrowMask(
     bool is_large = !is_small;
     bool is_split = is_grad_high && is_large;
     if (uniforms.step < uniforms.refine_scale2d_stop_iter)
-        is_split |= (running_radii[gid] > uniforms.grow_scale2d);
+        is_split |= (running_radii[splat_idx] > uniforms.grow_scale2d);
+    if (is_split)
+        is_dupli = false;
 
-    dupli_mask[gid] = int32_t(is_dupli);
-    split_mask[gid] = int32_t(is_split);
+    if (is_dupli || is_split) {
+        const uint32_t st = (uniforms.has_splat_states != 0) ? splat_states[splat_idx] : 0xFFFFFFFFu;
+        const int32_t gid = (uniforms.has_splat_gids != 0) ? splat_group_ids[splat_idx] : -1;
+        if (st == 0u || st == 1u || st == 4u ||
+            (st == 0xFFFFFFFFu && uniforms.protect_structural_groups != 0 && gid >= 0)) {
+            is_dupli = false;
+            is_split = false;
+        }
+        bool took_spec = false;
+        if ((is_dupli || is_split) && uniforms.has_spec_cap != 0 && gid >= 0) {
+            int32_t prev_s = 0;
+            InterlockedAdd(spec_remaining[0], -1, prev_s);
+            if (prev_s <= 0) {
+                InterlockedAdd(spec_remaining[0], 1);
+                is_dupli = false;
+                is_split = false;
+            } else {
+                took_spec = true;
+            }
+        }
+        if ((is_dupli || is_split) && uniforms.use_local_cell_credits != 0) {
+            int32_t cid = splat_cell_ids[splat_idx];
+            if (cid < 0 || uint32_t(cid) >= uniforms.num_cells) {
+                if (took_spec)
+                    InterlockedAdd(spec_remaining[0], 1);
+                is_dupli = false;
+                is_split = false;
+            } else {
+                int32_t prev_c = 0;
+                InterlockedAdd(cell_credits[cid], -1, prev_c);
+                if (prev_c <= 0) {
+                    InterlockedAdd(cell_credits[cid], 1);
+                    if (took_spec)
+                        InterlockedAdd(spec_remaining[0], 1);
+                    is_dupli = false;
+                    is_split = false;
+                }
+            }
+        }
+    }
+
+    dupli_mask[splat_idx] = int32_t(is_dupli);
+    split_mask[splat_idx] = int32_t(is_split);
 }
 
 #endif  // DEFAULT_PHASE == DEFAULT_PHASE_ComputeGrowMask

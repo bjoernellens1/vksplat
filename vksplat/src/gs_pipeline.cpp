@@ -1,6 +1,7 @@
 #include "gs_pipeline.h"
 #include "perf_timer.h"
 
+#include <filesystem>
 #include <fstream>
 
 #ifdef max
@@ -115,6 +116,7 @@ void VulkanGSPipeline::cleanupBuffers(VulkanGSPipelineBuffers& buffers) {
     _(default_grad)_(default_radii)_(default_dupli_mask)_(default_split_mask)_(default_keep_mask)
     _(mcmc_sample_probs)_(mcmc_sample_probs_cumsum)_(mcmc_index_map)_(mcmc_n_idx_buffer)
     _(group_ids)_(group_state)_(splat_state)_(splat_anchor)
+    _(splat_cell_ids)_(cell_credits)_(cell_eligible)_(default_spec_remaining)
     _(_temp_gauss_attr)_(_temp_indices)_(_temp_sum)_(_temp_cumsum)
     _(_cumsum_blockSums)_(_cumsum_blockSums2)_(_sorting_histogram)_(_sorting_histogram_cumsum)
     #undef _
@@ -318,6 +320,20 @@ void VulkanGSPipeline::selectPhysicalDevice(int device_id) {
         if (atomic_float_features.shaderBufferFloat32AtomicAdd == VK_FALSE)
             hasFloat32AtomicAdd = false;
 
+        bool hasMemoryBudget = false;
+        uint32_t ext_count = 0;
+        if (vkEnumerateDeviceExtensionProperties(device, nullptr, &ext_count, nullptr) == VK_SUCCESS && ext_count > 0) {
+            std::vector<VkExtensionProperties> exts(ext_count);
+            if (vkEnumerateDeviceExtensionProperties(device, nullptr, &ext_count, exts.data()) == VK_SUCCESS) {
+                for (const auto& ext : exts) {
+                    if (std::strcmp(ext.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) {
+                        hasMemoryBudget = true;
+                        break;
+                    }
+                }
+            }
+        }
+
         DeviceVendor vendor = DeviceVendor::Unknown;
         if (deviceProperties.vendorID == 0x10DE)
             vendor = DeviceVendor::NVIDIA;
@@ -339,7 +355,7 @@ void VulkanGSPipeline::selectPhysicalDevice(int device_id) {
                 limits.maxComputeSharedMemorySize,
                 maxGroupsX, maxGroupsY, maxGroupsZ,
                 maxThreadsX, maxThreadsY, maxThreadsZ,
-                hasInt16, hasInt64, hasFloat32AtomicAdd,
+                hasInt16, hasInt64, hasFloat32AtomicAdd, hasMemoryBudget,
                 vendor, deviceProperties.vendorID,
                 deviceProperties.deviceName
             }
@@ -468,6 +484,8 @@ void VulkanGSPipeline::createDevice() {
         VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
         VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
     };
+    if (deviceInfo.hasMemoryBudget)
+        device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     create_info.enabledExtensionCount = (uint32_t)device_extensions.size();
     create_info.ppEnabledExtensionNames = device_extensions.data();
     create_info.pNext = &subgroupSizeControlFeatures;
@@ -477,6 +495,89 @@ void VulkanGSPipeline::createDevice() {
     }
     
     vkGetDeviceQueue(device, queue_family_index, 0, &command_queue);
+}
+
+VulkanGSPipeline::GpuMemoryStats VulkanGSPipeline::getGpuMemoryStats(size_t pipeline_buffers_bytes) const {
+    constexpr double kInvMiB = 1.0 / (1024.0 * 1024.0);
+    GpuMemoryStats stats;
+    const size_t dev_bytes = std::max(current_vram, pipeline_buffers_bytes);
+    size_t staging_bytes = stager.allocSize + append_stage.allocSize;
+    for (const auto& s : upload_slots)
+        staging_bytes += s.allocSize;
+    stats.device_buffers_mb = static_cast<double>(dev_bytes) * kInvMiB;
+    stats.peak_device_buffers_mb = static_cast<double>(std::max(peak_vram, dev_bytes)) * kInvMiB;
+    stats.staging_buffers_mb = static_cast<double>(staging_bytes) * kInvMiB;
+
+    uint64_t vram_used = 0;
+    uint64_t vram_budget = 0;
+    if (physical_device != VK_NULL_HANDLE && deviceInfo.hasMemoryBudget) {
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT budget_props{};
+        budget_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 mem_props2{};
+        mem_props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        mem_props2.pNext = &budget_props;
+        vkGetPhysicalDeviceMemoryProperties2(physical_device, &mem_props2);
+        for (uint32_t h = 0; h < mem_props2.memoryProperties.memoryHeapCount; ++h) {
+            if (mem_props2.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+                vram_used += budget_props.heapUsage[h];
+                vram_budget += budget_props.heapBudget[h];
+            }
+        }
+        if (vram_used > 0)
+            stats.source = "VK_EXT_memory_budget";
+    }
+
+    if (vram_used == 0) {
+        auto read_u64 = [](const std::filesystem::path& p) -> uint64_t {
+            std::ifstream f(p);
+            uint64_t v = 0;
+            if (f >> v)
+                return v;
+            return 0;
+        };
+        auto read_hex_u32 = [](const std::filesystem::path& p) -> uint32_t {
+            std::ifstream f(p);
+            uint32_t v = 0;
+            if (f >> std::hex >> v)
+                return v;
+            return 0;
+        };
+        uint64_t fallback_used = 0, fallback_total = 0;
+        for (int card = 0; card < 16; ++card) {
+            std::filesystem::path dev_dir = "/sys/class/drm/card" + std::to_string(card) + "/device";
+            std::filesystem::path used_path = dev_dir / "mem_info_vram_used";
+            if (!std::filesystem::exists(used_path))
+                continue;
+            uint64_t used = read_u64(used_path);
+            uint64_t total = read_u64(dev_dir / "mem_info_vram_total");
+            uint32_t vend = read_hex_u32(dev_dir / "vendor");
+            if (deviceInfo.vendorId != 0 && vend == deviceInfo.vendorId && used > 0) {
+                vram_used = used;
+                vram_budget = total;
+                stats.source = "sysfs_drm";
+                break;
+            }
+            if (fallback_used == 0 && used > 0) {
+                fallback_used = used;
+                fallback_total = total;
+            }
+        }
+        if (vram_used == 0 && fallback_used > 0) {
+            vram_used = fallback_used;
+            vram_budget = fallback_total;
+            stats.source = "sysfs_drm";
+        }
+    }
+
+    if (vram_used == 0) {
+        vram_used = dev_bytes;
+        stats.source = "device_buffers_fallback";
+    } else {
+        vram_used = std::max<uint64_t>(vram_used, dev_bytes);
+    }
+    stats.vram_used_mb = static_cast<double>(vram_used) * kInvMiB;
+    stats.vram_budget_mb = static_cast<double>(vram_budget) * kInvMiB;
+    return stats;
 }
 
 void VulkanGSPipeline::createCommandPool() {

@@ -265,7 +265,17 @@ public:
     );
 
     void ensureGroupBuffersOnDevice(VulkanGSPipelineBuffers& buffers, size_t num_splats);
+    void ensureCellCreditBuffersOnDevice(VulkanGSPipelineBuffers& buffers, size_t num_splats);
     void syncGroupStateSize(VulkanGSPipelineBuffers& buffers, const int32_t* gids, size_t count);
+    void set_local_cell_credits(VulkanGSPipelineBuffers& buffers, const int32_t* cell_ids, size_t n_splats,
+                                const int32_t* credits, size_t n_cells, const int32_t* eligible_override = nullptr);
+    void clear_local_cell_credits();
+    std::vector<int32_t> get_local_cell_credits(VulkanGSPipelineBuffers& buffers);
+    bool has_local_cell_credits() const { return use_local_cell_credits_; }
+    const std::vector<int32_t>& get_splat_cell_ids() const { return splat_cell_ids; }
+    const std::vector<int32_t>& get_cell_eligible() const { return cell_eligible_host; }
+    size_t get_adc_host_readbacks() const { return adc_host_mask_readbacks_; }
+    void reset_adc_host_readbacks() { adc_host_mask_readbacks_ = 0; }
     void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
     void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
     void set_splat_states_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, const uint32_t* states, size_t count);
@@ -300,6 +310,13 @@ private:
     std::vector<int32_t> splat_entity_ids;
     std::vector<uint32_t> splat_states;     // (N,) per-splat evidence state mirror
     std::vector<float> splat_anchors_host;  // (8*N,) host mirror of per-splat geometric anchors
+    bool use_local_cell_credits_ = false;
+    bool splat_cell_ids_dirty_ = false;
+    bool cell_credits_gpu_dirty_ = false;
+    size_t adc_host_mask_readbacks_ = 0;
+    std::vector<int32_t> splat_cell_ids;
+    std::vector<int32_t> cell_credits_host;
+    std::vector<int32_t> cell_eligible_host;
     Buffer<uint32_t> group_op_rows;  // splat indices of update_group_sparse / keep list of compact_retracted
     Buffer<float> group_op_vals;
     Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
@@ -315,7 +332,7 @@ private:
     _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(17);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
-        _ComputePipeline compute_grow_mask = _ComputePipeline(5);
+        _ComputePipeline compute_grow_mask = _ComputePipeline(10);
         _ComputePipeline duplicate = _ComputePipeline(12);
         _ComputePipeline split = _ComputePipeline(12);
         _ComputePipeline compute_prune_mask = _ComputePipeline(3);
@@ -326,8 +343,8 @@ private:
     } pipeline_default;
     struct _MCMCComputePipeline {
         _ComputePipeline inject_noise = _ComputePipeline(7);
-        _ComputePipeline compute_probs = _ComputePipeline(5);
-        _ComputePipeline compute_relocation_index_map = _ComputePipeline(7);
+        _ComputePipeline compute_probs = _ComputePipeline(7);
+        _ComputePipeline compute_relocation_index_map = _ComputePipeline(8);
         _ComputePipeline compute_relocation = _ComputePipeline(7);
         _ComputePipeline update_relocation = _ComputePipeline(10);
         _ComputePipeline compute_add_index_map = _ComputePipeline(3);

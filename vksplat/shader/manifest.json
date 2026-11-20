@@ -31,41 +31,41 @@
         "mcmc.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/mcmc.slang": "c5d246b49d28b29237cd9d2c2a385e5336fdfb740fe3eb2eed7cd18a336e0f7b",
+                "slang/mcmc.slang": "4ab357e7c7463ab695e37f54f583ca6c571d1525d772f6aa0e68e3bcdfda2da9",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
                 "shader/generated/mcmc_clamp_scales.spv": "164e9b659aa7e2401df8f88b8bc7a89a4bb7456a58b8f9d08f068125388921af",
                 "shader/generated/mcmc_compact_gather.spv": "fd7afc843f6d1f0491503f5280115cebfa616d784d8be9946c0cd96d78ab1bf0",
                 "shader/generated/mcmc_compact_gather_sh.spv": "07af67f56fcde349cf5f14bb0742af5ed0f9ed0642f48549ba6e4bb36741a015",
-                "shader/generated/mcmc_compute_add.spv": "214a1b21887e6b46313f5ba438237718b72a40e5c229a87feefad0a980681e00",
-                "shader/generated/mcmc_compute_add_index_map.spv": "f89a7c9ce52b73779c4dcdec401aa73b9bb7625287a34f24285feceef9736780",
-                "shader/generated/mcmc_compute_probs.spv": "75b7c9626d0da947f3e7fdb977dc86d48d289bce7d012ca31ed976be6faf1757",
-                "shader/generated/mcmc_compute_relocation.spv": "ae8ce0fc3eb8fe74d741650a30a22bd1cc47059ae29b917c5346cc6beb82433d",
-                "shader/generated/mcmc_compute_relocation_index_map.spv": "c518e5c289e6d1ee9ff2712f9d83f57830aadeed760e99a640247bd580473cd6",
+                "shader/generated/mcmc_compute_add.spv": "368c2d83ca955ee8645c86f4ee33febfe43cfd2b997f3154e8d6ebdf8dab5ffd",
+                "shader/generated/mcmc_compute_add_index_map.spv": "9b52906c853e645fab81d38b91bf1649bda98f8bd9f2720572d6743d50f53760",
+                "shader/generated/mcmc_compute_probs.spv": "4082003635b92dc6e3edaf00ec8dc879868aa9f6beed137612438a2ab273806f",
+                "shader/generated/mcmc_compute_relocation.spv": "f32591d8be8c2120aabd63e9f38b6e3846cb26b16cca640826a43d953fe2c365",
+                "shader/generated/mcmc_compute_relocation_index_map.spv": "c6a055125c19f45f7a601a5affce5a55cd9d73f54801f5ed02910374a2bf3211",
                 "shader/generated/mcmc_inject_noise.spv": "8e7bf58dd5d4084023a32978a9d86d2a9c6c84ebf6eb42a5fcb16fa1007a9774",
                 "shader/generated/mcmc_mask_retracted_group.spv": "85691a33bf3da7d8fc6024c9f438b95f6dce01b144ad11c3420beeb2d0a951ea",
-                "shader/generated/mcmc_update_add.spv": "ad26de06424d9ce6d78b4b3782cfd4ef94c58ff2e577ef734a1ffe9f9abd6809",
+                "shader/generated/mcmc_update_add.spv": "b2e7dbf58f17d5f92770e34e6a289aa30a6fe026dd03bd35766ad4f917bf0820",
                 "shader/generated/mcmc_update_group_rows.spv": "ecb428dd23bbdcd18244129baef1c6c2fb36e80ee869a4fb467f90fd097c8eac",
-                "shader/generated/mcmc_update_relocation.spv": "3800f93b533efd3604a8b00577d154765bbf56ccac64ac8ad44e9dc8ed4cf5d6"
+                "shader/generated/mcmc_update_relocation.spv": "a85e50f0e8922aa5d8f0a077972c9978ef2776c5060cb9b9f1d077b850d71e51"
             }
         },
         "default.slang": {
             "sources": {
                 "slang/config.slang": "5c6e0cdba58e659cd1bd707e41ca3d9dc6f22debb7d90db41abaff3652d80b68",
-                "slang/default.slang": "8b5357701c360fccac24c4b1608be315a36f95f18b998f30fbfb8b2d172a982e",
+                "slang/default.slang": "490e7e221c41cd1d37ee51b009d2ba333d7adde2dc1d8c3b7757cf35c8e8412b",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
-                "shader/generated/default_compute_grow_mask.spv": "641b41500011d9d39b9a2ef6d20f19e88e4e0ff641ab6bd458c6dfef81cfbf7b",
-                "shader/generated/default_compute_prune_mask.spv": "90b779827779d87e2a81e5d58defcfd90a1cd4e71e39a6800e48287e87596202",
-                "shader/generated/default_duplicate.spv": "c8164b0136bdb9cfeaa97656ba63339cacdc7a14cc585dd9b64bc0b54b169b08",
-                "shader/generated/default_prune.spv": "b44715ca99bf0e6b900f2f5dc43af40885828fb0b5e4cebbbd21460aca3534f8",
-                "shader/generated/default_prune_mean.spv": "054a57d00655660eb824934e9c8894dfd8ecaee4758d37507647b2557db8953c",
-                "shader/generated/default_prune_sh.spv": "90888fa5d6202d17a28ccbe792e2792b187e65f060976c2500214b85d0f09fc4",
-                "shader/generated/default_reset_opa.spv": "d9e1822ab8b44eaae14c6d272b24e28413d5a1a2a1828d72cb35615af3b98173",
-                "shader/generated/default_split.spv": "9191e11856cff2d5e3a7625fc9ae3fec01385d32ef36479169d5c968049246e5",
-                "shader/generated/default_update_state.spv": "475b42cf526aa7e9eacaed09a7570b1946002c7b7bf2e2a8f2953ea20c10671b"
+                "shader/generated/default_compute_grow_mask.spv": "b52042b13cc7b279c3e396aa7bb041e4e3ff846b6b26eddd393c6bd3e035d40e",
+                "shader/generated/default_compute_prune_mask.spv": "5104049d67e02c5e1d8bfce1cbf6a6268ec41377ff6d8ab3a343dad784ed1da2",
+                "shader/generated/default_duplicate.spv": "24893211c86d09deb588a1aff7affb6d1573d8aad87e90324fce70694f2aec6d",
+                "shader/generated/default_prune.spv": "df95c962116b165847ab34aee4baa831108265f0a485b22c01273cd761a87079",
+                "shader/generated/default_prune_mean.spv": "a0e192ff44437ce53639b4daabd8efbb845d86f117312d12580a6dcbab408c44",
+                "shader/generated/default_prune_sh.spv": "a6cb205fe22f358daa40f13fe504f0d9d5b71a61173bda140b683297e9f8f246",
+                "shader/generated/default_reset_opa.spv": "609f428b4fac5d598ad02a3b346ce5d2cbbebb34442bac53f53b7693dbaacb7a",
+                "shader/generated/default_split.spv": "2a4015c130a006400043c557248fde55c4d713fed1f295566ff36e2ba1a15a99",
+                "shader/generated/default_update_state.spv": "809c1ad15c736b738221202cc59fec056cddecee006fd5d1782178b026c4d7b7"
             }
         },
         "where.slang": {
