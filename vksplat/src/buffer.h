@@ -143,6 +143,12 @@ struct VulkanGSPipelineBuffers {
     Buffer<uint32_t> splat_state;  // (N,) per-splat evidence state (0xFFFFFFFF = fallback to group_state)
     Buffer<float> splat_anchor;    // (N, 8) [p_x, p_y, p_z, w_depth, n_x, n_y, n_z, w_plane]
 
+    // GPU-resident local cell credits & speculative growth cap
+    Buffer<int32_t> splat_cell_ids;         // (N,) -1 = unassigned, >= 0 = cell ID
+    Buffer<int32_t> cell_credits;           // (C,) remaining credits per cell
+    Buffer<int32_t> cell_eligible;          // (C,) 1 if initial credit > 0 (corroborated multi-view), 0 otherwise
+    Buffer<int32_t> default_spec_remaining; // (1,) remaining speculative growth budget for ADC
+
     // intermediate buffers
     Buffer<float> _temp_gauss_attr;
     Buffer<int32_t> _temp_indices;

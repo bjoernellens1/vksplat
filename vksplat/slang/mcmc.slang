@@ -42,6 +42,8 @@ struct Uniforms {
     float min_opacity;
     uint32_t protect_structural_groups;
     uint32_t num_groups;
+    uint32_t use_cell_filter;
+    uint32_t num_cells;
 };
 
 // Per-splat MCMC protection: protect PREDICTED_UNOBSERVED (0u) and OBSERVED_UNCERTAIN (1u);
@@ -142,6 +144,8 @@ layout(binding=1) RWStructuredBuffer<uint32_t> sample_probs;  // (N,)
 layout(binding=2) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=3) StructuredBuffer<uint32_t> group_state;  // (G,)
 layout(binding=4) StructuredBuffer<uint32_t> splat_state;  // (N,)
+layout(binding=5) StructuredBuffer<int32_t> splat_cell_ids;  // (N,) or (1,)
+layout(binding=6) StructuredBuffer<int32_t> cell_filter_table;  // (C,) or (1,)
 #define computeProbabilities main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -159,13 +163,25 @@ void computeProbabilities(
         return;
     }
 
-    float opac = scales_opacs[tid].w;
-    opac = clamp(opac, 1e-6, 1-1e-6);
+    if (uniforms.use_cell_filter != 0) {
+        const int32_t cid = splat_cell_ids[tid];
+        if (cid < 0 || uint32_t(cid) >= uniforms.num_cells || cell_filter_table[cid] <= 0) {
+            sample_probs[tid] = 0;
+            return;
+        }
+    }
+
+    float raw_opac = scales_opacs[tid].w;
+    if (!isfinite(raw_opac)) {
+        sample_probs[tid] = 0;
+        return;
+    }
+    float opac = clamp(raw_opac, 1e-6, 1-1e-6);
 
     // low opacity -> 0; high opacity -> nonzero, prevent overflow
     const float kMinOpacity = uniforms.min_opacity;
     float max_opac = float(0x70000000) / float(num_splats);
-    sample_probs[tid] = (opac <= kMinOpacity || !isfinite(opac)) ? 0 :
+    sample_probs[tid] = (opac <= kMinOpacity) ? 0 :
         max(uint32_t(round(opac * max_opac)), 1u);
 }
 
@@ -243,6 +259,7 @@ layout(binding=3) RWByteAddressBuffer n_idx_buffer;  // (N,)
 layout(binding=4) StructuredBuffer<int32_t> group_ids;  // (N,)
 layout(binding=5) StructuredBuffer<uint32_t> group_state;  // (G,)
 layout(binding=6) StructuredBuffer<uint32_t> splat_state;  // (N,)
+layout(binding=7) StructuredBuffer<float4> scales_opacs;  // (N,)
 #define computeRelocationIndexMap main
 
 [numthreads(GROUP_SIZE, 1, 1)]
@@ -259,11 +276,13 @@ void computeRelocationIndexMap(
         index_map[tid] = tid;
         return;
     }
-    
-    uint32_t prob = sample_probs[tid];
 
-    // not relocated, put same ID
-    if (prob != 0) {
+    float raw_opac = scales_opacs[tid].w;
+    bool is_dead = (splat_state[tid] == 4u) || (!isfinite(raw_opac)) ||
+                   (clamp(raw_opac, 1e-6, 1-1e-6) <= uniforms.min_opacity);
+
+    // Live splats (even in cells ineligible to donate) stay in place; only dead splats relocate.
+    if (!is_dead) {
         index_map[tid] = tid;
         return;
     }

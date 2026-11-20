@@ -767,6 +767,13 @@ public:
         if (!trainer.get_splat_states().empty()) {
             snap["splat_states"] = get_splat_states();
         }
+        if (trainer.has_local_cell_credits()) {
+            snap["use_local_cell_credits"] = true;
+            snap["splat_cell_ids"] = get_splat_cell_ids();
+            snap["cell_credits"] = get_local_cell_credits();
+            const auto& elig = trainer.get_cell_eligible();
+            snap["cell_eligible"] = py::array_t<int32_t>({elig.size()}, {sizeof(int32_t)}, elig.data());
+        }
         if (buffers.splat_anchor.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.splat_anchor.deviceSize() > 0) {
             snap["splat_anchor"] = buffer_to_array<float, float>(buffers.splat_anchor, 8, (size_t)-1, "mean");
         }
@@ -807,6 +814,25 @@ public:
             set_splat_states(snap["splat_states"].cast<py::array_t<uint32_t>>());
         } else {
             trainer.set_splat_states_vec({});
+            buffers.splat_state.assign(std::max<size_t>(1, n), 0xFFFFFFFFu);
+            trainer.copyToDevice(buffers.splat_state);
+        }
+        if (snap.contains(py::str("use_local_cell_credits")) && snap["use_local_cell_credits"].cast<bool>()) {
+            auto cids = snap["splat_cell_ids"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+            auto creds = snap["cell_credits"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> elig;
+            const int32_t* elig_ptr = nullptr;
+            if (snap.contains(py::str("cell_eligible"))) {
+                elig = snap["cell_eligible"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                if (elig.size() == creds.size())
+                    elig_ptr = elig.data();
+            }
+            trainer.set_local_cell_credits(
+                buffers, cids.data(), static_cast<size_t>(cids.size()),
+                creds.data(), static_cast<size_t>(creds.size()), elig_ptr
+            );
+        } else {
+            trainer.clear_local_cell_credits();
         }
         if (snap.contains(py::str("splat_anchor"))) {
             set_splat_anchors(snap["splat_anchor"].cast<py::array_t<float>>());
@@ -849,6 +875,9 @@ public:
                 trainer.resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), true);
                 trainer.resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * alloc_size, true);
                 trainer.resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * alloc_size, true);
+            }
+            if (trainer.has_local_cell_credits()) {
+                trainer.resizeAndCopyDeviceBuffer(buffers.splat_cell_ids, alloc_size, false);
             }
         }
     }
@@ -1366,6 +1395,56 @@ public:
         return buffers.getVramBreakdown();
     }
 
+    py::dict get_gpu_memory_stats() {
+        auto stats = trainer.getGpuMemoryStats(buffers.getTotalAllocSize());
+        py::dict d;
+        d["device_buffers_mb"] = stats.device_buffers_mb;
+        d["peak_device_buffers_mb"] = stats.peak_device_buffers_mb;
+        d["pipeline_buffers_mb"] = static_cast<double>(buffers.getTotalAllocSize()) / (1024.0 * 1024.0);
+        d["staging_buffers_mb"] = stats.staging_buffers_mb;
+        d["vram_used_mb"] = stats.vram_used_mb;
+        d["vram_budget_mb"] = stats.vram_budget_mb;
+        d["source"] = stats.source;
+        return d;
+    }
+
+    void set_local_cell_credits(
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> splat_cell_ids,
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> cell_credits
+    ) {
+        auto cid_buf = splat_cell_ids.request();
+        auto cred_buf = cell_credits.request();
+        if (cid_buf.ndim != 1)
+            throw std::invalid_argument("splat_cell_ids must be a 1D int32 array");
+        if (cred_buf.ndim != 1)
+            throw std::invalid_argument("cell_credits must be a 1D int32 array");
+        trainer.set_local_cell_credits(
+            buffers,
+            static_cast<const int32_t*>(cid_buf.ptr),
+            static_cast<size_t>(cid_buf.size),
+            static_cast<const int32_t*>(cred_buf.ptr),
+            static_cast<size_t>(cred_buf.size)
+        );
+    }
+
+    void clear_local_cell_credits() {
+        trainer.clear_local_cell_credits();
+    }
+
+    py::array_t<int32_t> get_local_cell_credits() {
+        std::vector<int32_t> creds = trainer.get_local_cell_credits(buffers);
+        return py::array_t<int32_t>({creds.size()}, {sizeof(int32_t)}, creds.data());
+    }
+
+    py::array_t<int32_t> get_splat_cell_ids() {
+        const auto& cids = trainer.get_splat_cell_ids();
+        return py::array_t<int32_t>({cids.size()}, {sizeof(int32_t)}, cids.data());
+    }
+
+    size_t get_adc_host_readbacks() const {
+        return trainer.get_adc_host_readbacks();
+    }
+
     void write_ply(std::string filename) {
         trainer.writePLY(filename, buffers);
     }
@@ -1456,6 +1535,18 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_work_counters", &VkSplat::get_work_counters,
              "Cumulative tile-intersection (num_indices) and backward-dispatch counters since initialize; no extra readback")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")
+        .def("get_gpu_memory_stats", &VkSplat::get_gpu_memory_stats, "Get exact Vulkan buffer allocations and adapter VRAM usage in MB")
+        .def("set_local_cell_credits", &VkSplat::set_local_cell_credits,
+             "Set GPU-resident per-splat local cell IDs and per-cell growth credits",
+             py::arg("splat_cell_ids"), py::arg("cell_credits"))
+        .def("clear_local_cell_credits", &VkSplat::clear_local_cell_credits,
+             "Disable and clear local cell growth credits")
+        .def("get_local_cell_credits", &VkSplat::get_local_cell_credits,
+             "Read back current remaining per-cell growth credits")
+        .def("get_splat_cell_ids", &VkSplat::get_splat_cell_ids,
+             "Return host-mirrored per-splat cell IDs aligned with current splat order")
+        .def("get_adc_host_readbacks", &VkSplat::get_adc_host_readbacks,
+             "Number of ADC host mask readback trim events triggered by global effective_cap")
         .def("write_ply", &VkSplat::write_ply, "Save PLY file", py::call_guard<py::gil_scoped_release>())
         .def("get_device_group_ids", &VkSplat::get_device_group_ids, "Read the device-resident per-splat group ids")
         .def("get_device_group_state", &VkSplat::get_device_group_state, "Read the device-resident group state table")

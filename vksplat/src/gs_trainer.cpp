@@ -67,6 +67,11 @@ PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
     int32_t pause_refine_after_reset;
     uint32_t num_groups;
     uint32_t protect_structural_groups;
+    uint32_t has_splat_states;
+    uint32_t has_splat_gids;
+    uint32_t use_local_cell_credits;
+    uint32_t has_spec_cap;
+    uint32_t num_cells;
 });
 
 
@@ -110,6 +115,16 @@ void VulkanGSTrainer::cleanup() {
     splat_states.shrink_to_fit();
     splat_anchors_host.clear();
     splat_anchors_host.shrink_to_fit();
+    use_local_cell_credits_ = false;
+    splat_cell_ids_dirty_ = false;
+    cell_credits_gpu_dirty_ = false;
+    adc_host_mask_readbacks_ = 0;
+    splat_cell_ids.clear();
+    splat_cell_ids.shrink_to_fit();
+    cell_credits_host.clear();
+    cell_credits_host.shrink_to_fit();
+    cell_eligible_host.clear();
+    cell_eligible_host.shrink_to_fit();
 
     VulkanGSRenderer::cleanup();
 }
@@ -727,6 +742,15 @@ void VulkanGSTrainer::load_colmap_dataset(
     anchored_xyz_snapshot_valid = false;
     selective_freeze_unfrozen = false;
     pre_freeze_grad_ema = 0.0f;
+    splat_states.clear();
+    splat_anchors_host.clear();
+    use_local_cell_credits_ = false;
+    splat_cell_ids_dirty_ = false;
+    cell_credits_gpu_dirty_ = false;
+    adc_host_mask_readbacks_ = 0;
+    splat_cell_ids.clear();
+    cell_credits_host.clear();
+    cell_eligible_host.clear();
     splat_group_ids.assign(numPoints, -1);
     if (config.selective_plane_freeze) {
         std::string group_bin_path = resolveDatasetFile("plane_group_ids.bin");
@@ -808,7 +832,7 @@ void VulkanGSTrainer::load_colmap_dataset(
     copyToDevice(buffers.scales_opacs);
     buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
     copyToDevice(buffers.group_ids);
-    syncGroupStateSize(buffers, splat_group_ids.data(), splat_group_ids.size());
+    ensureGroupBuffersOnDevice(buffers, numPoints);
     if (num_anchored_splats > 0) {
         resizeDeviceBuffer(anchored_xyz_ws, 3 * num_anchored_splats);
     }
@@ -1156,10 +1180,12 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     DEVICE_GUARD;
 
     size_t num_splats = buffers.num_splats;
+    if (num_splats == 0)
+        return;
     const uint32_t width = renderer_uniforms.image_width;
     const uint32_t height = renderer_uniforms.image_height;
 
-    VulkanGSDefaultStrategyUniforms uniforms;
+    VulkanGSDefaultStrategyUniforms uniforms{};
     uniforms.num_splats = (uint32_t)num_splats;
     uniforms.old_num_splats = (uint32_t)num_splats;
     uniforms.seed = std::uniform_int_distribution<uint32_t>()(rng);
@@ -1227,6 +1253,47 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         int num_dupli = 0;
         int num_split = 0;
         if (!freeze_prune_step) {
+            ensureGroupBuffersOnDevice(buffers, num_splats);
+            ensureCellCreditBuffersOnDevice(buffers, num_splats);
+            if (buffers.default_spec_remaining.deviceBuffer.buffer == VK_NULL_HANDLE)
+                resizeDeviceBuffer(buffers.default_spec_remaining, 1);
+
+            size_t cur_spec = 0;
+            if (!splat_group_ids.empty()) {
+                const size_t n_g = std::min(num_splats, splat_group_ids.size());
+                for (size_t i = 0; i < n_g; ++i) {
+                    if (splat_group_ids[i] >= 0)
+                        ++cur_spec;
+                }
+            }
+            const bool has_spec_cap = (config.cap_speculative_max > 0);
+            const size_t allow_spec = has_spec_cap
+                ? ((cur_spec < static_cast<size_t>(config.cap_speculative_max))
+                    ? (static_cast<size_t>(config.cap_speculative_max) - cur_spec)
+                    : 0)
+                : std::numeric_limits<size_t>::max();
+            if (has_spec_cap) {
+                const uint32_t init_spec = static_cast<uint32_t>(
+                    std::min<size_t>(allow_spec, static_cast<size_t>(std::numeric_limits<int32_t>::max())));
+                vkCmdFillBuffer(command_buffer, buffers.default_spec_remaining.deviceBuffer.buffer,
+                                0, sizeof(int32_t), init_spec);
+            }
+
+            uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+            uniforms.has_splat_states = (!splat_states.empty()) ? 1u : 0u;
+            uniforms.has_splat_gids = (!splat_group_ids.empty()) ? 1u : 0u;
+            uniforms.use_local_cell_credits = use_local_cell_credits_ ? 1u : 0u;
+            uniforms.has_spec_cap = has_spec_cap ? 1u : 0u;
+            uniforms.num_cells = use_local_cell_credits_ ? static_cast<uint32_t>(cell_credits_host.size()) : 0u;
+
+            bufferMemoryBarrier({
+                { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_cell_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.cell_credits.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.default_spec_remaining.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+
             executeCompute(
                 {{num_splats, 256}},
                 &uniforms, sizeof(uniforms),
@@ -1237,8 +1304,16 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     buffers.scales_opacs.deviceBuffer,
                     resizeDeviceBuffer(buffers.default_dupli_mask, num_splats),
                     resizeDeviceBuffer(buffers.default_split_mask, num_splats),
+                    buffers.splat_state.deviceBuffer,
+                    buffers.group_ids.deviceBuffer,
+                    buffers.splat_cell_ids.deviceBuffer,
+                    buffers.cell_credits.deviceBuffer,
+                    buffers.default_spec_remaining.deviceBuffer,
                 }
             );
+            if (use_local_cell_credits_ && !cell_credits_host.empty())
+                cell_credits_gpu_dirty_ = true;
+
             if (config.selective_plane_freeze && num_anchored_splats > 0 &&
                 num_anchored_splats <= num_splats) {
                 bufferMemoryBarrier({
@@ -1252,128 +1327,87 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 bufferMemoryBarrier({
                     { buffers.default_dupli_mask.deviceBuffer, TRANSFER_WRITE },
                     { buffers.default_split_mask.deviceBuffer, TRANSFER_WRITE },
+                    { buffers.cell_credits.deviceBuffer, COMPUTE_SHADER_WRITE },
+                    { buffers.default_spec_remaining.deviceBuffer, COMPUTE_SHADER_WRITE },
                 }, COMPUTE_SHADER_READ);
             } else {
                 bufferMemoryBarrier({
                     { buffers.default_dupli_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
+                    { buffers.cell_credits.deviceBuffer, COMPUTE_SHADER_WRITE },
+                    { buffers.default_spec_remaining.deviceBuffer, COMPUTE_SHADER_WRITE },
                 }, COMPUTE_SHADER_READ);
             }
+
+            num_dupli = executeSum(buffers, buffers.default_dupli_mask);
+            num_split = executeSum(buffers, buffers.default_split_mask);
+
             const size_t growth_cap_lim = get_growth_cap();
             const size_t effective_cap = (config.cap_max > 0)
                 ? std::min(static_cast<size_t>(config.cap_max), growth_cap_lim)
                 : growth_cap_lim;
             const bool has_eff_cap = effective_cap < std::numeric_limits<size_t>::max();
-            const bool need_host_grow_filter =
-                (config.mcmc_protect_structural_groups && (!splat_group_ids.empty() || !splat_states.empty())) ||
-                has_eff_cap || (config.cap_speculative_max > 0);
-            if (need_host_grow_filter) {
+            if (has_eff_cap && (num_splats + static_cast<size_t>(num_dupli + num_split) > effective_cap)) {
+                ++adc_host_mask_readbacks_;
                 copyFromDevice(buffers.default_dupli_mask);
                 copyFromDevice(buffers.default_split_mask);
-                bool modified_grow = false;
-                size_t cur_spec = 0;
+                copyFromDevice(buffers.default_grad);
+                auto score_of = [&](size_t i) -> float {
+                    if (2 * i + 1 >= buffers.default_grad.size())
+                        return 0.0f;
+                    return buffers.default_grad[2 * i] / std::max(buffers.default_grad[2 * i + 1], 1.0f);
+                };
+                const size_t allow_tot = (num_splats < effective_cap) ? (effective_cap - num_splats) : 0;
+                std::vector<std::pair<float, size_t>> cand;
+                cand.reserve(static_cast<size_t>(num_dupli + num_split));
                 for (size_t i = 0; i < num_splats; ++i) {
-                    const int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
-                    const uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
-                    if (gid >= 0)
-                        ++cur_spec;
-                    bool disallow = false;
-                    if (st != 0xFFFFFFFFu) {
-                        // Allow OBSERVED_TRAINABLE (2u), METRIC_VERIFIED (3u), MEASURED_FREE (5u);
-                        // block PREDICTED_UNOBSERVED (0u), OBSERVED_UNCERTAIN (1u), CONTRADICTED (4u).
-                        disallow = (st == 0u || st == 1u || st == 4u);
-                    } else if (config.mcmc_protect_structural_groups && gid >= 0) {
-                        disallow = true;
-                    }
-                    if (disallow) {
-                        if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i] != 0) {
-                            buffers.default_dupli_mask[i] = 0;
-                            modified_grow = true;
-                        }
-                        if (i < buffers.default_split_mask.size() && buffers.default_split_mask[i] != 0) {
-                            buffers.default_split_mask[i] = 0;
-                            modified_grow = true;
+                    const bool d = (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i] != 0);
+                    const bool s = (i < buffers.default_split_mask.size() && buffers.default_split_mask[i] != 0);
+                    if (d && s)
+                        buffers.default_dupli_mask[i] = 0;
+                    if (d || s)
+                        cand.push_back({score_of(i), i});
+                }
+                std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                size_t used = 0;
+                size_t used_spec = 0;
+                std::vector<int32_t> credit_refunds;
+                if (use_local_cell_credits_)
+                    credit_refunds.assign(cell_credits_host.size(), 0);
+                for (const auto& [sc, idx] : cand) {
+                    const size_t want = static_cast<size_t>((buffers.default_dupli_mask[idx] ? 1 : 0) +
+                                                            (buffers.default_split_mask[idx] ? 1 : 0));
+                    const bool is_spec = (idx < splat_group_ids.size() && splat_group_ids[idx] >= 0);
+                    if (used + want <= allow_tot && (!is_spec || used_spec + want <= allow_spec)) {
+                        used += want;
+                        if (is_spec)
+                            used_spec += want;
+                    } else {
+                        buffers.default_dupli_mask[idx] = 0;
+                        buffers.default_split_mask[idx] = 0;
+                        if (use_local_cell_credits_ && idx < splat_cell_ids.size()) {
+                            int32_t cid = splat_cell_ids[idx];
+                            if (cid >= 0 && static_cast<size_t>(cid) < credit_refunds.size())
+                                credit_refunds[cid] += 1;
                         }
                     }
                 }
-                // Count proposed growth and enforce explicit cap_speculative_max and cap_max
-                size_t prop_total = 0, prop_spec = 0;
-                for (size_t i = 0; i < num_splats; ++i) {
-                    int g = ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ? 1 : 0) +
-                            ((i < buffers.default_split_mask.size() && buffers.default_split_mask[i]) ? 1 : 0);
-                    prop_total += (size_t)g;
-                    if (i < splat_group_ids.size() && splat_group_ids[i] >= 0)
-                        prop_spec += (size_t)g;
+                if (use_local_cell_credits_ && !credit_refunds.empty()) {
+                    copyFromDevice(buffers.cell_credits);
+                    for (size_t c = 0; c < credit_refunds.size() && c < buffers.cell_credits.size(); ++c)
+                        buffers.cell_credits[c] += credit_refunds[c];
+                    copyToDevice(buffers.cell_credits);
                 }
-                const bool over_spec = (config.cap_speculative_max > 0) && (cur_spec + prop_spec > (size_t)config.cap_speculative_max);
-                const bool over_tot = has_eff_cap && (num_splats + prop_total > effective_cap);
-                if (over_spec || over_tot) {
-                    copyFromDevice(buffers.default_grad);
-                    auto score_of = [&](size_t i) -> float {
-                        if (2 * i + 1 >= buffers.default_grad.size())
-                            return 0.0f;
-                        return buffers.default_grad[2 * i] / std::max(buffers.default_grad[2 * i + 1], 1.0f);
-                    };
-                    if (over_spec) {
-                        size_t allow_spec = (cur_spec < (size_t)config.cap_speculative_max) ? ((size_t)config.cap_speculative_max - cur_spec) : 0;
-                        std::vector<std::pair<float, size_t>> cand;
-                        for (size_t i = 0; i < num_splats; ++i) {
-                            if (i < splat_group_ids.size() && splat_group_ids[i] >= 0 &&
-                                ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ||
-                                 (i < buffers.default_split_mask.size() && buffers.default_split_mask[i]))) {
-                                cand.push_back({score_of(i), i});
-                            }
-                        }
-                        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-                        for (size_t c = allow_spec; c < cand.size(); ++c) {
-                            size_t idx = cand[c].second;
-                            buffers.default_dupli_mask[idx] = 0;
-                            buffers.default_split_mask[idx] = 0;
-                        }
-                        modified_grow = true;
-                    }
-                    // Recompute total after speculative cap
-                    prop_total = 0;
-                    for (size_t i = 0; i < num_splats; ++i) {
-                        if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ++prop_total;
-                        if (i < buffers.default_split_mask.size() && buffers.default_split_mask[i]) ++prop_total;
-                    }
-                    if (has_eff_cap && num_splats + prop_total > effective_cap) {
-                        size_t allow_tot = (num_splats < effective_cap) ? (effective_cap - num_splats) : 0;
-                        std::vector<std::pair<float, size_t>> cand;
-                        cand.reserve(prop_total);
-                        for (size_t i = 0; i < num_splats; ++i) {
-                            if ((i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ||
-                                (i < buffers.default_split_mask.size() && buffers.default_split_mask[i])) {
-                                cand.push_back({score_of(i), i});
-                            }
-                        }
-                        std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-                        size_t used = 0;
-                        for (const auto& [sc, idx] : cand) {
-                            int want = (buffers.default_dupli_mask[idx] ? 1 : 0) + (buffers.default_split_mask[idx] ? 1 : 0);
-                            if (used + (size_t)want <= allow_tot) {
-                                used += (size_t)want;
-                            } else {
-                                buffers.default_dupli_mask[idx] = 0;
-                                buffers.default_split_mask[idx] = 0;
-                            }
-                        }
-                        modified_grow = true;
-                    }
-                }
-                if (modified_grow) {
-                    copyToDevice(buffers.default_dupli_mask);
-                    copyToDevice(buffers.default_split_mask);
-                    bufferMemoryBarrier({
-                        { buffers.default_dupli_mask.deviceBuffer, TRANSFER_WRITE },
-                        { buffers.default_split_mask.deviceBuffer, TRANSFER_WRITE },
-                    }, COMPUTE_SHADER_READ);
-                }
+                copyToDevice(buffers.default_dupli_mask);
+                copyToDevice(buffers.default_split_mask);
+                bufferMemoryBarrier({
+                    { buffers.default_dupli_mask.deviceBuffer, TRANSFER_WRITE },
+                    { buffers.default_split_mask.deviceBuffer, TRANSFER_WRITE },
+                    { buffers.cell_credits.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ);
+                num_dupli = executeSum(buffers, buffers.default_dupli_mask);
+                num_split = executeSum(buffers, buffers.default_split_mask);
             }
-
-            num_dupli = executeSum(buffers, buffers.default_dupli_mask);
-            num_split = executeSum(buffers, buffers.default_split_mask);
         }
 
         if (num_dupli + num_split > 0) {
@@ -1392,11 +1426,46 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             resizeAndCopyDeviceBuffer(buffers.default_radii, new_num_splats, false);
             buffers.num_splats = new_num_splats;
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
+            if (!splat_group_ids.empty() && splat_group_ids.size() != num_splats)
                 splat_group_ids.resize(num_splats, -1);
-            if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
+            if (!splat_entity_ids.empty() && splat_entity_ids.size() != num_splats)
                 splat_entity_ids.resize(num_splats, -1);
+            if (!splat_states.empty() && splat_states.size() != num_splats)
+                splat_states.resize(num_splats, 0xFFFFFFFFu);
+            if (!splat_anchors_host.empty() && splat_anchors_host.size() != 8 * num_splats)
+                splat_anchors_host.resize(8 * num_splats, 0.0f);
+            if (use_local_cell_credits_ && splat_cell_ids.size() != num_splats)
+                splat_cell_ids.resize(num_splats, -1);
         }
+
+        auto propagateSpawnedMetadata = [&](int count) {
+            if (splat_group_ids.empty() && splat_entity_ids.empty() && splat_states.empty() &&
+                splat_anchors_host.empty() && !use_local_cell_credits_)
+                return;
+            copyFromDevice(buffers._temp_indices);
+            auto extendScalar = [&](auto& vec, auto fill) {
+                size_t base_n = vec.size();
+                vec.resize(base_n + count, fill);
+                for (int k = 0; k < count && (size_t)k < buffers._temp_indices.size(); ++k) {
+                    int32_t src = buffers._temp_indices[k];
+                    if (src >= 0 && (size_t)src < base_n)
+                        vec[base_n + k] = vec[src];
+                }
+            };
+            if (!splat_group_ids.empty()) extendScalar(splat_group_ids, int32_t(-1));
+            if (!splat_entity_ids.empty()) extendScalar(splat_entity_ids, int32_t(-1));
+            if (!splat_states.empty()) extendScalar(splat_states, uint32_t(5u));
+            if (use_local_cell_credits_) extendScalar(splat_cell_ids, int32_t(-1));
+            if (!splat_anchors_host.empty()) {
+                size_t base_n = splat_anchors_host.size() / 8;
+                splat_anchors_host.resize(8 * (base_n + count), 0.0f);
+                for (int k = 0; k < count && (size_t)k < buffers._temp_indices.size(); ++k) {
+                    int32_t src = buffers._temp_indices[k];
+                    if (src >= 0 && (size_t)src < base_n)
+                        std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
+                }
+            }
+        };
 
         if (num_dupli > 0) {
             executeWhere(buffers, buffers.default_dupli_mask, buffers._temp_indices);
@@ -1426,45 +1495,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
-                copyFromDevice(buffers._temp_indices);
-                if (!splat_group_ids.empty()) {
-                    size_t base_n = splat_group_ids.size();
-                    splat_group_ids.resize(base_n + num_dupli, -1);
-                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_group_ids[base_n + k] = splat_group_ids[src];
-                    }
-                }
-                if (!splat_entity_ids.empty()) {
-                    size_t base_n = splat_entity_ids.size();
-                    splat_entity_ids.resize(base_n + num_dupli, -1);
-                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_entity_ids[base_n + k] = splat_entity_ids[src];
-                    }
-                }
-                if (!splat_states.empty()) {
-                    size_t base_n = splat_states.size();
-                    splat_states.resize(base_n + num_dupli, 5u);
-                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_states[base_n + k] = splat_states[src];
-                    }
-                }
-                if (!splat_anchors_host.empty()) {
-                    size_t base_n = splat_anchors_host.size() / 8;
-                    splat_anchors_host.resize(8 * (base_n + num_dupli), 0.0f);
-                    for (int k = 0; k < num_dupli && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
-                    }
-                }
-            }
+            propagateSpawnedMetadata(num_dupli);
         }
 
         if (num_split > 0) {
@@ -1495,45 +1526,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
-                copyFromDevice(buffers._temp_indices);
-                if (!splat_group_ids.empty()) {
-                    size_t base_n = splat_group_ids.size();
-                    splat_group_ids.resize(base_n + num_split, -1);
-                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_group_ids[base_n + k] = splat_group_ids[src];
-                    }
-                }
-                if (!splat_entity_ids.empty()) {
-                    size_t base_n = splat_entity_ids.size();
-                    splat_entity_ids.resize(base_n + num_split, -1);
-                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_entity_ids[base_n + k] = splat_entity_ids[src];
-                    }
-                }
-                if (!splat_states.empty()) {
-                    size_t base_n = splat_states.size();
-                    splat_states.resize(base_n + num_split, 5u);
-                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            splat_states[base_n + k] = splat_states[src];
-                    }
-                }
-                if (!splat_anchors_host.empty()) {
-                    size_t base_n = splat_anchors_host.size() / 8;
-                    splat_anchors_host.resize(8 * (base_n + num_split), 0.0f);
-                    for (int k = 0; k < num_split && (size_t)k < buffers._temp_indices.size(); ++k) {
-                        int32_t src = buffers._temp_indices[k];
-                        if (src >= 0 && (size_t)src < base_n)
-                            std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
-                    }
-                }
-            }
+            propagateSpawnedMetadata(num_split);
         }
 
         // prune GS
@@ -1602,41 +1595,24 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         int num_prune = (int)num_splats - num_keep;
 
         if (num_prune > 0) {
-            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
+            if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() ||
+                !splat_anchors_host.empty() || use_local_cell_credits_) {
                 copyFromDevice(buffers.default_keep_mask);
-                if (!splat_group_ids.empty()) {
-                    std::vector<int32_t> kept_gids;
-                    kept_gids.reserve(num_keep);
+                auto filterScalar = [&](auto& vec, auto fill) {
+                    using Elem = typename std::remove_reference_t<decltype(vec)>::value_type;
+                    std::vector<Elem> kept;
+                    kept.reserve(num_keep);
                     for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
-                        if (buffers.default_keep_mask[i]) {
-                            kept_gids.push_back(i < splat_group_ids.size() ? splat_group_ids[i] : -1);
-                        }
+                        if (buffers.default_keep_mask[i])
+                            kept.push_back(i < vec.size() ? vec[i] : fill);
                     }
-                    kept_gids.resize(num_keep, -1);
-                    splat_group_ids = std::move(kept_gids);
-                }
-                if (!splat_entity_ids.empty()) {
-                    std::vector<int32_t> kept_eids;
-                    kept_eids.reserve(num_keep);
-                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
-                        if (buffers.default_keep_mask[i]) {
-                            kept_eids.push_back(i < splat_entity_ids.size() ? splat_entity_ids[i] : -1);
-                        }
-                    }
-                    kept_eids.resize(num_keep, -1);
-                    splat_entity_ids = std::move(kept_eids);
-                }
-                if (!splat_states.empty()) {
-                    std::vector<uint32_t> kept_st;
-                    kept_st.reserve(num_keep);
-                    for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
-                        if (buffers.default_keep_mask[i]) {
-                            kept_st.push_back(i < splat_states.size() ? splat_states[i] : 0xFFFFFFFFu);
-                        }
-                    }
-                    kept_st.resize(num_keep, 0xFFFFFFFFu);
-                    splat_states = std::move(kept_st);
-                }
+                    kept.resize(num_keep, fill);
+                    vec = std::move(kept);
+                };
+                if (!splat_group_ids.empty()) filterScalar(splat_group_ids, int32_t(-1));
+                if (!splat_entity_ids.empty()) filterScalar(splat_entity_ids, int32_t(-1));
+                if (!splat_states.empty()) filterScalar(splat_states, uint32_t(0xFFFFFFFFu));
+                if (use_local_cell_credits_) filterScalar(splat_cell_ids, int32_t(-1));
                 if (!splat_anchors_host.empty()) {
                     std::vector<float> kept_anc(8 * num_keep, 0.0f);
                     size_t dst_k = 0;
@@ -1731,6 +1707,19 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffers.splat_anchor.deviceBuffer, TRANSFER_WRITE },
                 }, COMPUTE_SHADER_READ_WRITE);
             }
+            if (use_local_cell_credits_) {
+                splat_cell_ids.resize(buffers.num_splats, -1);
+                if (buffers.num_splats > 0) {
+                    buffers.splat_cell_ids.assign(splat_cell_ids.begin(), splat_cell_ids.end());
+                } else {
+                    buffers.splat_cell_ids.assign(1, -1);
+                }
+                copyToDevice(buffers.splat_cell_ids);
+                splat_cell_ids_dirty_ = false;
+                bufferMemoryBarrier({
+                    { buffers.splat_cell_ids.deviceBuffer, TRANSFER_WRITE },
+                }, COMPUTE_SHADER_READ_WRITE);
+            }
         }
 
         // reset running states
@@ -1817,8 +1806,10 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     const size_t kGroupSize = 256;
     const size_t kGroupSizeSparse = 64;
     size_t num_splats = buffers.num_splats;
+    if (num_splats == 0)
+        return;
 
-    Uniform32_t uniforms[7];
+    Uniform32_t uniforms[8];
     uniforms[0].u = (uint32_t)num_splats;
     uniforms[1].u = 0;  // num_add
     uniforms[2].u = std::uniform_int_distribution<uint32_t>()(rng);
@@ -1826,7 +1817,10 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     uniforms[4].u = config.mcmc_protect_structural_groups ? 1u : 0u;
 
     ensureGroupBuffersOnDevice(buffers, num_splats);
+    ensureCellCreditBuffersOnDevice(buffers, num_splats);
     uniforms[5].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+    uniforms[6].u = 0u;
+    uniforms[7].u = 0u;
 
     // refinement
     if (
@@ -1836,16 +1830,20 @@ void VulkanGSTrainer::executeMCMCPostBackward(
 
         // Relocation */
 
-        // 1) Compute relocation probabilities for all Gaussians
+        // 1) Compute relocation probabilities for all Gaussians (preferring corroborated multi-view cells when active)
+        uniforms[6].u = use_local_cell_credits_ ? 1u : 0u;
+        uniforms[7].u = use_local_cell_credits_ ? static_cast<uint32_t>(cell_eligible_host.size()) : 0u;
         bufferMemoryBarrier({
             { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
             { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_cell_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.cell_eligible.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ);
         executeCompute(
             {{num_splats, kGroupSize}},
-            &uniforms, 6*sizeof(Uniform32_t),
+            &uniforms, 8*sizeof(Uniform32_t),
             pipeline_mcmc.compute_probs,
             {
                 buffers.scales_opacs.deviceBuffer,
@@ -1853,6 +1851,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 buffers.group_ids.deviceBuffer,
                 buffers.group_state.deviceBuffer,
                 buffers.splat_state.deviceBuffer,
+                buffers.splat_cell_ids.deviceBuffer,
+                buffers.cell_eligible.deviceBuffer,
             }
         );
 
@@ -1877,10 +1877,11 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ_WRITE);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 6*sizeof(Uniform32_t),
+                &uniforms, 8*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation_index_map,
                 {
                     buffers.mcmc_sample_probs.deviceBuffer,
@@ -1890,6 +1891,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     buffers.group_ids.deviceBuffer,
                     buffers.group_state.deviceBuffer,
                     buffers.splat_state.deviceBuffer,
+                    buffers.scales_opacs.deviceBuffer,
                 }
             );
 
@@ -1904,7 +1906,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 6*sizeof(Uniform32_t),
+                &uniforms, 8*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_relocation,
                 {
                     buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -1921,7 +1923,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             barrierAllGaussParams(buffers);
             executeCompute(
                 {{num_splats, kGroupSizeSparse}},
-                &uniforms, 6*sizeof(Uniform32_t),
+                &uniforms, 8*sizeof(Uniform32_t),
                 pipeline_mcmc.update_relocation,
                 {
                     buffers.mcmc_index_map.deviceBuffer,
@@ -1937,10 +1939,10 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }
             );
 
-            // MC-1: Update splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host for relocated dead splats
-            if (!splat_group_ids.empty() || !splat_states.empty()) {
+            // MC-1: Update splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host, splat_cell_ids for relocated dead splats
+            if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_) {
                 copyFromDevice(buffers.mcmc_index_map);
-                if (splat_group_ids.size() < num_splats)
+                if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
                     splat_group_ids.resize(num_splats, -1);
                 if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
                     splat_entity_ids.resize(num_splats, -1);
@@ -1948,18 +1950,24 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     splat_states.resize(num_splats, 0xFFFFFFFFu);
                 if (!splat_anchors_host.empty() && splat_anchors_host.size() < 8 * num_splats)
                     splat_anchors_host.resize(8 * num_splats, 0.0f);
+                if (use_local_cell_credits_ && splat_cell_ids.size() < num_splats)
+                    splat_cell_ids.resize(num_splats, -1);
                 std::vector<int32_t> old_gids = splat_group_ids;
                 std::vector<int32_t> old_eids = splat_entity_ids;
                 std::vector<uint32_t> old_sts = splat_states;
                 std::vector<float> old_anc = splat_anchors_host;
+                std::vector<int32_t> old_cids = splat_cell_ids;
                 for (size_t i = 0; i < num_splats && i < buffers.mcmc_index_map.size(); ++i) {
                     int32_t src = buffers.mcmc_index_map[i];
                     if (src >= 0 && (size_t)src < num_splats && (size_t)src != i) {
                         uint32_t st_i = (!old_sts.empty() && i < old_sts.size()) ? old_sts[i] : 0xFFFFFFFFu;
-                        if (st_i == 0u || st_i == 1u || (st_i == 0xFFFFFFFFu && protect_groups && old_gids[i] >= 0)) {
+                        int32_t gid_i = (!old_gids.empty() && i < old_gids.size()) ? old_gids[i] : -1;
+                        if (st_i == 0u || st_i == 1u || (st_i == 0xFFFFFFFFu && protect_groups && gid_i >= 0)) {
                             continue;
                         }
-                        splat_group_ids[i] = old_gids[src];
+                        if (!splat_group_ids.empty()) {
+                            splat_group_ids[i] = old_gids[src];
+                        }
                         if (!splat_entity_ids.empty()) {
                             splat_entity_ids[i] = old_eids[src];
                         }
@@ -1969,17 +1977,27 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                         if (!splat_anchors_host.empty()) {
                             std::memcpy(&splat_anchors_host[8 * i], &old_anc[8 * src], 8 * sizeof(float));
                         }
+                        if (use_local_cell_credits_) {
+                            splat_cell_ids[i] = old_cids[src];
+                        }
                     }
                 }
-                buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
-                copyToDevice(buffers.group_ids);
+                if (!splat_group_ids.empty()) {
+                    buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.begin() + num_splats);
+                    copyToDevice(buffers.group_ids);
+                }
                 if (!splat_states.empty()) {
-                    buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                    buffers.splat_state.assign(splat_states.begin(), splat_states.begin() + num_splats);
                     copyToDevice(buffers.splat_state);
                 }
                 if (!splat_anchors_host.empty()) {
-                    buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+                    buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.begin() + 8 * num_splats);
                     copyToDevice(buffers.splat_anchor);
+                }
+                if (use_local_cell_credits_) {
+                    buffers.splat_cell_ids.assign(splat_cell_ids.begin(), splat_cell_ids.begin() + num_splats);
+                    copyToDevice(buffers.splat_cell_ids);
+                    splat_cell_ids_dirty_ = false;
                 }
             }
             mcmc_relocated_count += (size_t)num_relocate;
@@ -1987,22 +2005,60 @@ void VulkanGSTrainer::executeMCMCPostBackward(
 
         // Add more GS */
 
-        const size_t effective_cap = std::min((size_t)config.cap_max, get_growth_cap());
+        const size_t effective_cap = (config.cap_max > 0)
+            ? std::min(static_cast<size_t>(config.cap_max), get_growth_cap())
+            : get_growth_cap();
         size_t new_num_splats = std::min((size_t)(config.grow_factor * num_splats), effective_cap);
         size_t num_add = std::max(new_num_splats, num_splats) - num_splats;
+        if (num_add > 0 && use_local_cell_credits_) {
+            if (cell_credits_gpu_dirty_)
+                (void)get_local_cell_credits(buffers);
+            const size_t n_cells = cell_credits_host.size();
+            std::vector<uint8_t> cell_has_parent(n_cells, 0);
+            for (size_t i = 0; i < num_splats; ++i) {
+                const int32_t cid = (i < splat_cell_ids.size()) ? splat_cell_ids[i] : -1;
+                if (cid < 0 || static_cast<size_t>(cid) >= n_cells || cell_credits_host[cid] <= 0 || cell_has_parent[cid])
+                    continue;
+                const uint32_t st = (!splat_states.empty() && i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
+                if (st == 0u || st == 1u || st == 4u)
+                    continue;
+                if (st != 2u && st != 3u && st != 5u) {
+                    const int32_t gid = (!splat_group_ids.empty() && i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
+                    if (gid >= 0) {
+                        if (config.mcmc_protect_structural_groups)
+                            continue;
+                        if (static_cast<size_t>(gid) < buffers.group_state.size() &&
+                            (buffers.group_state[gid] == 1u || buffers.group_state[gid] == 3u))
+                            continue;
+                    }
+                }
+                cell_has_parent[cid] = 1;
+            }
+            size_t total_positive_cell_credits = 0;
+            for (size_t c = 0; c < n_cells; ++c) {
+                if (cell_has_parent[c] && cell_credits_host[c] > 0)
+                    total_positive_cell_credits += static_cast<size_t>(cell_credits_host[c]);
+            }
+            num_add = std::min(num_add, total_positive_cell_credits);
+            new_num_splats = num_splats + num_add;
+        }
         if (num_add > 0) {
             uniforms[1].u = (uint32_t)num_add;
+            uniforms[6].u = use_local_cell_credits_ ? 1u : 0u;
+            uniforms[7].u = use_local_cell_credits_ ? static_cast<uint32_t>(cell_credits_host.size()) : 0u;
             
-            // 1) Compute relocation probabilities for all Gaussians
+            // 1) Compute add donor probabilities for all Gaussians (zeroing cells with credit <= 0)
             bufferMemoryBarrier({
                 { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
                 { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_cell_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.cell_credits.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             }, COMPUTE_SHADER_READ);
             executeCompute(
                 {{num_splats, kGroupSize}},
-                &uniforms, 6*sizeof(Uniform32_t),
+                &uniforms, 8*sizeof(Uniform32_t),
                 pipeline_mcmc.compute_probs,
                 {
                     buffers.scales_opacs.deviceBuffer,
@@ -2010,6 +2066,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     buffers.group_ids.deviceBuffer,
                     buffers.group_state.deviceBuffer,
                     buffers.splat_state.deviceBuffer,
+                    buffers.splat_cell_ids.deviceBuffer,
+                    buffers.cell_credits.deviceBuffer,
                 }
             );
 
@@ -2033,7 +2091,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ_WRITE);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 6*sizeof(Uniform32_t),
+                    &uniforms, 8*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add_index_map,
                     {
                         buffers.mcmc_sample_probs_cumsum.deviceBuffer,
@@ -2048,7 +2106,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }, COMPUTE_SHADER_READ);
                 executeCompute(
                     {{num_splats, kGroupSizeSparse}},
-                    &uniforms, 6*sizeof(Uniform32_t),
+                    &uniforms, 8*sizeof(Uniform32_t),
                     pipeline_mcmc.compute_add,
                     {
                         buffers.mcmc_n_idx_buffer.deviceBuffer,
@@ -2057,13 +2115,13 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 );
 
                 // 5) [dN] Update attributes for Gaussians added from
-                size_t alloc_size = num_splats;
+                size_t alloc_size = new_num_splats;
                 if (config.strategy == TrainerConfig::Strategy::MCMC)
                     alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
                 barrierAllGaussParams(buffers);
                 executeCompute(
                     {{num_add, kGroupSize}},
-                    &uniforms, 6*sizeof(Uniform32_t),
+                    &uniforms, 8*sizeof(Uniform32_t),
                     pipeline_mcmc.update_add,
                     {
                         buffers.mcmc_index_map.deviceBuffer,
@@ -2083,13 +2141,20 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 resizeAndCopyDeviceBuffer(buffers.splat_state, alloc_size, false);
                 if (!splat_anchors_host.empty())
                     resizeAndCopyDeviceBuffer(buffers.splat_anchor, 8 * alloc_size, false);
-                if (!splat_group_ids.empty() || !splat_states.empty()) {
+                if (use_local_cell_credits_)
+                    resizeAndCopyDeviceBuffer(buffers.splat_cell_ids, alloc_size, false);
+                if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_) {
                     copyFromDevice(buffers.mcmc_index_map);
-                    if (splat_group_ids.size() < num_splats)
-                        splat_group_ids.resize(num_splats, -1);
-                    splat_group_ids.resize(new_num_splats, -1);
-                    if (!splat_entity_ids.empty())
+                    if (!splat_group_ids.empty()) {
+                        if (splat_group_ids.size() < num_splats)
+                            splat_group_ids.resize(num_splats, -1);
+                        splat_group_ids.resize(new_num_splats, -1);
+                    }
+                    if (!splat_entity_ids.empty()) {
+                        if (splat_entity_ids.size() < num_splats)
+                            splat_entity_ids.resize(num_splats, -1);
                         splat_entity_ids.resize(new_num_splats, -1);
+                    }
                     if (!splat_states.empty()) {
                         if (splat_states.size() < num_splats)
                             splat_states.resize(num_splats, 0xFFFFFFFFu);
@@ -2100,10 +2165,17 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                             splat_anchors_host.resize(8 * num_splats, 0.0f);
                         splat_anchors_host.resize(8 * new_num_splats, 0.0f);
                     }
+                    if (use_local_cell_credits_) {
+                        if (splat_cell_ids.size() < num_splats)
+                            splat_cell_ids.resize(num_splats, -1);
+                        splat_cell_ids.resize(new_num_splats, -1);
+                    }
                     for (size_t k = 0; k < num_add && k < buffers.mcmc_index_map.size(); ++k) {
                         int32_t src = buffers.mcmc_index_map[k];
                         if (src >= 0 && (size_t)src < num_splats) {
-                            splat_group_ids[num_splats + k] = splat_group_ids[src];
+                            if (!splat_group_ids.empty()) {
+                                splat_group_ids[num_splats + k] = splat_group_ids[src];
+                            }
                             if (!splat_entity_ids.empty()) {
                                 splat_entity_ids[num_splats + k] = splat_entity_ids[src];
                             }
@@ -2113,14 +2185,30 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                             if (!splat_anchors_host.empty()) {
                                 std::memcpy(&splat_anchors_host[8 * (num_splats + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
                             }
+                            if (use_local_cell_credits_) {
+                                int32_t cid = splat_cell_ids[src];
+                                splat_cell_ids[num_splats + k] = cid;
+                                if (cid >= 0 && static_cast<size_t>(cid) < cell_credits_host.size())
+                                    cell_credits_host[cid] = std::max<int32_t>(0, cell_credits_host[cid] - 1);
+                            }
                         }
                     }
-                    uploadDeviceSlice(
-                        buffers.group_ids.deviceBuffer,
-                        num_splats * sizeof(int32_t),
-                        splat_group_ids.data() + num_splats,
-                        num_add * sizeof(int32_t)
-                    );
+                    if (!splat_group_ids.empty()) {
+                        uploadDeviceSlice(
+                            buffers.group_ids.deviceBuffer,
+                            num_splats * sizeof(int32_t),
+                            splat_group_ids.data() + num_splats,
+                            num_add * sizeof(int32_t)
+                        );
+                    } else {
+                        std::vector<int32_t> neg_ones(num_add, -1);
+                        uploadDeviceSlice(
+                            buffers.group_ids.deviceBuffer,
+                            num_splats * sizeof(int32_t),
+                            neg_ones.data(),
+                            num_add * sizeof(int32_t)
+                        );
+                    }
                     if (!splat_states.empty()) {
                         uploadDeviceSlice(
                             buffers.splat_state.deviceBuffer,
@@ -2144,6 +2232,20 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                             splat_anchors_host.data() + 8 * num_splats,
                             8 * num_add * sizeof(float)
                         );
+                    }
+                    if (use_local_cell_credits_) {
+                        uploadDeviceSlice(
+                            buffers.splat_cell_ids.deviceBuffer,
+                            num_splats * sizeof(int32_t),
+                            splat_cell_ids.data() + num_splats,
+                            num_add * sizeof(int32_t)
+                        );
+                        splat_cell_ids_dirty_ = false;
+                        if (!cell_credits_host.empty()) {
+                            buffers.cell_credits.assign(cell_credits_host.begin(), cell_credits_host.end());
+                            copyToDevice(buffers.cell_credits);
+                            cell_credits_gpu_dirty_ = false;
+                        }
                     }
                 } else {
                     std::vector<int32_t> neg_ones(num_add, -1);
@@ -2314,47 +2416,33 @@ void VulkanGSTrainer::executeMortonSorting(
     applyIndex(buffers.default_grad, 2*2);
     barrierAllGaussParams(buffers);
 
-    // MC-1: Permute splat_group_ids, splat_entity_ids, splat_states, and splat_anchors_host to match Morton-sorted order
-    if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() || !splat_anchors_host.empty()) {
+    // MC-1: Permute splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host, and splat_cell_ids to match Morton-sorted order
+    if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() ||
+        !splat_anchors_host.empty() || use_local_cell_credits_) {
         copyFromDevice(buffers.sorted_gauss_idx());
         const auto& idx_buf = buffers.sorted_gauss_idx();
-        if (!splat_group_ids.empty()) {
-            if (splat_group_ids.size() < num_splats)
-                splat_group_ids.resize(num_splats, -1);
-            std::vector<int32_t> new_gids(num_splats, -1);
+        auto permuteScalar = [&](auto& vec, auto fill) {
+            using Elem = typename std::remove_reference_t<decltype(vec)>::value_type;
+            if (vec.size() < num_splats)
+                vec.resize(num_splats, fill);
+            std::vector<Elem> out(num_splats, fill);
             for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
                 int32_t src = idx_buf[i];
-                if (src >= 0 && (size_t)src < splat_group_ids.size()) {
-                    new_gids[i] = splat_group_ids[src];
-                }
+                if (src >= 0 && (size_t)src < vec.size())
+                    out[i] = vec[src];
             }
-            splat_group_ids = std::move(new_gids);
+            vec = std::move(out);
+        };
+        if (!splat_group_ids.empty()) {
+            permuteScalar(splat_group_ids, int32_t(-1));
             buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
             copyToDevice(buffers.group_ids);
         }
         if (!splat_entity_ids.empty()) {
-            if (splat_entity_ids.size() < num_splats)
-                splat_entity_ids.resize(num_splats, -1);
-            std::vector<int32_t> new_eids(num_splats, -1);
-            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
-                int32_t src = idx_buf[i];
-                if (src >= 0 && (size_t)src < splat_entity_ids.size()) {
-                    new_eids[i] = splat_entity_ids[src];
-                }
-            }
-            splat_entity_ids = std::move(new_eids);
+            permuteScalar(splat_entity_ids, int32_t(-1));
         }
         if (!splat_states.empty()) {
-            if (splat_states.size() < num_splats)
-                splat_states.resize(num_splats, 0xFFFFFFFFu);
-            std::vector<uint32_t> new_sts(num_splats, 0xFFFFFFFFu);
-            for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
-                int32_t src = idx_buf[i];
-                if (src >= 0 && (size_t)src < splat_states.size()) {
-                    new_sts[i] = splat_states[src];
-                }
-            }
-            splat_states = std::move(new_sts);
+            permuteScalar(splat_states, uint32_t(0xFFFFFFFFu));
             buffers.splat_state.assign(splat_states.begin(), splat_states.end());
             copyToDevice(buffers.splat_state);
         }
@@ -2365,13 +2453,20 @@ void VulkanGSTrainer::executeMortonSorting(
             size_t n_anc = splat_anchors_host.size() / 8;
             for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
                 int32_t src = idx_buf[i];
-                if (src >= 0 && (size_t)src < n_anc) {
+                if (src >= 0 && (size_t)src < n_anc)
                     std::memcpy(&new_anc[8 * i], &splat_anchors_host[8 * src], 8 * sizeof(float));
-                }
             }
             splat_anchors_host = std::move(new_anc);
             buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
             copyToDevice(buffers.splat_anchor);
+        }
+        if (use_local_cell_credits_) {
+            permuteScalar(splat_cell_ids, int32_t(-1));
+            if (num_splats > 0) {
+                buffers.splat_cell_ids.assign(splat_cell_ids.begin(), splat_cell_ids.end());
+                copyToDevice(buffers.splat_cell_ids);
+            }
+            splat_cell_ids_dirty_ = false;
         }
     }
 
@@ -2727,6 +2822,130 @@ void VulkanGSTrainer::ensureGroupBuffersOnDevice(
         copyToDevice(buffers.splat_anchor);
         buffers.splat_anchor.deviceBuffer.size = 0;  // num_anchors = 0 in shader
     }
+}
+
+void VulkanGSTrainer::ensureCellCreditBuffersOnDevice(
+    VulkanGSPipelineBuffers& buffers,
+    size_t num_splats
+) {
+    if (use_local_cell_credits_) {
+        if (splat_cell_ids.size() < num_splats) {
+            splat_cell_ids.resize(num_splats, -1);
+            splat_cell_ids_dirty_ = true;
+        }
+        const size_t want_elems = std::max<size_t>(1, num_splats);
+        if (splat_cell_ids_dirty_ ||
+            buffers.splat_cell_ids.deviceBuffer.buffer == VK_NULL_HANDLE ||
+            buffers.splat_cell_ids.deviceBuffer.size < want_elems * sizeof(int32_t)) {
+            if (num_splats > 0) {
+                buffers.splat_cell_ids.assign(splat_cell_ids.begin(), splat_cell_ids.begin() + num_splats);
+            } else {
+                buffers.splat_cell_ids.assign(1, -1);
+            }
+            copyToDevice(buffers.splat_cell_ids);
+            splat_cell_ids_dirty_ = false;
+        }
+        if (buffers.cell_credits.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            if (!cell_credits_host.empty())
+                buffers.cell_credits.assign(cell_credits_host.begin(), cell_credits_host.end());
+            else
+                buffers.cell_credits.assign(1, 0);
+            copyToDevice(buffers.cell_credits);
+        }
+        if (buffers.cell_eligible.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            if (!cell_eligible_host.empty())
+                buffers.cell_eligible.assign(cell_eligible_host.begin(), cell_eligible_host.end());
+            else
+                buffers.cell_eligible.assign(1, 0);
+            copyToDevice(buffers.cell_eligible);
+        }
+    } else {
+        if (buffers.splat_cell_ids.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            buffers.splat_cell_ids.assign(1, -1);
+            copyToDevice(buffers.splat_cell_ids);
+        }
+        if (buffers.cell_credits.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            buffers.cell_credits.assign(1, 0);
+            copyToDevice(buffers.cell_credits);
+        }
+        if (buffers.cell_eligible.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            buffers.cell_eligible.assign(1, 0);
+            copyToDevice(buffers.cell_eligible);
+        }
+    }
+}
+
+void VulkanGSTrainer::set_local_cell_credits(
+    VulkanGSPipelineBuffers& buffers,
+    const int32_t* cell_ids,
+    size_t n_splats,
+    const int32_t* credits,
+    size_t n_cells,
+    const int32_t* eligible_override
+) {
+    HOST_GUARD;
+    use_local_cell_credits_ = true;
+    if (cell_ids != nullptr && n_splats > 0)
+        splat_cell_ids.assign(cell_ids, cell_ids + n_splats);
+    else
+        splat_cell_ids.clear();
+    if (splat_cell_ids.size() < buffers.num_splats)
+        splat_cell_ids.resize(buffers.num_splats, -1);
+
+    if (credits != nullptr && n_cells > 0) {
+        cell_credits_host.assign(credits, credits + n_cells);
+        cell_eligible_host.resize(n_cells);
+        for (size_t c = 0; c < n_cells; ++c) {
+            cell_eligible_host[c] = (eligible_override != nullptr)
+                ? (eligible_override[c] > 0 ? 1 : 0)
+                : (credits[c] > 0 ? 1 : 0);
+        }
+    } else {
+        cell_credits_host.clear();
+        cell_eligible_host.clear();
+    }
+
+    const size_t n_upload = std::max<size_t>(buffers.num_splats, splat_cell_ids.size());
+    if (n_upload > 0)
+        buffers.splat_cell_ids.assign(splat_cell_ids.begin(), splat_cell_ids.begin() + n_upload);
+    else
+        buffers.splat_cell_ids.assign(1, -1);
+    copyToDevice(buffers.splat_cell_ids);
+    splat_cell_ids_dirty_ = false;
+
+    if (!cell_credits_host.empty()) {
+        buffers.cell_credits.assign(cell_credits_host.begin(), cell_credits_host.end());
+        buffers.cell_eligible.assign(cell_eligible_host.begin(), cell_eligible_host.end());
+    } else {
+        buffers.cell_credits.assign(1, 0);
+        buffers.cell_eligible.assign(1, 0);
+    }
+    copyToDevice(buffers.cell_credits);
+    copyToDevice(buffers.cell_eligible);
+    cell_credits_gpu_dirty_ = false;
+}
+
+void VulkanGSTrainer::clear_local_cell_credits() {
+    use_local_cell_credits_ = false;
+    splat_cell_ids_dirty_ = false;
+    cell_credits_gpu_dirty_ = false;
+    splat_cell_ids.clear();
+    cell_credits_host.clear();
+    cell_eligible_host.clear();
+}
+
+std::vector<int32_t> VulkanGSTrainer::get_local_cell_credits(VulkanGSPipelineBuffers& buffers) {
+    if (!use_local_cell_credits_ || cell_credits_host.empty())
+        return {};
+    if (cell_credits_gpu_dirty_ && buffers.cell_credits.deviceBuffer.buffer != VK_NULL_HANDLE) {
+        HOST_GUARD;
+        copyFromDevice(buffers.cell_credits);
+        const size_t n = std::min(cell_credits_host.size(), buffers.cell_credits.size());
+        for (size_t c = 0; c < n; ++c)
+            cell_credits_host[c] = buffers.cell_credits[c];
+        cell_credits_gpu_dirty_ = false;
+    }
+    return cell_credits_host;
 }
 
 void VulkanGSTrainer::set_group_states(
@@ -3162,6 +3381,7 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
         {&buffers.g_sh_coeffs_2.deviceBuffer, 0, true}, {&buffers.xyz_ws.deviceBuffer, 3, false},
         {&buffers.rotations.deviceBuffer, 4, false}, {&buffers.scales_opacs.deviceBuffer, 4, false},
         {&buffers.group_ids.deviceBuffer, 1, false}, {&buffers.splat_state.deviceBuffer, 1, false},
+        {&buffers.splat_cell_ids.deviceBuffer, 1, false},
         {&buffers.splat_anchor.deviceBuffer, 8, false}, {&buffers.g_xyz_ws.deviceBuffer, 6, false},
         {&buffers.g_rotations.deviceBuffer, 8, false}, {&buffers.g_scales_opacs.deviceBuffer, 8, false},
         {&buffers.default_grad.deviceBuffer, 2, false}, {&buffers.default_radii.deviceBuffer, 1, false},
@@ -3221,6 +3441,8 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
     };
     remap(splat_group_ids);
     remap(splat_entity_ids);
+    if (use_local_cell_credits_)
+        remap(splat_cell_ids);
     if (!splat_states.empty()) {
         splat_states.resize(old_n, 0xFFFFFFFFu);
         std::vector<uint32_t> out_st(new_n);
@@ -3269,6 +3491,8 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     constexpr size_t R = SH_REORDER_SIZE;
 
     ensureGroupBuffersOnDevice(buffers, old_n);
+    if (use_local_cell_credits_)
+        ensureCellCreditBuffersOnDevice(buffers, old_n);
 
     std::vector<int32_t> add_gids(n_add, -1);
     if (new_group_ids != nullptr)
@@ -3288,7 +3512,9 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     const size_t off_so = off_rot + 4 * n_add * sizeof(float);
     const size_t off_gid = off_so + 4 * n_add * sizeof(float);
     const size_t off_sst = off_gid + n_add * sizeof(int32_t);
-    const size_t off_sh = off_sst + n_add * sizeof(uint32_t);
+    const size_t off_cid = off_sst + n_add * sizeof(uint32_t);
+    const size_t cid_bytes = use_local_cell_credits_ ? n_add * sizeof(int32_t) : 0;
+    const size_t off_sh = off_cid + cid_bytes;
     const size_t staging_bytes = off_sh + sh_vec4 * 4 * sizeof(float);
 
     std::vector<uint32_t> add_sst(n_add, 0xFFFFFFFFu);
@@ -3316,6 +3542,8 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     }
     std::memcpy(stage + off_gid, add_gids.data(), n_add * sizeof(int32_t));
     std::memcpy(stage + off_sst, add_sst.data(), n_add * sizeof(uint32_t));
+    if (use_local_cell_credits_)
+        std::fill_n(reinterpret_cast<int32_t*>(stage + off_cid), n_add, -1);
 
     struct Vec4 { float v[4]; };
     Vec4* st_sh = reinterpret_cast<Vec4*>(stage + off_sh);
@@ -3381,6 +3609,8 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     grow(buffers.scales_opacs, 4 * new_n, false);
     grow(buffers.group_ids, new_n, false);
     grow(buffers.splat_state, new_n, false);
+    if (use_local_cell_credits_)
+        grow(buffers.splat_cell_ids, new_n, false);
     if (!splat_anchors_host.empty())
         grow(buffers.splat_anchor, 8 * new_n, true);
     // optimizer moments and densification statistics of existing splats are preserved, new ones start at zero
@@ -3413,6 +3643,10 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         VkBufferCopy region{off_sst, old_n * sizeof(uint32_t), n_add * sizeof(uint32_t)};
         vkCmdCopyBuffer(cb, src, buffers.splat_state.deviceBuffer.buffer, 1, &region);
     }
+    if (use_local_cell_credits_) {
+        VkBufferCopy region{off_cid, old_n * sizeof(int32_t), n_add * sizeof(int32_t)};
+        vkCmdCopyBuffer(cb, src, buffers.splat_cell_ids.deviceBuffer.buffer, 1, &region);
+    }
     vkCmdCopyBuffer(cb, src, buffers.sh_coeffs.deviceBuffer.buffer, (uint32_t)sh_regions.size(), sh_regions.data());
 
     submitAppendRecording();
@@ -3429,6 +3663,12 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     }
     if (!splat_anchors_host.empty())
         splat_anchors_host.resize(8 * new_n, 0.0f);
+    if (use_local_cell_credits_) {
+        if (splat_cell_ids.size() < old_n)
+            splat_cell_ids.resize(old_n, -1);
+        splat_cell_ids.resize(new_n, -1);
+        splat_cell_ids_dirty_ = false;
+    }
     buffers.num_splats = new_n;
 
     if (reallocated)
