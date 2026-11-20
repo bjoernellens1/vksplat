@@ -349,9 +349,13 @@ public:
         st["added_count"] = trainer.get_mcmc_added_count();
         st["num_splats"] = buffers.num_splats;
         st["cap_max"] = config.cap_max;
+        st["growth_cap"] = trainer.get_growth_cap();
         st["mcmc_protect_structural_groups"] = config.mcmc_protect_structural_groups;
         st["imagined_protection"] = true;
         return st;
+    }
+    void set_growth_cap(size_t cap) {
+        trainer.set_growth_cap(cap);
     }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         trainer.set_selective_freeze_unfrozen(unfrozen);
@@ -1400,6 +1404,7 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
         .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
+        .def("set_growth_cap", &VkSplat::set_growth_cap, "Set evidence-derived densification ceiling for ADC and MCMC; does not remove existing splats", py::arg("max_splats"))
         .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
         .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
         .def("clear_train_frames", &VkSplat::clear_train_frames, "Clear all loaded training frames")
