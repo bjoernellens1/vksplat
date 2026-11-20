@@ -1080,7 +1080,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     // execute compute
     size_t alloc_size = num_splats;
     if (config.strategy == TrainerConfig::Strategy::MCMC)
-        alloc_size = std::max(alloc_size, (size_t)config.cap_max);
+        alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
     executeCompute(
         {{num_splats, SUBGROUP_SIZE}},
         &shaderUniforms, sizeof(shaderUniforms),
@@ -1259,9 +1259,14 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffers.default_split_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
                 }, COMPUTE_SHADER_READ);
             }
+            const size_t growth_cap_lim = get_growth_cap();
+            const size_t effective_cap = (config.cap_max > 0)
+                ? std::min(static_cast<size_t>(config.cap_max), growth_cap_lim)
+                : growth_cap_lim;
+            const bool has_eff_cap = effective_cap < std::numeric_limits<size_t>::max();
             const bool need_host_grow_filter =
                 (config.mcmc_protect_structural_groups && (!splat_group_ids.empty() || !splat_states.empty())) ||
-                (config.cap_max > 0) || (config.cap_speculative_max > 0);
+                has_eff_cap || (config.cap_speculative_max > 0);
             if (need_host_grow_filter) {
                 copyFromDevice(buffers.default_dupli_mask);
                 copyFromDevice(buffers.default_split_mask);
@@ -1301,7 +1306,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                         prop_spec += (size_t)g;
                 }
                 const bool over_spec = (config.cap_speculative_max > 0) && (cur_spec + prop_spec > (size_t)config.cap_speculative_max);
-                const bool over_tot = (config.cap_max > 0) && (num_splats + prop_total > (size_t)config.cap_max);
+                const bool over_tot = has_eff_cap && (num_splats + prop_total > effective_cap);
                 if (over_spec || over_tot) {
                     copyFromDevice(buffers.default_grad);
                     auto score_of = [&](size_t i) -> float {
@@ -1333,8 +1338,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                         if (i < buffers.default_dupli_mask.size() && buffers.default_dupli_mask[i]) ++prop_total;
                         if (i < buffers.default_split_mask.size() && buffers.default_split_mask[i]) ++prop_total;
                     }
-                    if (config.cap_max > 0 && num_splats + prop_total > (size_t)config.cap_max) {
-                        size_t allow_tot = (num_splats < (size_t)config.cap_max) ? ((size_t)config.cap_max - num_splats) : 0;
+                    if (has_eff_cap && num_splats + prop_total > effective_cap) {
+                        size_t allow_tot = (num_splats < effective_cap) ? (effective_cap - num_splats) : 0;
                         std::vector<std::pair<float, size_t>> cand;
                         cand.reserve(prop_total);
                         for (size_t i = 0; i < num_splats; ++i) {
@@ -1369,13 +1374,6 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
             num_dupli = executeSum(buffers, buffers.default_dupli_mask);
             num_split = executeSum(buffers, buffers.default_split_mask);
-            // Both ADC and MCMC obey the same runtime evidence ceiling.
-            // 'where' below produces ordered candidate indices; only the first permitted
-            // duplicate/split indices are consumed, avoiding an expensive mask readback.
-            const size_t effective_cap = std::min(static_cast<size_t>(config.cap_max), get_growth_cap());
-            const size_t room = effective_cap > num_splats ? effective_cap - num_splats : 0;
-            num_dupli = static_cast<int>(std::min(static_cast<size_t>(num_dupli), room));
-            num_split = static_cast<int>(std::min(static_cast<size_t>(num_split), room - static_cast<size_t>(num_dupli)));
         }
 
         if (num_dupli + num_split > 0) {
@@ -1989,8 +1987,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
 
         // Add more GS */
 
-        const size_t effective_cap = std::min(static_cast<size_t>(config.cap_max), get_growth_cap());
-        size_t new_num_splats = std::min(static_cast<size_t>(config.grow_factor * num_splats), effective_cap);
+        const size_t effective_cap = std::min((size_t)config.cap_max, get_growth_cap());
+        size_t new_num_splats = std::min((size_t)(config.grow_factor * num_splats), effective_cap);
         size_t num_add = std::max(new_num_splats, num_splats) - num_splats;
         if (num_add > 0) {
             uniforms[1].u = (uint32_t)num_add;
@@ -2061,7 +2059,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 // 5) [dN] Update attributes for Gaussians added from
                 size_t alloc_size = num_splats;
                 if (config.strategy == TrainerConfig::Strategy::MCMC)
-                    alloc_size = std::max(alloc_size, (size_t)config.cap_max);
+                    alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
                 barrierAllGaussParams(buffers);
                 executeCompute(
                     {{num_add, kGroupSize}},
