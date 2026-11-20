@@ -1369,6 +1369,13 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
             num_dupli = executeSum(buffers, buffers.default_dupli_mask);
             num_split = executeSum(buffers, buffers.default_split_mask);
+            // Both ADC and MCMC obey the same runtime evidence ceiling.
+            // 'where' below produces ordered candidate indices; only the first permitted
+            // duplicate/split indices are consumed, avoiding an expensive mask readback.
+            const size_t effective_cap = std::min(static_cast<size_t>(config.cap_max), get_growth_cap());
+            const size_t room = effective_cap > num_splats ? effective_cap - num_splats : 0;
+            num_dupli = static_cast<int>(std::min(static_cast<size_t>(num_dupli), room));
+            num_split = static_cast<int>(std::min(static_cast<size_t>(num_split), room - static_cast<size_t>(num_dupli)));
         }
 
         if (num_dupli + num_split > 0) {
@@ -1982,7 +1989,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
 
         // Add more GS */
 
-        size_t new_num_splats = std::min((size_t)(config.grow_factor * num_splats), (size_t)config.cap_max);
+        const size_t effective_cap = std::min(static_cast<size_t>(config.cap_max), get_growth_cap());
+        size_t new_num_splats = std::min(static_cast<size_t>(config.grow_factor * num_splats), effective_cap);
         size_t num_add = std::max(new_num_splats, num_splats) - num_splats;
         if (num_add > 0) {
             uniforms[1].u = (uint32_t)num_add;
