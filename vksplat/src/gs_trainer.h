@@ -5,6 +5,8 @@
 #include "colmap_reader.h"
 
 #include <random>
+#include <atomic>
+#include <limits>
 
 
 // see simple_trainer.py for details
@@ -182,6 +184,11 @@ public:
     const std::vector<uint32_t>& get_splat_states() const { return splat_states; }
     size_t get_mcmc_relocated_count() const { return mcmc_relocated_count; }
     size_t get_mcmc_added_count() const { return mcmc_added_count; }
+    // A runtime *growth* ceiling, independent of allocated capacity and manual measured/prior insertion.
+    // Set between train_steps calls; atomic because train_steps may release the Python GIL.
+    // Existing splats are never deleted when the evidence ceiling becomes smaller.
+    void set_growth_cap(size_t ceiling) { runtime_growth_cap.store(ceiling, std::memory_order_relaxed); }
+    size_t get_growth_cap() const { return runtime_growth_cap.load(std::memory_order_relaxed); }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         selective_freeze_unfrozen = unfrozen;
         if (!unfrozen) {
@@ -296,6 +303,7 @@ private:
     Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
+    std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
     Buffer<float> anchored_xyz_ws;
 
     _ComputePipeline pipeline_ssim_stats = _ComputePipeline(3);
