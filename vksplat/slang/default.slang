@@ -46,6 +46,7 @@ struct Uniforms {
     uint32_t use_local_cell_credits;
     uint32_t has_spec_cap;
     uint32_t num_cells;
+    float structural_reset_opa;
 };
 
 
@@ -330,6 +331,9 @@ layout(binding=1) StructuredBuffer<float> running_radii;  // (N,)
 
 // ~(prune mask)
 layout(binding=2) RWStructuredBuffer<int32_t> keep_mask;  // (N,)
+layout(binding=3) StructuredBuffer<int32_t> group_ids;    // (N,) or (1,)
+layout(binding=4) StructuredBuffer<uint32_t> group_state; // (G,)
+layout(binding=5) StructuredBuffer<uint32_t> splat_state; // (N,) or (1,)
 
 #define computePruneMask main
 
@@ -344,9 +348,27 @@ void computePruneMask(
         return;
 
     float4 scale = scales_opacs[gid];
-    bool is_prune = scale.w < uniforms.prune_opa;
-    is_prune |= (!isfinite(length(scale)));
+    const int32_t sgid = (uniforms.has_splat_gids != 0u) ? group_ids[gid] : -1;
+    const uint32_t st = (uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu;
+    const bool grp_retracted = (sgid >= 0) && (uint32_t(sgid) < uniforms.num_groups) && (group_state[sgid] == 3u);
 
+    if (grp_retracted || st == 4u || !isfinite(length(scale))) {
+        keep_mask[gid] = 0;
+        return;
+    }
+    if (st == 0u || st == 1u ||
+        (st == 0xFFFFFFFFu && uniforms.protect_structural_groups != 0u && sgid >= 0)) {
+        keep_mask[gid] = 1;
+        return;
+    }
+    if (sgid >= 0) {
+        // Structural surfels intentionally use large tangent scales (up to 0.24 m); never prune via prune_scale3d/2d.
+        bool is_struct_dead = (uniforms.prune_opa > 0.0f) ? (scale.w <= uniforms.prune_opa) : (scale.w <= 0.0f);
+        keep_mask[gid] = int32_t(!is_struct_dead);
+        return;
+    }
+
+    bool is_prune = scale.w < uniforms.prune_opa;
     if (uniforms.step > uniforms.reset_every) {
         bool is_too_big = max(scale.x, max(scale.y, scale.z)) > uniforms.prune_scale3d;
         if (uniforms.step < uniforms.refine_scale2d_stop_iter)
@@ -481,8 +503,8 @@ void resetOpacity(
         return;
 
     {
-        const uint32_t st = splat_state[gid];
-        const int32_t sgid = group_ids[gid];
+        const uint32_t st = (uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu;
+        const int32_t sgid = (uniforms.has_splat_gids != 0u) ? group_ids[gid] : -1;
         const bool grp_retracted = (sgid >= 0) && (uint32_t(sgid) < uniforms.num_groups) && (group_state[sgid] == 3u);
         if (grp_retracted || st == 4u) {
             scales_opacs[gid].a = 0.0;
@@ -490,14 +512,19 @@ void resetOpacity(
             g_scales_opacs[2*gid+1].a = 0.0;
             return;
         }
-        // State-aware exemption (V17.7): protect ONLY unobserved/occluded (0u) or uncertain (1u) per-splat predictions.
-        // Legacy group mode (st == 0xFFFFFFFFu) reproduces pre-V17.7 unexempted ADC reset; OBSERVED_TRAINABLE (2u),
-        // METRIC_VERIFIED (3u), and MEASURED_FREE (5u) undergo normal ADC reset and recover via active gradients.
-        if (st == 0u || st == 1u)
+        if (st == 0u || st == 1u ||
+            (st == 0xFFFFFFFFu && uniforms.protect_structural_groups != 0u && sgid >= 0)) {
             return;
+        }
+        if (sgid >= 0 && (st == 2u || st == 3u)) {
+            scales_opacs[gid].a = min(scales_opacs[gid].w, max(uniforms.structural_reset_opa, 2.0f * uniforms.prune_opa));
+            g_scales_opacs[2*gid+0].a = 0.0;
+            g_scales_opacs[2*gid+1].a = 0.0;
+            return;
+        }
     }
 
-    scales_opacs[gid].a = min(scales_opacs[gid].w, 2.0*uniforms.prune_opa);
+    scales_opacs[gid].a = min(scales_opacs[gid].w, 2.0f * uniforms.prune_opa);
     g_scales_opacs[2*gid+0].a = 0.0;
     g_scales_opacs[2*gid+1].a = 0.0;
 }

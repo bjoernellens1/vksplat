@@ -72,6 +72,7 @@ PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
     uint32_t use_local_cell_credits;
     uint32_t has_spec_cap;
     uint32_t num_cells;
+    float structural_reset_opa;
 });
 
 
@@ -1085,14 +1086,18 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
         anchored_xyz_snapshot_valid = true;
     }
 
+    const float feat_decay = config.get_lr_decay(step, config.feature_lr_final_scale);
+    const float opac_decay = config.get_lr_decay(step, config.opacity_lr_final_scale);
+    const float scale_decay = config.get_lr_decay(step, config.scale_lr_final_scale);
+
     shaderUniforms.lr_means = global_freeze ? 0.0f : (config.get_means_lr(step, scene_scale) * ws_boost);
-    shaderUniforms.lr_quats = config.quats_lr * ws_boost;
-    shaderUniforms.lr_scales = config.scales_lr * ws_boost;
-    shaderUniforms.lr_opacities = config.opacities_lr * ws_boost;
+    shaderUniforms.lr_quats = config.quats_lr * scale_decay * ws_boost;
+    shaderUniforms.lr_scales = config.scales_lr * scale_decay * ws_boost;
+    shaderUniforms.lr_opacities = config.opacities_lr * opac_decay * ws_boost;
     shaderUniforms.reg_scale = config.scale_reg / (3*num_splats);
     shaderUniforms.reg_opacity = config.opacity_reg / num_splats;
-    shaderUniforms.lr_sh_dc = config.features_dc_lr * (config.enable_lr_boost ? (4.5f * powf(0.25f, progress)) : 1.0f);
-    shaderUniforms.lr_sh_rest = config.features_rest_lr * ws_boost;
+    shaderUniforms.lr_sh_dc = config.features_dc_lr * feat_decay * (config.enable_lr_boost ? (4.5f * powf(0.25f, progress)) : 1.0f);
+    shaderUniforms.lr_sh_rest = config.features_rest_lr * feat_decay * ws_boost;
     for (size_t i = 0; i < 16; i++)
         shaderUniforms.world_view_transform[i] = uniforms.world_view_transform[i];
     ensureGroupBuffersOnDevice(buffers, num_splats);
@@ -1208,6 +1213,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         (int32_t)dataset_train.size() + uniforms.refine_every;
     uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
     uniforms.protect_structural_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
+    uniforms.structural_reset_opa = config.structural_reset_opa;
 
     const bool freeze_active = (config.freeze_geometry_after_iter > 0 &&
                                 step >= config.freeze_geometry_after_iter);
@@ -1410,6 +1416,19 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             }
         }
 
+        auto syncHostMetadataSize = [&](size_t expected_n) {
+            if (!splat_group_ids.empty() && splat_group_ids.size() != expected_n)
+                splat_group_ids.resize(expected_n, -1);
+            if (!splat_entity_ids.empty() && splat_entity_ids.size() != expected_n)
+                splat_entity_ids.resize(expected_n, -1);
+            if (!splat_states.empty() && splat_states.size() != expected_n)
+                splat_states.resize(expected_n, 5u);
+            if (!splat_anchors_host.empty() && splat_anchors_host.size() != 8 * expected_n)
+                splat_anchors_host.resize(8 * expected_n, 0.0f);
+            if (use_local_cell_credits_ && splat_cell_ids.size() != expected_n)
+                splat_cell_ids.resize(expected_n, -1);
+        };
+
         if (num_dupli + num_split > 0) {
             size_t new_num_splats = num_splats + num_dupli + num_split;
             barrierAllGaussParams(buffers);
@@ -1426,30 +1445,23 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             resizeAndCopyDeviceBuffer(buffers.default_radii, new_num_splats, false);
             buffers.num_splats = new_num_splats;
             barrierAllGaussParams(buffers);
-            if (!splat_group_ids.empty() && splat_group_ids.size() != num_splats)
-                splat_group_ids.resize(num_splats, -1);
-            if (!splat_entity_ids.empty() && splat_entity_ids.size() != num_splats)
-                splat_entity_ids.resize(num_splats, -1);
-            if (!splat_states.empty() && splat_states.size() != num_splats)
-                splat_states.resize(num_splats, 0xFFFFFFFFu);
-            if (!splat_anchors_host.empty() && splat_anchors_host.size() != 8 * num_splats)
-                splat_anchors_host.resize(8 * num_splats, 0.0f);
-            if (use_local_cell_credits_ && splat_cell_ids.size() != num_splats)
-                splat_cell_ids.resize(num_splats, -1);
+            syncHostMetadataSize(num_splats);
         }
 
-        auto propagateSpawnedMetadata = [&](int count) {
+        auto propagateSpawnedMetadata = [&](size_t base_n, int count) {
+            if (count <= 0)
+                return;
             if (splat_group_ids.empty() && splat_entity_ids.empty() && splat_states.empty() &&
                 splat_anchors_host.empty() && !use_local_cell_credits_)
                 return;
+            syncHostMetadataSize(base_n);
             copyFromDevice(buffers._temp_indices);
             auto extendScalar = [&](auto& vec, auto fill) {
-                size_t base_n = vec.size();
-                vec.resize(base_n + count, fill);
+                vec.resize(base_n + static_cast<size_t>(count), fill);
                 for (int k = 0; k < count && (size_t)k < buffers._temp_indices.size(); ++k) {
                     int32_t src = buffers._temp_indices[k];
                     if (src >= 0 && (size_t)src < base_n)
-                        vec[base_n + k] = vec[src];
+                        vec[base_n + static_cast<size_t>(k)] = vec[src];
                 }
             };
             if (!splat_group_ids.empty()) extendScalar(splat_group_ids, int32_t(-1));
@@ -1457,12 +1469,11 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             if (!splat_states.empty()) extendScalar(splat_states, uint32_t(5u));
             if (use_local_cell_credits_) extendScalar(splat_cell_ids, int32_t(-1));
             if (!splat_anchors_host.empty()) {
-                size_t base_n = splat_anchors_host.size() / 8;
-                splat_anchors_host.resize(8 * (base_n + count), 0.0f);
+                splat_anchors_host.resize(8 * (base_n + static_cast<size_t>(count)), 0.0f);
                 for (int k = 0; k < count && (size_t)k < buffers._temp_indices.size(); ++k) {
                     int32_t src = buffers._temp_indices[k];
                     if (src >= 0 && (size_t)src < base_n)
-                        std::memcpy(&splat_anchors_host[8 * (base_n + k)], &splat_anchors_host[8 * src], 8 * sizeof(float));
+                        std::memcpy(&splat_anchors_host[8 * (base_n + static_cast<size_t>(k))], &splat_anchors_host[8 * src], 8 * sizeof(float));
                 }
             }
         };
@@ -1471,7 +1482,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             executeWhere(buffers, buffers.default_dupli_mask, buffers._temp_indices);
             bufferMemoryBarrier({
                 { buffers._temp_indices.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-            }, COMPUTE_SHADER_READ);
+            }, TRANSFER_COMPUTE_SHADER_READ);
 
             uniforms.num_splats = (uint32_t)(num_splats + num_dupli);
             uniforms.old_num_splats = (uint32_t)(num_splats);
@@ -1495,14 +1506,14 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            propagateSpawnedMetadata(num_dupli);
+            propagateSpawnedMetadata(num_splats, num_dupli);
         }
 
         if (num_split > 0) {
             executeWhere(buffers, buffers.default_split_mask, buffers._temp_indices);
             bufferMemoryBarrier({
                 { buffers._temp_indices.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-            }, COMPUTE_SHADER_READ);
+            }, TRANSFER_COMPUTE_SHADER_READ);
 
             uniforms.num_splats = (uint32_t)(num_splats + num_dupli + num_split);
             uniforms.old_num_splats = (uint32_t)(num_splats + num_dupli);
@@ -1526,14 +1537,38 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 }
             );
             barrierAllGaussParams(buffers);
-            propagateSpawnedMetadata(num_split);
+            propagateSpawnedMetadata(num_splats + static_cast<size_t>(num_dupli), num_split);
         }
 
         // prune GS
 
         num_splats = buffers.num_splats;
+        syncHostMetadataSize(num_splats);
+        if (num_dupli + num_split > 0) {
+            if (!splat_group_ids.empty()) {
+                buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+                copyToDevice(buffers.group_ids);
+            }
+            if (!splat_states.empty()) {
+                buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                copyToDevice(buffers.splat_state);
+            }
+        }
+        ensureGroupBuffersOnDevice(buffers, num_splats);
         uniforms.num_splats = (uint32_t)num_splats;
         uniforms.old_num_splats = (uint32_t)num_splats;
+        uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+        uniforms.protect_structural_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
+        uniforms.has_splat_states = (!splat_states.empty()) ? 1u : 0u;
+        uniforms.has_splat_gids = (!splat_group_ids.empty()) ? 1u : 0u;
+        uniforms.structural_reset_opa = config.structural_reset_opa;
+        bufferMemoryBarrier({
+            { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+            { buffers.default_radii.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ);
         executeCompute(
             {{num_splats, 256}},
             &uniforms, sizeof(uniforms),
@@ -1542,6 +1577,9 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 buffers.scales_opacs.deviceBuffer,
                 buffers.default_radii.deviceBuffer,
                 resizeDeviceBuffer(buffers.default_keep_mask, num_splats),
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
             }
         );
         if (config.selective_plane_freeze && num_anchored_splats > 0 &&
@@ -1554,41 +1592,31 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             bufferMemoryBarrier({
                 { buffers.default_keep_mask.deviceBuffer, TRANSFER_WRITE },
             }, COMPUTE_SHADER_READ);
+            if (!splat_states.empty() || !splat_group_ids.empty()) {
+                copyFromDevice(buffers.default_keep_mask);
+                bool modified_keep = false;
+                for (size_t i = 0; i < num_anchored_splats && i < buffers.default_keep_mask.size(); ++i) {
+                    int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
+                    uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
+                    bool grp_ret = (gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u);
+                    if (grp_ret || st == 4u) {
+                        if (buffers.default_keep_mask[i] != 0) {
+                            buffers.default_keep_mask[i] = 0;
+                            modified_keep = true;
+                        }
+                    }
+                }
+                if (modified_keep) {
+                    copyToDevice(buffers.default_keep_mask);
+                    bufferMemoryBarrier({
+                        { buffers.default_keep_mask.deviceBuffer, TRANSFER_WRITE },
+                    }, COMPUTE_SHADER_READ);
+                }
+            }
         } else {
             bufferMemoryBarrier({
                 { buffers.default_keep_mask.deviceBuffer, COMPUTE_SHADER_WRITE },
             }, COMPUTE_SHADER_READ);
-        }
-        if (!splat_states.empty() || (config.mcmc_protect_structural_groups && !splat_group_ids.empty())) {
-            copyFromDevice(buffers.default_keep_mask);
-            bool modified_keep = false;
-            for (size_t i = 0; i < num_splats && i < buffers.default_keep_mask.size(); ++i) {
-                int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
-                uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
-                bool grp_ret = (gid >= 0 && (size_t)gid < buffers.group_state.size() && buffers.group_state[gid] == 3u);
-                if (grp_ret) {
-                    if (buffers.default_keep_mask[i] != 0) {
-                        buffers.default_keep_mask[i] = 0;
-                        modified_keep = true;
-                    }
-                } else if (st == 0u || st == 1u) {
-                    if (buffers.default_keep_mask[i] != 1) {
-                        buffers.default_keep_mask[i] = 1;
-                        modified_keep = true;
-                    }
-                } else if (st == 0xFFFFFFFFu && config.mcmc_protect_structural_groups && gid >= 0) {
-                    if (buffers.default_keep_mask[i] != 1) {
-                        buffers.default_keep_mask[i] = 1;
-                        modified_keep = true;
-                    }
-                }
-            }
-            if (modified_keep) {
-                copyToDevice(buffers.default_keep_mask);
-                bufferMemoryBarrier({
-                    { buffers.default_keep_mask.deviceBuffer, TRANSFER_WRITE },
-                }, COMPUTE_SHADER_READ);
-            }
         }
 
         int num_keep = executeSum(buffers, buffers.default_keep_mask);
@@ -1597,6 +1625,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         if (num_prune > 0) {
             if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() ||
                 !splat_anchors_host.empty() || use_local_cell_credits_) {
+                syncHostMetadataSize(num_splats);
                 copyFromDevice(buffers.default_keep_mask);
                 auto filterScalar = [&](auto& vec, auto fill) {
                     using Elem = typename std::remove_reference_t<decltype(vec)>::value_type;
@@ -1611,7 +1640,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 };
                 if (!splat_group_ids.empty()) filterScalar(splat_group_ids, int32_t(-1));
                 if (!splat_entity_ids.empty()) filterScalar(splat_entity_ids, int32_t(-1));
-                if (!splat_states.empty()) filterScalar(splat_states, uint32_t(0xFFFFFFFFu));
+                if (!splat_states.empty()) filterScalar(splat_states, uint32_t(5u));
                 if (use_local_cell_credits_) filterScalar(splat_cell_ids, int32_t(-1));
                 if (!splat_anchors_host.empty()) {
                     std::vector<float> kept_anc(8 * num_keep, 0.0f);
@@ -1691,9 +1720,15 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                     { buffers.group_ids.deviceBuffer, TRANSFER_WRITE },
                 }, COMPUTE_SHADER_READ_WRITE);
             }
+            if (!splat_entity_ids.empty()) {
+                splat_entity_ids.resize(buffers.num_splats, -1);
+            }
             if (!splat_states.empty()) {
-                splat_states.resize(buffers.num_splats, 0xFFFFFFFFu);
-                buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                splat_states.resize(buffers.num_splats, 5u);
+                if (buffers.num_splats > 0)
+                    buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+                else
+                    buffers.splat_state.assign(1, 5u);
                 copyToDevice(buffers.splat_state);
                 bufferMemoryBarrier({
                     { buffers.splat_state.deviceBuffer, TRANSFER_WRITE },
@@ -1701,11 +1736,15 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             }
             if (!splat_anchors_host.empty()) {
                 splat_anchors_host.resize(8 * buffers.num_splats, 0.0f);
-                buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
-                copyToDevice(buffers.splat_anchor);
-                bufferMemoryBarrier({
-                    { buffers.splat_anchor.deviceBuffer, TRANSFER_WRITE },
-                }, COMPUTE_SHADER_READ_WRITE);
+                if (buffers.num_splats > 0) {
+                    buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+                    copyToDevice(buffers.splat_anchor);
+                    bufferMemoryBarrier({
+                        { buffers.splat_anchor.deviceBuffer, TRANSFER_WRITE },
+                    }, COMPUTE_SHADER_READ_WRITE);
+                } else if (buffers.splat_anchor.deviceBuffer.buffer != VK_NULL_HANDLE) {
+                    buffers.splat_anchor.deviceBuffer.size = 0;
+                }
             }
             if (use_local_cell_credits_) {
                 splat_cell_ids.resize(buffers.num_splats, -1);
@@ -1746,6 +1785,16 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         uniforms.old_num_splats = (uint32_t)num_splats;
         uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
         uniforms.protect_structural_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
+        uniforms.has_splat_states = (!splat_states.empty()) ? 1u : 0u;
+        uniforms.has_splat_gids = (!splat_group_ids.empty()) ? 1u : 0u;
+        uniforms.structural_reset_opa = config.structural_reset_opa;
+        bufferMemoryBarrier({
+            { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
         executeCompute(
             {{num_splats, 256}},
             &uniforms, sizeof(uniforms),
@@ -2412,8 +2461,8 @@ void VulkanGSTrainer::executeMortonSorting(
     applyIndex(buffers.g_xyz_ws, 3*2);
     applyIndex(buffers.g_rotations, 4*2);
     applyIndex(buffers.g_scales_opacs, 4*2);
-    applyIndex(buffers.default_radii, 2);
-    applyIndex(buffers.default_grad, 2*2);
+    applyIndex(buffers.default_radii, 1);
+    applyIndex(buffers.default_grad, 2);
     barrierAllGaussParams(buffers);
 
     // MC-1: Permute splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host, and splat_cell_ids to match Morton-sorted order
@@ -2423,7 +2472,7 @@ void VulkanGSTrainer::executeMortonSorting(
         const auto& idx_buf = buffers.sorted_gauss_idx();
         auto permuteScalar = [&](auto& vec, auto fill) {
             using Elem = typename std::remove_reference_t<decltype(vec)>::value_type;
-            if (vec.size() < num_splats)
+            if (vec.size() != num_splats)
                 vec.resize(num_splats, fill);
             std::vector<Elem> out(num_splats, fill);
             for (uint32_t i = 0; i < num_splats && i < idx_buf.size(); ++i) {
@@ -2442,12 +2491,12 @@ void VulkanGSTrainer::executeMortonSorting(
             permuteScalar(splat_entity_ids, int32_t(-1));
         }
         if (!splat_states.empty()) {
-            permuteScalar(splat_states, uint32_t(0xFFFFFFFFu));
+            permuteScalar(splat_states, uint32_t(5u));
             buffers.splat_state.assign(splat_states.begin(), splat_states.end());
             copyToDevice(buffers.splat_state);
         }
         if (!splat_anchors_host.empty()) {
-            if (splat_anchors_host.size() < 8 * num_splats)
+            if (splat_anchors_host.size() != 8 * num_splats)
                 splat_anchors_host.resize(8 * num_splats, 0.0f);
             std::vector<float> new_anc(8 * num_splats, 0.0f);
             size_t n_anc = splat_anchors_host.size() / 8;
@@ -2889,7 +2938,7 @@ void VulkanGSTrainer::set_local_cell_credits(
         splat_cell_ids.assign(cell_ids, cell_ids + n_splats);
     else
         splat_cell_ids.clear();
-    if (splat_cell_ids.size() < buffers.num_splats)
+    if (buffers.num_splats > 0 && splat_cell_ids.size() != buffers.num_splats)
         splat_cell_ids.resize(buffers.num_splats, -1);
 
     if (credits != nullptr && n_cells > 0) {
@@ -3067,7 +3116,7 @@ void VulkanGSTrainer::set_splat_anchors(
         return;
     }
     splat_anchors_host.assign(anchors_8, anchors_8 + 8 * count);
-    if (splat_anchors_host.size() < 8 * buffers.num_splats)
+    if (buffers.num_splats > 0 && splat_anchors_host.size() != 8 * buffers.num_splats)
         splat_anchors_host.resize(8 * buffers.num_splats, 0.0f);
     buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
     copyToDevice(buffers.splat_anchor);

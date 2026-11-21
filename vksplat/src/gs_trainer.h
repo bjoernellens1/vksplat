@@ -68,10 +68,21 @@ struct TrainerConfig {
     float quats_lr;
     float scale_reg;
     float opacity_reg;
+    float feature_lr_final_scale = 1.0f;
+    float opacity_lr_final_scale = 1.0f;
+    float scale_lr_final_scale = 1.0f;
+    float structural_reset_opa = 0.25f;
 
     inline float get_means_lr(int step, float scene_scale) const {
-        float progress = fmin(float(step)/float(this->max_steps), 1.0f);
+        float progress = fmin(float(step)/float(std::max(1, this->max_steps)), 1.0f);
         return this->means_lr * pow(this->means_lr_final/this->means_lr, progress) * scene_scale;
+    }
+
+    inline float get_lr_decay(int step, float final_scale) const {
+        if (final_scale <= 0.0f || final_scale == 1.0f || this->max_steps <= 0)
+            return (final_scale <= 0.0f) ? 0.0f : 1.0f;
+        float progress = std::clamp(float(step) / float(this->max_steps), 0.0f, 1.0f);
+        return std::pow(final_scale, progress);
     }
 
     // strategy
@@ -335,7 +346,7 @@ private:
         _ComputePipeline compute_grow_mask = _ComputePipeline(10);
         _ComputePipeline duplicate = _ComputePipeline(12);
         _ComputePipeline split = _ComputePipeline(12);
-        _ComputePipeline compute_prune_mask = _ComputePipeline(3);
+        _ComputePipeline compute_prune_mask = _ComputePipeline(6);
         _ComputePipeline prune = _ComputePipeline(4);
         _ComputePipeline prune_mean = _ComputePipeline(4);
         _ComputePipeline prune_sh = _ComputePipeline(4);

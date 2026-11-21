@@ -254,6 +254,14 @@ public:
         config.quats_lr = train_config["quats_lr"].cast<float>();
         config.scale_reg = train_config["scale_reg"].cast<float>();
         config.opacity_reg = train_config["opacity_reg"].cast<float>();
+        config.feature_lr_final_scale = train_config.contains(py::str("feature_lr_final_scale"))
+            ? train_config["feature_lr_final_scale"].cast<float>() : 1.0f;
+        config.opacity_lr_final_scale = train_config.contains(py::str("opacity_lr_final_scale"))
+            ? train_config["opacity_lr_final_scale"].cast<float>() : 1.0f;
+        config.scale_lr_final_scale = train_config.contains(py::str("scale_lr_final_scale"))
+            ? train_config["scale_lr_final_scale"].cast<float>() : 1.0f;
+        config.structural_reset_opa = train_config.contains(py::str("structural_reset_opa"))
+            ? train_config["structural_reset_opa"].cast<float>() : 0.25f;
 
         // strategy
         config.refine_start_iter = train_config["refine_start_iter"].cast<int>();
@@ -387,6 +395,30 @@ public:
         d["refine_every"] = config.refine_every;
         return d;
     }
+    void set_stabilization_schedule(
+        float structural_reset_opa = 0.25f,
+        float lr_final_scale = 1.0f,
+        int max_steps = -1
+    ) {
+        if (structural_reset_opa >= 0.0f)
+            config.structural_reset_opa = std::clamp(structural_reset_opa, 0.0f, 1.0f);
+        if (lr_final_scale > 0.0f) {
+            config.feature_lr_final_scale = lr_final_scale;
+            config.opacity_lr_final_scale = lr_final_scale;
+            config.scale_lr_final_scale = lr_final_scale;
+        }
+        if (max_steps > 0)
+            config.max_steps = max_steps;
+    }
+    py::dict get_stabilization_schedule() const {
+        py::dict d;
+        d["structural_reset_opa"] = config.structural_reset_opa;
+        d["feature_lr_final_scale"] = config.feature_lr_final_scale;
+        d["opacity_lr_final_scale"] = config.opacity_lr_final_scale;
+        d["scale_lr_final_scale"] = config.scale_lr_final_scale;
+        d["max_steps"] = config.max_steps;
+        return d;
+    }
     void set_selective_freeze_unfrozen(bool unfrozen) {
         trainer.set_selective_freeze_unfrozen(unfrozen);
     }
@@ -469,6 +501,11 @@ public:
         if ((size_t)abuf.size != 8 * n)
             throw std::invalid_argument("anchors must have shape (len(rows), 8)");
         trainer.set_splat_anchors_sparse(buffers, rows.data(), static_cast<const float*>(abuf.ptr), n);
+    }
+    py::array_t<float> get_splat_anchors() {
+        if (buffers.splat_anchor.deviceBuffer.buffer == VK_NULL_HANDLE || buffers.splat_anchor.deviceSize() == 0)
+            return py::array_t<float>(std::array<py::ssize_t, 2>{0, 8});
+        return buffer_to_array<float, float>(buffers.splat_anchor, 8, (size_t)-1, "mean");
     }
     void reanchor_splats_sparse(
         py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
@@ -758,6 +795,11 @@ public:
         snap["cap_speculative_max"] = config.cap_speculative_max;
         snap["grow_factor"] = config.grow_factor;
         snap["refine_every"] = config.refine_every;
+        snap["structural_reset_opa"] = config.structural_reset_opa;
+        snap["feature_lr_final_scale"] = config.feature_lr_final_scale;
+        snap["opacity_lr_final_scale"] = config.opacity_lr_final_scale;
+        snap["scale_lr_final_scale"] = config.scale_lr_final_scale;
+        snap["max_steps"] = config.max_steps;
         snap["xyz_ws"] = buffer_to_array<float, float>(buffers.xyz_ws, 3, (size_t)-1, "mean");
         snap["sh_coeffs"] = buffer_to_array<float, float>(buffers.sh_coeffs, 16, 3, "sh");
         snap["rotations"] = buffer_to_array<float, float>(buffers.rotations, 4);
@@ -863,6 +905,16 @@ public:
                 snap.contains(py::str("refine_every")) ? snap["refine_every"].cast<int>() : -1
             );
         }
+        if (snap.contains(py::str("structural_reset_opa")))
+            config.structural_reset_opa = snap["structural_reset_opa"].cast<float>();
+        if (snap.contains(py::str("feature_lr_final_scale")))
+            config.feature_lr_final_scale = snap["feature_lr_final_scale"].cast<float>();
+        if (snap.contains(py::str("opacity_lr_final_scale")))
+            config.opacity_lr_final_scale = snap["opacity_lr_final_scale"].cast<float>();
+        if (snap.contains(py::str("scale_lr_final_scale")))
+            config.scale_lr_final_scale = snap["scale_lr_final_scale"].cast<float>();
+        if (snap.contains(py::str("max_steps")))
+            config.max_steps = snap["max_steps"].cast<int>();
         if (config.strategy == TrainerConfig::Strategy::MCMC) {
             const size_t alloc_size = std::max(n, config.mcmc_alloc_cap());
             trainer.resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3 * alloc_size, false);
@@ -1560,6 +1612,7 @@ PYBIND11_MODULE(vksplat, m) {
         .def("set_splat_states_sparse", &VkSplat::set_splat_states_sparse, "Sparse update of per-splat evidence states", py::arg("rows"), py::arg("states"))
         .def("set_splat_anchors", &VkSplat::set_splat_anchors, "Set per-splat (N, 8) normalized anchors [p_xyz, w_depth, n_xyz, w_plane]", py::arg("anchors"))
         .def("set_splat_anchors_sparse", &VkSplat::set_splat_anchors_sparse, "Sparse update of per-splat (R, 8) normalized anchors", py::arg("rows"), py::arg("anchors"))
+        .def("get_splat_anchors", &VkSplat::get_splat_anchors, "Read back per-splat (N, 8) normalized anchors")
         .def("reanchor_splats_sparse", &VkSplat::reanchor_splats_sparse, "Pre-step sparse re-anchoring of observed structural surfels onto measured depth + RGB",
              py::arg("rows"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"), py::arg("sh_dc"), py::arg("states"))
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
@@ -1589,6 +1642,13 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("grow_factor") = -1.0f, py::arg("refine_every") = -1)
         .def("get_densification_budget", &VkSplat::get_densification_budget,
              "Return active densification budget dict")
+        .def("set_stabilization_schedule", &VkSplat::set_stabilization_schedule,
+             "Configure structural opacity reset floor and exponential refinement LR decay over max_steps",
+             py::arg("structural_reset_opa") = 0.25f,
+             py::arg("lr_final_scale") = 1.0f,
+             py::arg("max_steps") = -1)
+        .def("get_stabilization_schedule", &VkSplat::get_stabilization_schedule,
+             "Return active stabilization schedule dict")
         .def("set_selective_freeze_unfrozen", &VkSplat::set_selective_freeze_unfrozen, "Toggle selective plane freeze", py::arg("unfrozen"))
         .def("reset_anchored_snapshot", &VkSplat::reset_anchored_snapshot, "Reset anchored splat count and snapshot", py::arg("new_num_anchored"))
         .def("clear_train_frames", &VkSplat::clear_train_frames, "Clear all loaded training frames")
