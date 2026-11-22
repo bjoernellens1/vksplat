@@ -482,6 +482,71 @@ public:
             throw std::invalid_argument("rows and states must have the same length");
         trainer.set_splat_states_sparse(buffers, rows.data(), states.data(), static_cast<size_t>(rows.size()));
     }
+    void set_splat_surfel_2d_mask(py::array_t<uint8_t, py::array::c_style | py::array::forcecast> mask_arr) {
+        constexpr uint32_t kSurfel2DFlag = 0x00010000u;
+        constexpr uint32_t kLegacyState = 0xFFFFFFFFu;
+        auto mbuf = mask_arr.request();
+        size_t n = buffers.num_splats;
+        if (static_cast<size_t>(mbuf.size) != n)
+            throw std::invalid_argument("mask length must equal num_splats");
+        const uint8_t* mptr = static_cast<const uint8_t*>(mbuf.ptr);
+        if (buffers.splat_state.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.splat_state.size() >= n) {
+            trainer.copyFromDevice(buffers.splat_state);
+        }
+        std::vector<uint32_t> sts(n, 5u);
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t cur = (i < buffers.splat_state.size()) ? buffers.splat_state[i] : 5u;
+            if (cur == kLegacyState) cur = 5u;
+            uint32_t base = cur & 0xFFFFu;
+            sts[i] = (mptr[i] != 0u) ? (base | kSurfel2DFlag) : base;
+        }
+        trainer.set_splat_states_vec(sts);
+        buffers.splat_state.assign(sts.begin(), sts.end());
+        if (!buffers.splat_state.empty()) {
+            trainer.copyToDevice(buffers.splat_state);
+        }
+        trainer.copyFromDevice(buffers.scales_opacs);
+        for (size_t i = 0; i < n; ++i) {
+            if (mptr[i] != 0u && (4 * i + 2) < buffers.scales_opacs.size()) {
+                buffers.scales_opacs[4 * i + 2] = 0.0f;
+            }
+        }
+        trainer.copyToDevice(buffers.scales_opacs);
+    }
+    void promote_surfels_to_3d(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
+        py::array_t<float, py::array::c_style | py::array::forcecast> sigma_n
+    ) {
+        constexpr uint32_t kSurfel2DFlag = 0x00010000u;
+        constexpr uint32_t kLegacyState = 0xFFFFFFFFu;
+        if (rows.size() != sigma_n.size())
+            throw std::invalid_argument("rows and sigma_n must have the same length");
+        size_t n = buffers.num_splats;
+        size_t m = static_cast<size_t>(rows.size());
+        if (m == 0) return;
+        const uint32_t* rptr = rows.data();
+        const float* sptr = sigma_n.data();
+        if (buffers.splat_state.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.splat_state.size() >= n) {
+            trainer.copyFromDevice(buffers.splat_state);
+        }
+        trainer.copyFromDevice(buffers.scales_opacs);
+        std::vector<uint32_t> sts(buffers.splat_state.begin(), buffers.splat_state.end());
+        if (sts.size() < n) sts.resize(n, 5u);
+        for (size_t k = 0; k < m; ++k) {
+            uint32_t idx = rptr[k];
+            if (idx >= n) continue;
+            if (sts[idx] != kLegacyState) {
+                sts[idx] = sts[idx] & (~kSurfel2DFlag);
+            }
+            if ((4 * idx + 2) < buffers.scales_opacs.size()) {
+                buffers.scales_opacs[4 * idx + 2] = std::max(sptr[k], 1e-4f);
+            }
+        }
+        trainer.set_splat_states_vec(sts);
+        buffers.splat_state.assign(sts.begin(), sts.end());
+        trainer.copyToDevice(buffers.splat_state);
+        trainer.copyToDevice(buffers.scales_opacs);
+    }
     void set_splat_anchors(py::array_t<float, py::array::c_style | py::array::forcecast> anchors) {
         auto buf = anchors.request();
         if (buf.size == 0) {
@@ -1610,6 +1675,8 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_states", &VkSplat::get_splat_states, "Get per-splat evidence states (uint32)")
         .def("set_splat_states", &VkSplat::set_splat_states, "Set per-splat evidence states (uint32)", py::arg("states"))
         .def("set_splat_states_sparse", &VkSplat::set_splat_states_sparse, "Sparse update of per-splat evidence states", py::arg("rows"), py::arg("states"))
+        .def("set_splat_surfel_2d_mask", &VkSplat::set_splat_surfel_2d_mask, "Mark per-splat SURFEL_2D primitive flags (bit 16) and zero normal scale", py::arg("mask"))
+        .def("promote_surfels_to_3d", &VkSplat::promote_surfels_to_3d, "Promote selected SURFEL_2D rows to GAUSSIAN_3D with measured normal scale sigma_n", py::arg("rows"), py::arg("sigma_n"))
         .def("set_splat_anchors", &VkSplat::set_splat_anchors, "Set per-splat (N, 8) normalized anchors [p_xyz, w_depth, n_xyz, w_plane]", py::arg("anchors"))
         .def("set_splat_anchors_sparse", &VkSplat::set_splat_anchors_sparse, "Sparse update of per-splat (R, 8) normalized anchors", py::arg("rows"), py::arg("anchors"))
         .def("get_splat_anchors", &VkSplat::get_splat_anchors, "Read back per-splat (N, 8) normalized anchors")

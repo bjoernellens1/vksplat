@@ -50,7 +50,7 @@ struct Uniforms {
 // OBSERVED_TRAINABLE (2u) and METRIC_VERIFIED (3u) are eligible for refinement; CONTRADICTED (4u) is recycled.
 bool mcmc_protected(uint32_t tid, int32_t gid, uint32_t protect_all, uint32_t num_groups,
                     StructuredBuffer<uint32_t> group_state, StructuredBuffer<uint32_t> splat_state) {
-    const uint32_t st = splat_state[tid];
+    const uint32_t st = splat_base_state(splat_state[tid]);
     if (st == 0u || st == 1u)
         return true;
     if (st == 2u || st == 3u || st == 4u || st == 5u)
@@ -112,7 +112,7 @@ void injectNoise(
     const uint32_t tid = thread_id.x;
     if (tid >= num_splats)
         return;
-    if (splat_state[tid] == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state))
+    if (splat_base_state(splat_state[tid]) == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state))
         return;
     
     float4 quat = normalize(rotations[tid]);
@@ -158,7 +158,7 @@ void computeProbabilities(
     if (tid >= num_splats)
         return;
 
-    if (splat_state[tid] == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state)) {
+    if (splat_base_state(splat_state[tid]) == 4u || mcmc_protected(tid, group_ids[tid], uniforms.protect_structural_groups, uniforms.num_groups, group_state, splat_state)) {
         sample_probs[tid] = 0;
         return;
     }
@@ -278,7 +278,7 @@ void computeRelocationIndexMap(
     }
 
     float raw_opac = scales_opacs[tid].w;
-    bool is_dead = (splat_state[tid] == 4u) || (!isfinite(raw_opac)) ||
+    bool is_dead = (splat_base_state(splat_state[tid]) == 4u) || (!isfinite(raw_opac)) ||
                    (clamp(raw_opac, 1e-6, 1-1e-6) <= uniforms.min_opacity);
 
     // Live splats (even in cells ineligible to donate) stay in place; only dead splats relocate.
@@ -580,7 +580,7 @@ void maskRetractedGroup(
 
     int32_t gid = group_ids[tid];
     bool grp_ret = (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u);
-    if (grp_ret || splat_state[tid] == 4u) {
+    if (grp_ret || splat_base_state(splat_state[tid]) == 4u) {
         scales_opacs[tid].w = 0.0;
     }
 }

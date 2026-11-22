@@ -133,7 +133,7 @@ void computeGrowMask(
         is_dupli = false;
 
     if (is_dupli || is_split) {
-        const uint32_t st = (uniforms.has_splat_states != 0) ? splat_states[splat_idx] : 0xFFFFFFFFu;
+        const uint32_t st = splat_base_state((uniforms.has_splat_states != 0) ? splat_states[splat_idx] : 0xFFFFFFFFu);
         const int32_t gid = (uniforms.has_splat_gids != 0) ? splat_group_ids[splat_idx] : -1;
         if (st == 0u || st == 1u || st == 4u ||
             (st == 0xFFFFFFFFu && uniforms.protect_structural_groups != 0 && gid >= 0)) {
@@ -349,7 +349,7 @@ void computePruneMask(
 
     float4 scale = scales_opacs[gid];
     const int32_t sgid = (uniforms.has_splat_gids != 0u) ? group_ids[gid] : -1;
-    const uint32_t st = (uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu;
+    const uint32_t st = splat_base_state((uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu);
     const bool grp_retracted = (sgid >= 0) && (uint32_t(sgid) < uniforms.num_groups) && (group_state[sgid] == 3u);
 
     if (grp_retracted || st == 4u || !isfinite(length(scale))) {
@@ -503,7 +503,7 @@ void resetOpacity(
         return;
 
     {
-        const uint32_t st = (uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu;
+        const uint32_t st = splat_base_state((uniforms.has_splat_states != 0u) ? splat_state[gid] : 0xFFFFFFFFu);
         const int32_t sgid = (uniforms.has_splat_gids != 0u) ? group_ids[gid] : -1;
         const bool grp_retracted = (sgid >= 0) && (uint32_t(sgid) < uniforms.num_groups) && (group_state[sgid] == 3u);
         if (grp_retracted || st == 4u) {

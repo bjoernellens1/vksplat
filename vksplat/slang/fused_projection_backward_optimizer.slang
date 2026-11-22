@@ -103,8 +103,11 @@ void main(
     // 4: CONTRADICTED (skip), 5: MEASURED_FREE (full optimization), 0xFFFFFFFF: fallback to group_state.
     bool imagined = false;
     bool uncertain_obs = false;
+    bool is_surfel_2d = false;
     {
-        const uint32_t st = splat_state[g_idx];
+        const uint32_t raw_st = splat_state[g_idx];
+        const uint32_t st = splat_base_state(raw_st);
+        is_surfel_2d = is_splat_surfel_2d(raw_st);
         const int32_t gid = group_ids[g_idx];
         if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u)
             return;
@@ -141,11 +144,15 @@ void main(
         return;
 
     // load stuff
+    float3 loaded_scales = scales_opacs[g_idx].xyz;
+    if (is_surfel_2d) {
+        loaded_scales.z = 0.0f;
+    }
     Gaussian_3D gauss = {
         read_mean(g_idx, xyz_ws),
         read_spherical_harmonics_coeffs(g_idx, sh_coeffs, active_sh),
         rotations[g_idx],
-        scales_opacs[g_idx].xyz,
+        loaded_scales,
         scales_opacs[g_idx].w
     };
 
@@ -189,7 +196,11 @@ void main(
                 nrm /= nlen;
                 float dn = dot(nrm, gauss.xyz_ws - anc0.xyz);
                 v_xyz_ws += (2.0f * anc1.w * dn) * nrm;
-                if (uniforms.normal_scale_cap > 0.0f && gauss.scales.z > uniforms.normal_scale_cap) {
+                if (is_surfel_2d) {
+                    DifferentialPair<float4> dp_q = diffPair(gauss.rotations);
+                    bwd_diff(surfel_normal_alignment_loss)(dp_q, nrm, 0.5f * anc1.w);
+                    v_rotation += dp_q.d;
+                } else if (uniforms.normal_scale_cap > 0.0f && gauss.scales.z > uniforms.normal_scale_cap) {
                     v_scale_opac.z += anc1.w * (gauss.scales.z - uniforms.normal_scale_cap);
                 }
             }
@@ -254,11 +265,15 @@ void main(
 
         // update
         float opac_lr = uncertain_obs ? (0.25f * uniforms.lr_opacities) : uniforms.lr_opacities;
-        float4 lr = float4(float3(uniforms.lr_scales), opac_lr);
+        float lr_sz = is_surfel_2d ? 0.0f : uniforms.lr_scales;
+        float4 lr = float4(uniforms.lr_scales, uniforms.lr_scales, lr_sz, opac_lr);
         optimizer_update(u, dLdu, g1, g2, g1_sc, g2_sc, lr);
 
         // map (no blanket opacity floor: false priors remain retractable!)
         x.xyz = exp(u.xyz);  // scale: x = exp(u)
+        if (is_surfel_2d) {
+            x.z = 0.0f;
+        }
         x.w = 1.0 / (1.0+exp(-u.w));  // opacity: x = sigmoid(u)
 
         // save
