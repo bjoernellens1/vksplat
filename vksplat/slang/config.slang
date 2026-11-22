@@ -61,6 +61,11 @@
 
 static const float M_PI = 3.14159265358979;
 
+// Per-splat SURFEL_2D primitive flag packed into bit 16 of splat_state (V17.15 Track D2)
+#define SPLAT_FLAG_SURFEL_2D 0x00010000u
+#define splat_base_state(st) (((st) == 0xFFFFFFFFu) ? (st) : ((st) & 0xFFFFu))
+#define is_splat_surfel_2d(st) (((st) != 0xFFFFFFFFu) && (((st) & SPLAT_FLAG_SURFEL_2D) != 0u))
+
 #ifndef USE_EMULATED_INT64
 #define USE_EMULATED_INT64 0
 #endif

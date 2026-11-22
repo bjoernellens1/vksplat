@@ -772,7 +772,7 @@ struct Uniforms {
     float _pad_tile2;
 }
 
-// Per-splat evidence states (Sub-Plan V17.7)
+// Per-splat evidence states (Sub-Plan V17.7) + SURFEL_2D primitive flag (defined in config.slang)
 static const uint SPLAT_STATE_PREDICTED_UNOBSERVED = 0u;
 static const uint SPLAT_STATE_OBSERVED_UNCERTAIN   = 1u;
 static const uint SPLAT_STATE_OBSERVED_TRAINABLE   = 2u;
@@ -780,6 +780,15 @@ static const uint SPLAT_STATE_METRIC_VERIFIED      = 3u;
 static const uint SPLAT_STATE_CONTRADICTED         = 4u;
 static const uint SPLAT_STATE_MEASURED_FREE        = 5u;
 static const uint SPLAT_STATE_LEGACY_GROUP         = 0xFFFFFFFFu;
+
+[ForceInline]
+[Differentiable]
+float surfel_normal_alignment_loss(float4 q, no_diff float3 target_nrm) {
+    float3x3 R = quat_to_rotmat(normalize(q));
+    float3 n_surf = float3(R[0][2], R[1][2], R[2][2]);
+    float c = dot(n_surf, target_nrm);
+    return 1.0f - c * c;
+}
 
 // Backward-accumulation mode of a splat: 0 normal (full xyz/cov/opac/rgb gradients),
 // 1 IMAGINED / PREDICTED_UNOBSERVED (geometry/opacity gradients dropped, rgb kept),
@@ -790,7 +799,7 @@ uint splat_freeze_mode(int32_t splat_id, uint freeze_flags, uint num_groups,
     if (freeze_flags == 0 || splat_id < 0)
         return 0;
     if ((freeze_flags & 4u) != 0) {
-        const uint32_t st = splat_state[splat_id];
+        const uint32_t st = splat_base_state(splat_state[splat_id]);
         if (st == SPLAT_STATE_PREDICTED_UNOBSERVED)
             return 1;
         if (st == SPLAT_STATE_CONTRADICTED)
