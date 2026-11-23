@@ -163,6 +163,9 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_mcmc.compact_gather, spirv_paths.at("mcmc_compact_gather"));
     createComputePipeline(pipeline_mcmc.compact_gather_sh, spirv_paths.at("mcmc_compact_gather_sh"));
     createComputePipeline(pipeline_mcmc.decay_opacity_rows, spirv_paths.at("mcmc_decay_opacity_rows"));
+    createComputePipeline(pipeline_mcmc.rayguard_observe, spirv_paths.at("mcmc_rayguard_observe"));
+    createComputePipeline(pipeline_mcmc.rayguard_apply, spirv_paths.at("mcmc_rayguard_apply"));
+    createComputePipeline(pipeline_mcmc.rayguard_remap, spirv_paths.at("mcmc_rayguard_remap"));
     createComputePipeline(pipeline_morton_sort.compute_stats, spirv_paths.at("morton_sort_compute_stats"));
     createComputePipeline(pipeline_morton_sort.generate_keys, spirv_paths.at("morton_sort_generate_keys"));
     createComputePipeline(pipeline_morton_sort.apply_indices, spirv_paths.at("morton_sort_apply_indices"));
@@ -3403,6 +3406,275 @@ VulkanGSTrainer::DecayOpacityStats VulkanGSTrainer::decay_opacities_sparse(
             { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
         }, COMPUTE_SHADER_READ_WRITE);
     }
+    return stats;
+}
+
+void VulkanGSTrainer::reset_rayguard_evidence_gpu() {
+    rayguard_uids_.clear();
+}
+
+void VulkanGSTrainer::syncRayGuardEvidenceOnDevice(VulkanGSPipelineBuffers& buffers) {
+    const size_t n = buffers.num_splats;
+    if (n == 0) {
+        rayguard_uids_.clear();
+        return;
+    }
+    if (splat_uids.size() < n) {
+        size_t old_sz = splat_uids.size();
+        splat_uids.resize(n);
+        for (size_t i = old_sz; i < n; ++i)
+            splat_uids[i] = next_splat_uid_++;
+    }
+    if (rayguard_uids_.size() == n &&
+        std::equal(rayguard_uids_.begin(), rayguard_uids_.end(), splat_uids.begin()) &&
+        rayguard_ev_.deviceSize() >= 12 * n) {
+        return;
+    }
+
+    // Fast path: pure append (prefix identical, n > old_n) -> grow GPU buffer zero-filled in place
+    if (!rayguard_uids_.empty() && n > rayguard_uids_.size() &&
+        rayguard_ev_.deviceSize() >= 12 * rayguard_uids_.size() &&
+        std::equal(rayguard_uids_.begin(), rayguard_uids_.end(), splat_uids.begin())) {
+        resizeAndCopyDeviceBuffer(rayguard_ev_, 12 * n, true);
+        rayguard_uids_.assign(splat_uids.begin(), splat_uids.begin() + n);
+        return;
+    }
+
+    // Initial allocation (no prior evidence): zero-allocate 12*N floats on GPU
+    if (rayguard_uids_.empty() || rayguard_ev_.deviceSize() < 12 * rayguard_uids_.size()) {
+        std::vector<float> zeros(12 * n, 0.0f);
+        resizeDeviceBuffer(rayguard_ev_, 12 * n);
+        uploadDeviceSlice(rayguard_ev_.deviceBuffer, 0, zeros.data(), zeros.size() * sizeof(float));
+        rayguard_uids_.assign(splat_uids.begin(), splat_uids.begin() + n);
+        return;
+    }
+
+    // General UID-keyed remap (handles Morton sort, ADC prune, MCMC relocation, compact_retracted)
+    const size_t old_n = rayguard_uids_.size();
+    std::vector<std::pair<uint64_t, uint32_t>> old_sorted(old_n);
+    for (size_t i = 0; i < old_n; ++i)
+        old_sorted[i] = {rayguard_uids_[i], static_cast<uint32_t>(i)};
+    std::sort(old_sorted.begin(), old_sorted.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<uint32_t> remap_src(n, 0xFFFFFFFFu);
+    for (size_t i = 0; i < n; ++i) {
+        uint64_t u = splat_uids[i];
+        auto it = std::lower_bound(
+            old_sorted.begin(), old_sorted.end(), u,
+            [](const auto& a, uint64_t val) { return a.first < val; }
+        );
+        if (it != old_sorted.end() && it->first == u) {
+            remap_src[i] = it->second;
+        }
+    }
+
+    resizeDeviceBuffer(group_op_rows, n);
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, remap_src.data(), n * sizeof(uint32_t));
+    resizeDeviceBuffer(rayguard_ev_scratch_, 12 * n);
+    {
+        DEVICE_GUARD;
+        Uniform32_t u_rm[1];
+        u_rm[0].u = static_cast<uint32_t>(n);
+        bufferMemoryBarrier({
+            { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+            { rayguard_ev_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { rayguard_ev_scratch_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+        executeCompute(
+            {{n, 256}},
+            &u_rm, sizeof(u_rm),
+            pipeline_mcmc.rayguard_remap,
+            {
+                group_op_rows.deviceBuffer,
+                rayguard_ev_.deviceBuffer,
+                rayguard_ev_scratch_.deviceBuffer,
+            }
+        );
+        bufferMemoryBarrier({
+            { rayguard_ev_scratch_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+    }
+    std::swap(rayguard_ev_, rayguard_ev_scratch_);
+    rayguard_uids_.assign(splat_uids.begin(), splat_uids.begin() + n);
+}
+
+void VulkanGSTrainer::invalidate_rayguard_contradictions_gpu(VulkanGSPipelineBuffers& buffers) {
+    const size_t n = buffers.num_splats;
+    if (n == 0 || rayguard_uids_.empty())
+        return;
+    syncRayGuardEvidenceOnDevice(buffers);
+    ensureGroupBuffersOnDevice(buffers, n);
+    resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * n, true);
+    resizeDeviceBuffer(rayguard_stats_, 4);
+    {
+        DEVICE_GUARD;
+        Uniform32_t u[12] = {};
+        u[0].u = static_cast<uint32_t>(n);
+        u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+        u[2].u = 1u;  // mode=1: invalidate contradictions, preserve support_hits
+        bufferMemoryBarrier({
+            { rayguard_ev_.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+        executeCompute(
+            {{n, 256}},
+            &u, sizeof(u),
+            pipeline_mcmc.rayguard_apply,
+            {
+                buffers.scales_opacs.deviceBuffer,
+                buffers.g_scales_opacs.deviceBuffer,
+                rayguard_ev_.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                rayguard_stats_.deviceBuffer,
+            }
+        );
+        bufferMemoryBarrier({
+            { rayguard_ev_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+    }
+}
+
+VulkanGSTrainer::DecayOpacityStats VulkanGSTrainer::observe_and_apply_rayguard_gpu(
+    VulkanGSPipelineBuffers& buffers,
+    const float* depth_m,
+    int height,
+    int width,
+    float fx,
+    float fy,
+    float cx,
+    float cy,
+    const float* n2c_3x4_row_major,
+    const float* cam_o_norm_3,
+    float dp_inv_scale,
+    int current_step,
+    float delta_logit,
+    float min_opacity,
+    bool reset_moments,
+    bool respect_protected_states,
+    int min_rays,
+    float min_baseline_m,
+    float min_parallax_deg,
+    float surface_protect_m,
+    int cooldown_steps
+) {
+    if (!std::isfinite(delta_logit) || delta_logit < 0.0f) {
+        throw std::invalid_argument("observe_and_apply_rayguard_gpu: delta_logit must be finite and >= 0");
+    }
+    if (!std::isfinite(min_opacity) || min_opacity <= 0.0f || min_opacity >= 1.0f) {
+        throw std::invalid_argument("observe_and_apply_rayguard_gpu: min_opacity must be finite and in (0, 1)");
+    }
+    DecayOpacityStats stats;
+    const size_t n = buffers.num_splats;
+    if (n == 0 || depth_m == nullptr || height <= 0 || width <= 0)
+        return stats;
+
+    syncRayGuardEvidenceOnDevice(buffers);
+    ensureGroupBuffersOnDevice(buffers, n);
+    resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * n, true);
+
+    const size_t n_pix = static_cast<size_t>(height) * static_cast<size_t>(width);
+    resizeDeviceBuffer(rayguard_depth_, n_pix);
+    uploadDeviceSlice(rayguard_depth_.deviceBuffer, 0, depth_m, n_pix * sizeof(float));
+
+    uint32_t zero_stats[4] = {0u, 0u, 0u, 0u};
+    resizeDeviceBuffer(rayguard_stats_, 4);
+    uploadDeviceSlice(rayguard_stats_.deviceBuffer, 0, zero_stats, sizeof(zero_stats));
+
+    const float min_1mcos = 1.0f - std::cos(min_parallax_deg * 3.14159265358979323846f / 180.0f);
+    {
+        DEVICE_GUARD;
+        Uniform32_t u_obs[25];
+        u_obs[0].u = static_cast<uint32_t>(n);
+        u_obs[1].u = static_cast<uint32_t>(width);
+        u_obs[2].u = static_cast<uint32_t>(height);
+        u_obs[3].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+        u_obs[4].f = fx;
+        u_obs[5].f = fy;
+        u_obs[6].f = cx;
+        u_obs[7].f = cy;
+        u_obs[8].f = surface_protect_m;
+        u_obs[9].f = dp_inv_scale;
+        u_obs[10].f = cam_o_norm_3[0];
+        u_obs[11].f = cam_o_norm_3[1];
+        u_obs[12].f = cam_o_norm_3[2];
+        for (int k = 0; k < 12; ++k)
+            u_obs[13 + k].f = n2c_3x4_row_major[k];
+
+        bufferMemoryBarrier({
+            { rayguard_depth_.deviceBuffer, TRANSFER_WRITE },
+            { rayguard_stats_.deviceBuffer, TRANSFER_WRITE },
+            { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { rayguard_ev_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+
+        executeCompute(
+            {{n, 256}},
+            &u_obs, sizeof(u_obs),
+            pipeline_mcmc.rayguard_observe,
+            {
+                buffers.xyz_ws.deviceBuffer,
+                buffers.scales_opacs.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                rayguard_depth_.deviceBuffer,
+                rayguard_ev_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { rayguard_ev_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+
+        Uniform32_t u_app[12];
+        u_app[0].u = static_cast<uint32_t>(n);
+        u_app[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+        u_app[2].u = 0u;  // mode=0: apply
+        u_app[3].u = reset_moments ? 1u : 0u;
+        u_app[4].u = respect_protected_states ? 1u : 0u;
+        u_app[5].f = static_cast<float>(min_rays);
+        u_app[6].f = min_baseline_m;
+        u_app[7].f = min_1mcos;
+        u_app[8].f = delta_logit;
+        u_app[9].f = min_opacity;
+        u_app[10].f = static_cast<float>(current_step);
+        u_app[11].f = static_cast<float>(cooldown_steps);
+
+        executeCompute(
+            {{n, 256}},
+            &u_app, sizeof(u_app),
+            pipeline_mcmc.rayguard_apply,
+            {
+                buffers.scales_opacs.deviceBuffer,
+                buffers.g_scales_opacs.deviceBuffer,
+                rayguard_ev_.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                rayguard_stats_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { rayguard_ev_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { rayguard_stats_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+    }
+
+    uint32_t out_stats[4] = {0u, 0u, 0u, 0u};
+    downloadDeviceSlice(rayguard_stats_.deviceBuffer, 0, out_stats, sizeof(out_stats));
+    stats.proposed = out_stats[0];
+    stats.deduped = out_stats[0];
+    stats.skipped_protected = out_stats[1];
+    stats.applied = out_stats[2];
     return stats;
 }
 

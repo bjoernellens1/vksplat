@@ -166,6 +166,9 @@ public:
             "mcmc_compact_gather",
             "mcmc_compact_gather_sh",
             "mcmc_decay_opacity_rows",
+            "mcmc_rayguard_observe",
+            "mcmc_rayguard_apply",
+            "mcmc_rayguard_remap",
             "morton_sort_compute_stats",
             "morton_sort_generate_keys",
             "morton_sort_apply_indices",
@@ -611,6 +614,67 @@ public:
     py::array_t<uint64_t> get_splat_uids() {
         const auto& uids = trainer.get_splat_uids();
         return py::array_t<uint64_t>({uids.size()}, {sizeof(uint64_t)}, uids.data());
+    }
+    py::dict observe_and_apply_rayguard_gpu(
+        py::array_t<float, py::array::c_style | py::array::forcecast> depth_m,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        py::array_t<float, py::array::c_style | py::array::forcecast> n2c_3x4,
+        py::array_t<float, py::array::c_style | py::array::forcecast> cam_o_norm,
+        float dp_inv_scale,
+        int current_step,
+        float delta_logit = 3.5f,
+        float min_opacity = 0.002f,
+        bool reset_moments = true,
+        bool respect_protected_states = true,
+        int min_rays = 2,
+        float min_baseline_m = 0.20f,
+        float min_parallax_deg = 8.0f,
+        float surface_protect_m = 0.12f,
+        int cooldown_steps = 500
+    ) {
+        auto dbuf = depth_m.request();
+        if (dbuf.ndim != 2)
+            throw std::invalid_argument("observe_and_apply_rayguard_gpu: depth_m must be 2D (H, W)");
+        if (n2c_3x4.size() != 12)
+            throw std::invalid_argument("observe_and_apply_rayguard_gpu: n2c_3x4 must have 12 floats");
+        if (cam_o_norm.size() != 3)
+            throw std::invalid_argument("observe_and_apply_rayguard_gpu: cam_o_norm must have 3 floats");
+        auto st = trainer.observe_and_apply_rayguard_gpu(
+            buffers,
+            static_cast<const float*>(dbuf.ptr),
+            static_cast<int>(dbuf.shape[0]),
+            static_cast<int>(dbuf.shape[1]),
+            fx, fy, cx, cy,
+            n2c_3x4.data(),
+            cam_o_norm.data(),
+            dp_inv_scale,
+            current_step,
+            delta_logit,
+            min_opacity,
+            reset_moments,
+            respect_protected_states,
+            min_rays,
+            min_baseline_m,
+            min_parallax_deg,
+            surface_protect_m,
+            cooldown_steps
+        );
+        py::dict d;
+        d["proposed"] = st.proposed;
+        d["deduped"] = st.deduped;
+        d["skipped_out_of_range"] = st.skipped_out_of_range;
+        d["skipped_protected"] = st.skipped_protected;
+        d["applied"] = st.applied;
+        return d;
+    }
+    void invalidate_rayguard_contradictions_gpu() {
+        trainer.invalidate_rayguard_contradictions_gpu(buffers);
+    }
+    void reset_rayguard_evidence_gpu() {
+        trainer.reset_rayguard_evidence_gpu();
     }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
@@ -1737,6 +1801,19 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
         .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
         .def("get_splat_uids", &VkSplat::get_splat_uids, "Get persistent monotonic uint64 per-splat identities tracked across sort/prune/relocate/compact")
+        .def("observe_and_apply_rayguard_gpu", &VkSplat::observe_and_apply_rayguard_gpu,
+             "GPU-resident incremental RayGuard: uploads only HxW depth map, accumulates UID-keyed evidence on GPU, applies sparse logit opacity decay, and reads back 16-byte stats",
+             py::arg("depth_m"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
+             py::arg("n2c_3x4"), py::arg("cam_o_norm"), py::arg("dp_inv_scale"), py::arg("current_step"),
+             py::arg("delta_logit") = 3.5f, py::arg("min_opacity") = 0.002f,
+             py::arg("reset_moments") = true, py::arg("respect_protected_states") = true,
+             py::arg("min_rays") = 2, py::arg("min_baseline_m") = 0.20f,
+             py::arg("min_parallax_deg") = 8.0f, py::arg("surface_protect_m") = 0.12f,
+             py::arg("cooldown_steps") = 500)
+        .def("invalidate_rayguard_contradictions_gpu", &VkSplat::invalidate_rayguard_contradictions_gpu,
+             "Invalidate GPU-resident RayGuard contradiction counters after SLAM pose revision (preserves support_hits)")
+        .def("reset_rayguard_evidence_gpu", &VkSplat::reset_rayguard_evidence_gpu,
+             "Reset GPU-resident RayGuard evidence buffer")
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
         .def("set_growth_cap", &VkSplat::set_growth_cap,
              "Set evidence-derived densification ceiling for ADC and MCMC; does not remove existing splats",

@@ -163,3 +163,68 @@ def test_splat_uids_lifecycle_and_decay_stats(tmp_path):
     assert st["deduped"] == 3
     assert st["skipped_protected"] == 1
     assert st["applied"] == 2
+
+
+def test_gpu_resident_rayguard_observe_apply_and_pose_invalidation(tmp_path):
+    ds = sc.build_dataset(tmp_path / "ds", n_points=128, w=64, h=48)
+    mod = sc.new_trainer(ds, tmp_path / "out", mcmc_protect_structural_groups=True)
+    mod.train_step(0, 1)
+
+    # Set known world/normalized positions: dp_transform = I (dp_inv_scale = 1.0)
+    # Row 0: free floater at (0, 0, 2.0), opacity 0.85
+    # Row 1: real surface at (0, 0, 4.0), opacity 0.85 (protected by depth hit!)
+    # Row 2: METRIC_VERIFIED (state 3) floater at (0, 0, 2.0), opacity 0.85 (protected by state!)
+    n = int(np.asarray(mod.xyz_ws).shape[0])
+    xyz = np.tile(np.array([[0.0, 0.0, -5.0]], dtype=np.float32), (n, 1))
+    xyz[0] = np.array([0.0, 0.0, 2.0], dtype=np.float32)
+    xyz[1] = np.array([0.0, 0.0, 4.0], dtype=np.float32)
+    xyz[2] = np.array([0.0, 0.0, 2.0], dtype=np.float32)
+    scales = np.full((n, 3), 0.01, dtype=np.float32)
+    quats = np.tile(np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32), (n, 1))
+    states = np.full((n,), 5, dtype=np.uint32)
+    states[2] = 3  # METRIC_VERIFIED
+    mod.reanchor_splats_sparse(
+        np.arange(n, dtype=np.uint32),
+        xyz,
+        scales,
+        quats,
+        np.zeros((0, 3), dtype=np.float32),
+        states,
+    )
+
+    so = np.asarray(mod.get_scales_opacities_packed(), dtype=np.float32).reshape(-1, 4).copy()
+    so[:, 3] = 0.85
+    mod._set_scales_opacs(np.ascontiguousarray(so, dtype=np.float32))
+
+    dep = np.full((64, 64), 4.0, dtype=np.float32)
+
+    def _n2c_and_cam(cam_xyz):
+        c2w = np.eye(4, dtype=np.float32)
+        c2w[:3, 3] = cam_xyz
+        w2c = np.linalg.inv(c2w).astype(np.float32)
+        return np.ascontiguousarray(w2c[:3, :].reshape(-1), dtype=np.float32), np.asarray(cam_xyz, dtype=np.float32)
+
+    # View 1: 1 ray only -> proposed=0, applied=0
+    n2c1, cam1 = _n2c_and_cam([0.0, 0.0, 0.0])
+    st1 = mod.observe_and_apply_rayguard_gpu(dep, 60.0, 60.0, 32.0, 32.0, n2c1, cam1, 1.0, 10)
+    assert st1["proposed"] == 0 and st1["applied"] == 0
+
+    # View 2: 0.35m lateral baseline (~9.9 deg parallax) -> ONLY Row 0 decays!
+    n2c2, cam2 = _n2c_and_cam([0.35, 0.0, 0.0])
+    st2 = mod.observe_and_apply_rayguard_gpu(dep, 60.0, 60.0, 32.0, 32.0, n2c2, cam2, 1.0, 20, 3.5, 0.002, True, True)
+    assert st2["proposed"] == 1 and st2["applied"] == 1 and st2["skipped_protected"] == 0
+
+    so_after = np.asarray(mod.get_scales_opacities_packed(), dtype=np.float32).reshape(-1, 4)
+    expected_0 = _cpu_logit_decay(np.array([0.85], dtype=np.float32), 3.5, 0.002)[0]
+    assert abs(float(so_after[0, 3]) - float(expected_0)) <= 1e-5
+    assert so_after[1, 3] == np.float32(0.85)  # surface-supported splat untouched!
+    assert so_after[2, 3] == np.float32(0.85)  # METRIC_VERIFIED splat untouched!
+
+    # Cooldown prevents immediate re-decay at step 30
+    st3 = mod.observe_and_apply_rayguard_gpu(dep, 60.0, 60.0, 32.0, 32.0, n2c2, cam2, 1.0, 30)
+    assert st3["applied"] == 0
+
+    # Pose-revision invalidation clears contradiction counters while preserving support_hits
+    mod.invalidate_rayguard_contradictions_gpu()
+    st4 = mod.observe_and_apply_rayguard_gpu(dep, 60.0, 60.0, 32.0, 32.0, n2c1, cam1, 1.0, 600)
+    assert st4["applied"] == 0  # needs 2 fresh rays after pose invalidation!
