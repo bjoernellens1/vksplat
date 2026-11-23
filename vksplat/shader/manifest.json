@@ -31,7 +31,7 @@
         "mcmc.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
-                "slang/mcmc.slang": "b5a9b99235cb97e387bf25b4fbd8dd2a0193177dc15e4ab8f9ae72a2252afaed",
+                "slang/mcmc.slang": "c9b22a641654be1b582ba76bd1925a91c544bf493e66ff8f2d0cd214d1bfcea8",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
@@ -46,6 +46,9 @@
                 "shader/generated/mcmc_decay_opacity_rows.spv": "38643507f92b3aeaffb338d71b642212e410bc8029eefeacf965b4e39e0c9947",
                 "shader/generated/mcmc_inject_noise.spv": "91a7202b0334d8238368f687d11aa64330431144ebaef7f0136fe4d3e01477cd",
                 "shader/generated/mcmc_mask_retracted_group.spv": "f9e85b5b5e4ca3d7f072a5fc4a021ad1e60a2b9869b059cdd1e89b835696b921",
+                "shader/generated/mcmc_rayguard_apply.spv": "cc8417b95fe364e532d5c2cf1ff870b9d81d76513dce19d859b0e23fe1c8a835",
+                "shader/generated/mcmc_rayguard_observe.spv": "42e07bfb017fc0adc8227995f393c2636c7dd7d4d024c78f6a1a5d359daac16d",
+                "shader/generated/mcmc_rayguard_remap.spv": "543a0d138e82ff572305f916b6e688e4437bde36e0933ce6df64115ed50b2b5a",
                 "shader/generated/mcmc_update_add.spv": "b2e7dbf58f17d5f92770e34e6a289aa30a6fe026dd03bd35766ad4f917bf0820",
                 "shader/generated/mcmc_update_group_rows.spv": "ecb428dd23bbdcd18244129baef1c6c2fb36e80ee869a4fb467f90fd097c8eac",
                 "shader/generated/mcmc_update_relocation.spv": "a85e50f0e8922aa5d8f0a077972c9978ef2776c5060cb9b9f1d077b850d71e51"

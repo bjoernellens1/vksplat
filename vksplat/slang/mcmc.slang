@@ -18,6 +18,9 @@
 #define MCMC_PHASE_CompactGather 33
 #define MCMC_PHASE_CompactGatherSH 34
 #define MCMC_PHASE_DecayOpacityRows 35
+#define MCMC_PHASE_RayGuardObserve 36
+#define MCMC_PHASE_RayGuardApply 37
+#define MCMC_PHASE_RayGuardRemap 38
 
 #ifndef MCMC_PHASE
 #define MCMC_PHASE -1
@@ -79,6 +82,46 @@ struct DecayOpacityRowsUniforms {
     uint32_t reset_moments;
     uint32_t respect_protected_states;
     uint32_t num_groups;
+};
+
+struct RayGuardObserveUniforms {
+    uint32_t num_splats;
+    uint32_t width;
+    uint32_t height;
+    uint32_t num_groups;
+    float fx;
+    float fy;
+    float cx;
+    float cy;
+    float surface_protect_m;
+    float dp_inv_scale;
+    // Camera origin in normalized coordinates (orthogonal dp_rot preserves ray angles & scaled baseline)
+    float cam_on_x;
+    float cam_on_y;
+    float cam_on_z;
+    // Combined n2c = w2c @ inv(dp_transform) (3x4 row-major: maps xyz_norm -> camera meters)
+    float n2c_00, n2c_01, n2c_02, n2c_03;
+    float n2c_10, n2c_11, n2c_12, n2c_13;
+    float n2c_20, n2c_21, n2c_22, n2c_23;
+};
+
+struct RayGuardApplyUniforms {
+    uint32_t num_splats;
+    uint32_t num_groups;
+    uint32_t mode; // 0=apply decay, 1=invalidate contradictions (pose revision)
+    uint32_t reset_moments;
+    uint32_t respect_protected_states;
+    float min_rays;
+    float min_baseline_m;
+    float min_1_minus_cos;
+    float delta_logit;
+    float min_opacity;
+    float current_step;
+    float cooldown_steps;
+};
+
+struct RayGuardRemapUniforms {
+    uint32_t new_n;
 };
 
 struct CompactUniforms {
@@ -758,3 +801,264 @@ void decayOpacityRows(
 }
 
 #endif  // MCMC_PHASE == MCMC_PHASE_DecayOpacityRows
+
+
+#if MCMC_PHASE == MCMC_PHASE_RayGuardObserve
+
+// GPU-resident incremental RayGuard observation (zero xyz/opacity/state readback):
+// Layout of rayguard_ev (3 * N float4s):
+//   [3*i + 0] = (support_hits, contra_hits, max_baseline_m, max_1_minus_cos)
+//   [3*i + 1] = (first_cam_x, first_cam_y, first_cam_z, cooldown_until_step)
+//   [3*i + 2] = (first_dir_x, first_dir_y, first_dir_z, 0.0)
+layout(binding=0) StructuredBuffer<float> means;              // (N, 3) normalized
+layout(binding=1) StructuredBuffer<float4> scales_opacs;      // (N, 4) norm_scales + linear opac
+layout(binding=2) StructuredBuffer<int32_t> group_ids;        // (N,)
+layout(binding=3) StructuredBuffer<uint32_t> group_state;     // (G,)
+layout(binding=4) StructuredBuffer<uint32_t> splat_state;     // (N,)
+layout(binding=5) StructuredBuffer<float> depth_img;          // (H * W) meters
+layout(binding=6) RWStructuredBuffer<float4> rayguard_ev;     // (3 * N, 4)
+
+#define rayGuardObserve main
+
+bool rg_valid_depth(float d) {
+    return isfinite(d) && d > 0.25f && d < 5.5f;
+}
+
+bool rg_is_depth_edge(int32_t u, int32_t v, int32_t w, int32_t h, StructuredBuffer<float> dep) {
+    // 3x3 local jump + 1px dilation equivalent: check 5x5 neighborhood around (u,v) for discontinuity
+    // or invalid depth hole within 1 px of the 3x3 stencil.
+    float d0 = dep[v * w + u];
+    if (!rg_valid_depth(d0))
+        return true;
+    float d_min = d0;
+    float d_max = d0;
+    for (int32_t dv = -1; dv <= 1; ++dv) {
+        int32_t vv = clamp(v + dv, 0, h - 1);
+        for (int32_t du = -1; du <= 1; ++du) {
+            int32_t uu = clamp(u + du, 0, w - 1);
+            float dn = dep[vv * w + uu];
+            if (!rg_valid_depth(dn))
+                return true;
+            d_min = min(d_min, dn);
+            d_max = max(d_max, dn);
+        }
+    }
+    float thresh = max(0.08f, 0.04f * d0);
+    return (d_max - d_min) > thresh;
+}
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void rayGuardObserve(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform RayGuardObserveUniforms U
+) {
+    const uint32_t tid = thread_id.x;
+    if (tid >= U.num_splats)
+        return;
+
+    float4 so = scales_opacs[tid];
+    if (!isfinite(so.w) || so.w < 0.08f)
+        return;
+
+    const uint32_t st = splat_base_state(splat_state[tid]);
+    if (st == 0u || st == 1u || st == 3u)
+        return;
+    const int32_t gid = group_ids[tid];
+    if (gid >= 0 && uint32_t(gid) < U.num_groups) {
+        const uint32_t gst = group_state[gid];
+        if (gst == 1u || gst == 2u)
+            return;
+    }
+
+    float3 pn = read_mean(tid, means);
+    if (!all(isfinite(pn)))
+        return;
+
+    float3 pc = float3(
+        U.n2c_00 * pn.x + U.n2c_01 * pn.y + U.n2c_02 * pn.z + U.n2c_03,
+        U.n2c_10 * pn.x + U.n2c_11 * pn.y + U.n2c_12 * pn.z + U.n2c_13,
+        U.n2c_20 * pn.x + U.n2c_21 * pn.y + U.n2c_22 * pn.z + U.n2c_23
+    );
+    if (pc.z <= 0.20f || pc.z >= 5.0f)
+        return;
+
+    int32_t u = int32_t(round(pc.x * U.fx / pc.z + U.cx));
+    int32_t v = int32_t(round(pc.y * U.fy / pc.z + U.cy));
+    int32_t W = int32_t(U.width);
+    int32_t H = int32_t(U.height);
+    if (u < 0 || u >= W || v < 0 || v >= H)
+        return;
+
+    float d_meas = depth_img[v * W + u];
+    if (!rg_valid_depth(d_meas))
+        return;
+
+    float4 ev0 = rayguard_ev[3u * tid + 0u];
+    // 1. Center near-surface protection
+    if (abs(d_meas - pc.z) <= U.surface_protect_m) {
+        ev0.x = min(ev0.x + 1.0f, 30000.0f);
+        rayguard_ev[3u * tid + 0u] = ev0;
+        return;
+    }
+
+    // 2. Projected Gaussian footprint 5-point cross protection
+    float max_s_w = max(abs(so.x), max(abs(so.y), abs(so.z))) * U.dp_inv_scale;
+    float f_med = 0.5f * (U.fx + U.fy);
+    int32_t r_px = clamp(int32_t(ceil(f_med * max_s_w / max(pc.z, 1e-3f))), 0, 4);
+    if (r_px > 0) {
+        float d1 = depth_img[v * W + clamp(u + r_px, 0, W - 1)];
+        float d2 = depth_img[v * W + clamp(u - r_px, 0, W - 1)];
+        float d3 = depth_img[clamp(v + r_px, 0, H - 1) * W + u];
+        float d4 = depth_img[clamp(v - r_px, 0, H - 1) * W + u];
+        bool fp_hit =
+            (rg_valid_depth(d1) && abs(d1 - pc.z) <= U.surface_protect_m) ||
+            (rg_valid_depth(d2) && abs(d2 - pc.z) <= U.surface_protect_m) ||
+            (rg_valid_depth(d3) && abs(d3 - pc.z) <= U.surface_protect_m) ||
+            (rg_valid_depth(d4) && abs(d4 - pc.z) <= U.surface_protect_m);
+        if (fp_hit) {
+            ev0.x = min(ev0.x + 1.0f, 30000.0f);
+            rayguard_ev[3u * tid + 0u] = ev0;
+            return;
+        }
+    }
+
+    // 3. Free-space contradiction test with inline 3x3 depth-edge veto
+    float sig = 0.005f + 0.0040f * d_meas;
+    float margin = max(0.25f, 3.0f * sig);
+    if (d_meas <= pc.z + margin)
+        return;
+    if (rg_is_depth_edge(u, v, W, H, depth_img))
+        return;
+
+    float3 cam_on = float3(U.cam_on_x, U.cam_on_y, U.cam_on_z);
+    float3 ray = pn - cam_on;
+    float rlen = max(length(ray), 1e-6f);
+    float3 rdir = ray / rlen;
+
+    float4 ev1 = rayguard_ev[3u * tid + 1u];
+    float4 ev2 = rayguard_ev[3u * tid + 2u];
+    if (ev0.y <= 0.5f) {
+        ev1.xyz = cam_on;
+        ev2.xyz = rdir;
+    }
+    ev0.y = min(ev0.y + 1.0f, 30000.0f);
+    float b_dist = length(cam_on - ev1.xyz) * U.dp_inv_scale;
+    ev0.z = max(ev0.z, b_dist);
+    float one_minus_cos = 1.0f - clamp(dot(rdir, ev2.xyz), -1.0f, 1.0f);
+    ev0.w = max(ev0.w, one_minus_cos);
+
+    rayguard_ev[3u * tid + 0u] = ev0;
+    rayguard_ev[3u * tid + 1u] = ev1;
+    rayguard_ev[3u * tid + 2u] = ev2;
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_RayGuardObserve
+
+
+#if MCMC_PHASE == MCMC_PHASE_RayGuardApply
+
+layout(binding=0) RWStructuredBuffer<float4> scales_opacs;   // (N, 4)
+layout(binding=1) RWStructuredBuffer<float4> g_scales_opacs; // (N, 2, 4)
+layout(binding=2) RWStructuredBuffer<float4> rayguard_ev;    // (3 * N, 4)
+layout(binding=3) StructuredBuffer<int32_t> group_ids;       // (N,)
+layout(binding=4) StructuredBuffer<uint32_t> group_state;    // (G,)
+layout(binding=5) StructuredBuffer<uint32_t> splat_state;    // (N,)
+layout(binding=6) RWByteAddressBuffer stats_out;             // 4 uint32s: [proposed, skipped_protected, applied, 0]
+
+#define rayGuardApply main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void rayGuardApply(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform RayGuardApplyUniforms U
+) {
+    const uint32_t tid = thread_id.x;
+    if (tid >= U.num_splats)
+        return;
+
+    float4 ev0 = rayguard_ev[3u * tid + 0u];
+    if (U.mode == 1u) {
+        // Pose-revision invalidation: clear contradiction evidence, preserve support_hits (ev0.x)
+        ev0.y = 0.0f;
+        ev0.z = 0.0f;
+        ev0.w = 0.0f;
+        rayguard_ev[3u * tid + 0u] = ev0;
+        return;
+    }
+
+    float4 ev1 = rayguard_ev[3u * tid + 1u];
+    float4 so = scales_opacs[tid];
+    if (!isfinite(so.w) || so.w < 0.08f)
+        return;
+    if (ev0.y < U.min_rays || ev0.x > 0.5f || ev0.z < U.min_baseline_m || ev0.w < U.min_1_minus_cos)
+        return;
+    if (U.current_step < ev1.w)
+        return;
+
+    stats_out.InterlockedAdd(0u, 1u);  // proposed
+
+    if (U.respect_protected_states != 0u) {
+        const uint32_t st = splat_base_state(splat_state[tid]);
+        bool prot = (st == 0u || st == 1u || st == 3u);
+        if (!prot) {
+            const int32_t gid = group_ids[tid];
+            if (gid >= 0 && uint32_t(gid) < U.num_groups) {
+                const uint32_t gst = group_state[gid];
+                if (gst == 1u || gst == 2u)
+                    prot = true;
+            }
+        }
+        if (prot) {
+            stats_out.InterlockedAdd(4u, 1u);  // skipped_protected
+            return;
+        }
+    }
+
+    const float p = clamp(so.w, 1e-7f, 1.0f - 1e-7f);
+    const float logit = log(p / (1.0f - p)) - U.delta_logit;
+    const float new_p = 1.0f / (1.0f + exp(-clamp(logit, -20.0f, 20.0f)));
+    so.w = max(new_p, U.min_opacity);
+    scales_opacs[tid] = so;
+    if (U.reset_moments != 0u) {
+        g_scales_opacs[2u * tid + 0u].w = 0.0f;
+        g_scales_opacs[2u * tid + 1u].w = 0.0f;
+    }
+    ev1.w = U.current_step + U.cooldown_steps;
+    rayguard_ev[3u * tid + 1u] = ev1;
+    stats_out.InterlockedAdd(8u, 1u);  // applied
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_RayGuardApply
+
+
+#if MCMC_PHASE == MCMC_PHASE_RayGuardRemap
+
+// Identity-safe GPU gather of 3*float4 RayGuard evidence across sort/prune/compact/relocate.
+// Entries with remap_src[tid] == 0xFFFFFFFFu (brand-new or relocated splats) are zeroed.
+layout(binding=0) StructuredBuffer<uint32_t> remap_src;  // (new_n,)
+layout(binding=1) StructuredBuffer<float4> src_ev;       // (old_n * 3, 4)
+layout(binding=2) RWStructuredBuffer<float4> dst_ev;     // (new_n * 3, 4)
+
+#define rayGuardRemap main
+
+[numthreads(GROUP_SIZE, 1, 1)]
+void rayGuardRemap(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform RayGuardRemapUniforms U
+) {
+    const uint32_t tid = thread_id.x;
+    if (tid >= U.new_n)
+        return;
+    const uint32_t src = remap_src[tid];
+    if (src == 0xFFFFFFFFu) {
+        dst_ev[3u * tid + 0u] = float4(0.0f);
+        dst_ev[3u * tid + 1u] = float4(0.0f);
+        dst_ev[3u * tid + 2u] = float4(0.0f);
+    } else {
+        dst_ev[3u * tid + 0u] = src_ev[3u * src + 0u];
+        dst_ev[3u * tid + 1u] = src_ev[3u * src + 1u];
+        dst_ev[3u * tid + 2u] = src_ev[3u * src + 2u];
+    }
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_RayGuardRemap

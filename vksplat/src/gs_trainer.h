@@ -312,6 +312,35 @@ public:
     DecayOpacityStats decay_opacities_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, size_t count,
                                              float delta_logit, float min_opacity = 1e-4f, bool reset_moments = true,
                                              bool respect_protected_states = true);
+    // GPU-resident incremental RayGuard: syncs per-splat evidence by persistent `splat_uids`,
+    // uploads only the HxW float32 depth map, projects all N splats on GPU (with inline 3x3
+    // depth-edge veto, 5-point footprint protection, baseline + angular parallax), applies
+    // logit-space decay, and reads back only 16 bytes of exact atomic stats.
+    DecayOpacityStats observe_and_apply_rayguard_gpu(
+        VulkanGSPipelineBuffers& buffers,
+        const float* depth_m,
+        int height,
+        int width,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        const float* n2c_3x4_row_major,
+        const float* cam_o_norm_3,
+        float dp_inv_scale,
+        int current_step,
+        float delta_logit = 3.5f,
+        float min_opacity = 0.002f,
+        bool reset_moments = true,
+        bool respect_protected_states = true,
+        int min_rays = 2,
+        float min_baseline_m = 0.20f,
+        float min_parallax_deg = 8.0f,
+        float surface_protect_m = 0.12f,
+        int cooldown_steps = 500
+    );
+    void invalidate_rayguard_contradictions_gpu(VulkanGSPipelineBuffers& buffers);
+    void reset_rayguard_evidence_gpu();
     const std::vector<uint64_t>& get_splat_uids() const { return splat_uids; }
     uint64_t get_next_splat_uid() const { return next_splat_uid_; }
     void set_splat_uids_vec(std::vector<uint64_t> uids, uint64_t next_uid) {
@@ -356,6 +385,12 @@ private:
     Buffer<uint32_t> group_op_rows;  // splat indices of update_group_sparse / keep list of compact_retracted
     Buffer<float> group_op_vals;
     Buffer<uint32_t> compact_scratch;  // copy of the buffer being gathered
+    Buffer<float> rayguard_ev_;          // (12 * N) GPU-resident per-splat RayGuard evidence (3 float4/splat)
+    Buffer<float> rayguard_ev_scratch_;  // scratch for UID-keyed GPU gather remap
+    Buffer<float> rayguard_depth_;       // (H * W) current keyframe depth map
+    Buffer<uint32_t> rayguard_stats_;    // (4) GPU atomic stats [proposed, skipped_protected, applied, 0]
+    std::vector<uint64_t> rayguard_uids_;
+    void syncRayGuardEvidenceOnDevice(VulkanGSPipelineBuffers& buffers);
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
@@ -392,6 +427,9 @@ private:
         _ComputePipeline compact_gather = _ComputePipeline(3);
         _ComputePipeline compact_gather_sh = _ComputePipeline(3);
         _ComputePipeline decay_opacity_rows = _ComputePipeline(6);
+        _ComputePipeline rayguard_observe = _ComputePipeline(7);
+        _ComputePipeline rayguard_apply = _ComputePipeline(7);
+        _ComputePipeline rayguard_remap = _ComputePipeline(3);
     } pipeline_mcmc;
     struct _MortonSortComputePipeline {
         _ComputePipeline compute_stats = _ComputePipeline(2);
