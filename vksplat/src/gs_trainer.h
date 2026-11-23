@@ -295,13 +295,29 @@ public:
     void reanchor_splats_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows,
                                 const float* xyz, const float* scales, const float* quats,
                                 const float* sh_dc, const uint32_t* states, size_t count);
+    struct DecayOpacityStats {
+        size_t proposed = 0;
+        size_t deduped = 0;
+        size_t skipped_out_of_range = 0;
+        size_t skipped_protected = 0;
+        size_t applied = 0;
+    };
+
     // Sparse GPU-resident logit-space opacity decay.
-    // Deduplicates `rows` on host before dispatch and validates `delta_logit >= 0` and `0 < min_opacity < 1`.
+    // Deduplicates `rows` on host before dispatch, filters protected states/groups when
+    // `respect_protected_states=true`, validates `delta_logit >= 0` and `0 < min_opacity < 1`,
+    // and returns exact proposed vs. applied counts.
     // Index-lifetime contract: `rows` are valid only within the current compaction/Morton epoch and must NOT
     // be deferred across ADC prune/split or MCMC relocation/compaction.
-    void decay_opacities_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, size_t count,
-                                float delta_logit, float min_opacity = 1e-4f, bool reset_moments = true,
-                                bool respect_protected_states = true);
+    DecayOpacityStats decay_opacities_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, size_t count,
+                                             float delta_logit, float min_opacity = 1e-4f, bool reset_moments = true,
+                                             bool respect_protected_states = true);
+    const std::vector<uint64_t>& get_splat_uids() const { return splat_uids; }
+    uint64_t get_next_splat_uid() const { return next_splat_uid_; }
+    void set_splat_uids_vec(std::vector<uint64_t> uids, uint64_t next_uid) {
+        splat_uids = std::move(uids);
+        next_splat_uid_ = std::max<uint64_t>(next_uid, 1u);
+    }
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
     void clamp_scales(VulkanGSPipelineBuffers& buffers, float max_scale, float tangent_cap);
     // Rewrites geometry (xyz, scales, quats; rows in ascending splat index of the group) and resets the geometry
@@ -326,6 +342,8 @@ private:
     float pre_freeze_grad_ema = 0.0f;
     std::vector<int32_t> splat_group_ids;
     std::vector<int32_t> splat_entity_ids;
+    std::vector<uint64_t> splat_uids;       // (N,) persistent monotonic per-splat identity across sort/prune/relocate
+    uint64_t next_splat_uid_ = 1u;
     std::vector<uint32_t> splat_states;     // (N,) per-splat evidence state mirror
     std::vector<float> splat_anchors_host;  // (8*N,) host mirror of per-splat geometric anchors
     bool use_local_cell_credits_ = false;

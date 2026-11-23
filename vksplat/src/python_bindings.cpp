@@ -591,7 +591,7 @@ public:
         const uint32_t* st_ptr = (states.size() == (py::ssize_t)n) ? states.data() : nullptr;
         trainer.reanchor_splats_sparse(buffers, rows.data(), xyz.data(), scales.data(), quats.data(), dc_ptr, st_ptr, n);
     }
-    void decay_opacities_sparse(
+    py::dict decay_opacities_sparse(
         py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
         float delta_logit,
         float min_opacity = 1e-4f,
@@ -599,7 +599,18 @@ public:
         bool respect_protected_states = true
     ) {
         size_t n = static_cast<size_t>(rows.size());
-        trainer.decay_opacities_sparse(buffers, rows.data(), n, delta_logit, min_opacity, reset_moments, respect_protected_states);
+        auto st = trainer.decay_opacities_sparse(buffers, rows.data(), n, delta_logit, min_opacity, reset_moments, respect_protected_states);
+        py::dict d;
+        d["proposed"] = st.proposed;
+        d["deduped"] = st.deduped;
+        d["skipped_out_of_range"] = st.skipped_out_of_range;
+        d["skipped_protected"] = st.skipped_protected;
+        d["applied"] = st.applied;
+        return d;
+    }
+    py::array_t<uint64_t> get_splat_uids() {
+        const auto& uids = trainer.get_splat_uids();
+        return py::array_t<uint64_t>({uids.size()}, {sizeof(uint64_t)}, uids.data());
     }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
@@ -883,6 +894,8 @@ public:
         snap["scales_opacs"] = buffer_to_array<float, float>(buffers.scales_opacs, 4);
         snap["splat_group_ids"] = get_splat_group_ids();
         snap["splat_entity_ids"] = get_splat_entity_ids();
+        snap["splat_uids"] = get_splat_uids();
+        snap["next_splat_uid"] = trainer.get_next_splat_uid();
         if (!trainer.get_splat_states().empty()) {
             snap["splat_states"] = get_splat_states();
         }
@@ -928,6 +941,14 @@ public:
         }
         if (snap.contains(py::str("splat_entity_ids"))) {
             set_splat_entity_ids(snap["splat_entity_ids"].cast<py::array_t<int32_t>>());
+        }
+        if (snap.contains(py::str("splat_uids"))) {
+            auto u_arr = snap["splat_uids"].cast<py::array_t<uint64_t, py::array::c_style | py::array::forcecast>>();
+            std::vector<uint64_t> u_vec(u_arr.data(), u_arr.data() + u_arr.size());
+            uint64_t next_u = snap.contains(py::str("next_splat_uid"))
+                ? snap["next_splat_uid"].cast<uint64_t>()
+                : (u_vec.empty() ? 1u : (*std::max_element(u_vec.begin(), u_vec.end()) + 1u));
+            trainer.set_splat_uids_vec(std::move(u_vec), next_u);
         }
         if (snap.contains(py::str("splat_states"))) {
             set_splat_states(snap["splat_states"].cast<py::array_t<uint32_t>>());
@@ -1715,6 +1736,7 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_sh_dc", &VkSplat::get_sh_dc, "Read only the (N, 3) DC band from reordered sh_coeffs on device")
         .def("get_splat_entity_ids", &VkSplat::get_splat_entity_ids, "Get per-splat entity IDs")
         .def("set_splat_entity_ids", &VkSplat::set_splat_entity_ids, "Set per-splat entity IDs", py::arg("entity_ids"))
+        .def("get_splat_uids", &VkSplat::get_splat_uids, "Get persistent monotonic uint64 per-splat identities tracked across sort/prune/relocate/compact")
         .def("get_mcmc_stats", &VkSplat::get_mcmc_stats, "Get MCMC relocation and add statistics")
         .def("set_growth_cap", &VkSplat::set_growth_cap,
              "Set evidence-derived densification ceiling for ADC and MCMC; does not remove existing splats",
