@@ -77,6 +77,8 @@ struct DecayOpacityRowsUniforms {
     float delta_logit;
     float min_opacity;
     uint32_t reset_moments;
+    uint32_t respect_protected_states;
+    uint32_t num_groups;
 };
 
 struct CompactUniforms {
@@ -711,10 +713,15 @@ void compactGatherSH(
 
 // Sparse logit-space opacity decay for contradicted splats (RayGuard):
 // decays scales_opacs[r].w in logit space without full-buffer readback/upload,
-// and optionally zeroes ONLY the opacity (.w) Adam moments of affected rows.
-layout(binding=0) StructuredBuffer<uint32_t> rows;           // (R,) splat indices
+// optionally protects PREDICTED_UNOBSERVED (0), OBSERVED_UNCERTAIN (1), METRIC_VERIFIED (3),
+// and IMAGINED (1) / LOCKED (2) structural groups, and optionally zeroes ONLY the opacity (.w)
+// Adam moments of affected rows.
+layout(binding=0) StructuredBuffer<uint32_t> rows;           // (R,) deduplicated splat indices
 layout(binding=1) RWStructuredBuffer<float4> scales_opacs;   // (N, 4)
 layout(binding=2) RWStructuredBuffer<float4> g_scales_opacs; // (N, 2, 4)
+layout(binding=3) StructuredBuffer<int32_t> group_ids;       // (N,)
+layout(binding=4) StructuredBuffer<uint32_t> group_state;    // (G,) 0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED
+layout(binding=5) StructuredBuffer<uint32_t> splat_state;    // (N,)
 
 #define decayOpacityRows main
 
@@ -727,6 +734,17 @@ void decayOpacityRows(
     if (t >= uniforms.num_rows)
         return;
     const uint32_t r = rows[t];
+    if (uniforms.respect_protected_states != 0u) {
+        const uint32_t st = splat_base_state(splat_state[r]);
+        if (st == 0u || st == 1u || st == 3u)
+            return;
+        const int32_t gid = group_ids[r];
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
+            const uint32_t gst = group_state[gid];
+            if (gst == 1u || gst == 2u)
+                return;
+        }
+    }
     float4 so = scales_opacs[r];
     const float p = clamp(so.w, 1e-7f, 1.0f - 1e-7f);
     const float logit = log(p / (1.0f - p)) - uniforms.delta_logit;

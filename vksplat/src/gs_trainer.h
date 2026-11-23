@@ -295,8 +295,13 @@ public:
     void reanchor_splats_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows,
                                 const float* xyz, const float* scales, const float* quats,
                                 const float* sh_dc, const uint32_t* states, size_t count);
+    // Sparse GPU-resident logit-space opacity decay.
+    // Deduplicates `rows` on host before dispatch and validates `delta_logit >= 0` and `0 < min_opacity < 1`.
+    // Index-lifetime contract: `rows` are valid only within the current compaction/Morton epoch and must NOT
+    // be deferred across ADC prune/split or MCMC relocation/compaction.
     void decay_opacities_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, size_t count,
-                                float delta_logit, float min_opacity = 1e-4f, bool reset_moments = true);
+                                float delta_logit, float min_opacity = 1e-4f, bool reset_moments = true,
+                                bool respect_protected_states = true);
     void retract_group_sparse(VulkanGSPipelineBuffers& buffers, int32_t group_id);
     void clamp_scales(VulkanGSPipelineBuffers& buffers, float max_scale, float tangent_cap);
     // Rewrites geometry (xyz, scales, quats; rows in ascending splat index of the group) and resets the geometry
@@ -368,7 +373,7 @@ private:
         _ComputePipeline update_group_rows = _ComputePipeline(8);
         _ComputePipeline compact_gather = _ComputePipeline(3);
         _ComputePipeline compact_gather_sh = _ComputePipeline(3);
-        _ComputePipeline decay_opacity_rows = _ComputePipeline(3);
+        _ComputePipeline decay_opacity_rows = _ComputePipeline(6);
     } pipeline_mcmc;
     struct _MortonSortComputePipeline {
         _ComputePipeline compute_stats = _ComputePipeline(2);

@@ -3265,8 +3265,15 @@ void VulkanGSTrainer::decay_opacities_sparse(
     size_t count,
     float delta_logit,
     float min_opacity,
-    bool reset_moments
+    bool reset_moments,
+    bool respect_protected_states
 ) {
+    if (!std::isfinite(delta_logit) || delta_logit < 0.0f) {
+        throw std::invalid_argument("decay_opacities_sparse: delta_logit must be finite and >= 0");
+    }
+    if (!std::isfinite(min_opacity) || min_opacity <= 0.0f || min_opacity >= 1.0f) {
+        throw std::invalid_argument("decay_opacities_sparse: min_opacity must be finite and in (0, 1)");
+    }
     if (count == 0 || buffers.num_splats == 0 || rows == nullptr)
         return;
     std::vector<uint32_t> valid_rows;
@@ -3277,25 +3284,33 @@ void VulkanGSTrainer::decay_opacities_sparse(
             valid_rows.push_back(r);
         }
     }
-    const size_t n_valid = valid_rows.size();
-    if (n_valid == 0)
+    if (valid_rows.empty())
         return;
+    std::sort(valid_rows.begin(), valid_rows.end());
+    valid_rows.erase(std::unique(valid_rows.begin(), valid_rows.end()), valid_rows.end());
+    const size_t n_valid = valid_rows.size();
 
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
     resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * buffers.num_splats, true);
     resizeDeviceBuffer(group_op_rows, n_valid);
     uploadDeviceSlice(group_op_rows.deviceBuffer, 0, valid_rows.data(), n_valid * sizeof(uint32_t));
 
     {
         DEVICE_GUARD;
-        Uniform32_t uniforms[4];
+        Uniform32_t uniforms[6];
         uniforms[0].u = static_cast<uint32_t>(n_valid);
         uniforms[1].f = delta_logit;
         uniforms[2].f = min_opacity;
         uniforms[3].u = reset_moments ? 1u : 0u;
+        uniforms[4].u = respect_protected_states ? 1u : 0u;
+        uniforms[5].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
         bufferMemoryBarrier({
             { group_op_rows.deviceBuffer, TRANSFER_WRITE },
             { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
             { buffers.g_scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ_WRITE);
         executeCompute(
             {{n_valid, 64}},
@@ -3305,6 +3320,9 @@ void VulkanGSTrainer::decay_opacities_sparse(
                 group_op_rows.deviceBuffer,
                 buffers.scales_opacs.deviceBuffer,
                 buffers.g_scales_opacs.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
             }
         );
         bufferMemoryBarrier({

@@ -595,12 +595,11 @@ public:
         py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
         float delta_logit,
         float min_opacity = 1e-4f,
-        bool reset_moments = true
+        bool reset_moments = true,
+        bool respect_protected_states = true
     ) {
         size_t n = static_cast<size_t>(rows.size());
-        if (n == 0)
-            return;
-        trainer.decay_opacities_sparse(buffers, rows.data(), n, delta_logit, min_opacity, reset_moments);
+        trainer.decay_opacities_sparse(buffers, rows.data(), n, delta_logit, min_opacity, reset_moments, respect_protected_states);
     }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
@@ -1696,8 +1695,9 @@ PYBIND11_MODULE(vksplat, m) {
         .def("reanchor_splats_sparse", &VkSplat::reanchor_splats_sparse, "Pre-step sparse re-anchoring of observed structural surfels onto measured depth + RGB",
              py::arg("rows"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"), py::arg("sh_dc"), py::arg("states"))
         .def("decay_opacities_sparse", &VkSplat::decay_opacities_sparse,
-             "GPU-resident sparse logit-space opacity decay for contradicted splats (uploads only row indices, no full-buffer readback/upload)",
-             py::arg("rows"), py::arg("delta_logit") = 2.5f, py::arg("min_opacity") = 1e-4f, py::arg("reset_moments") = true)
+             "GPU-resident sparse logit-space opacity decay for contradicted splats (deduplicates rows, validates parameters, protects unobserved/verified/locked states)",
+             py::arg("rows"), py::arg("delta_logit") = 2.5f, py::arg("min_opacity") = 1e-4f,
+             py::arg("reset_moments") = true, py::arg("respect_protected_states") = true)
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
         .def("set_sparse_backward", &VkSplat::set_sparse_backward,
              "Sparse tile backward: quantile in [0,1) (0 = dense), halo tiles, every full_every-th step dense",
