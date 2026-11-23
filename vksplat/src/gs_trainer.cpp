@@ -754,6 +754,11 @@ void VulkanGSTrainer::load_colmap_dataset(
     cell_credits_host.clear();
     cell_eligible_host.clear();
     splat_group_ids.assign(numPoints, -1);
+    splat_uids.resize(numPoints);
+    next_splat_uid_ = 1u;
+    for (size_t i = 0; i < numPoints; ++i) {
+        splat_uids[i] = next_splat_uid_++;
+    }
     if (config.selective_plane_freeze) {
         std::string group_bin_path = resolveDatasetFile("plane_group_ids.bin");
         if (std::filesystem::exists(group_bin_path)) {
@@ -1452,6 +1457,17 @@ void VulkanGSTrainer::executeDefaultPostBackward(
         auto propagateSpawnedMetadata = [&](size_t base_n, int count) {
             if (count <= 0)
                 return;
+            // Always assign fresh monotonic UIDs to newly spawned duplicate/split children
+            if (splat_uids.size() < base_n) {
+                size_t old_sz = splat_uids.size();
+                splat_uids.resize(base_n);
+                for (size_t i = old_sz; i < base_n; ++i)
+                    splat_uids[i] = next_splat_uid_++;
+            }
+            splat_uids.resize(base_n + static_cast<size_t>(count));
+            for (int k = 0; k < count; ++k) {
+                splat_uids[base_n + static_cast<size_t>(k)] = next_splat_uid_++;
+            }
             if (splat_group_ids.empty() && splat_entity_ids.empty() && splat_states.empty() &&
                 splat_anchors_host.empty() && !use_local_cell_credits_)
                 return;
@@ -1625,7 +1641,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
 
         if (num_prune > 0) {
             if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() ||
-                !splat_anchors_host.empty() || use_local_cell_credits_) {
+                !splat_anchors_host.empty() || use_local_cell_credits_ || !splat_uids.empty()) {
                 syncHostMetadataSize(num_splats);
                 copyFromDevice(buffers.default_keep_mask);
                 auto filterScalar = [&](auto& vec, auto fill) {
@@ -1641,6 +1657,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
                 };
                 if (!splat_group_ids.empty()) filterScalar(splat_group_ids, int32_t(-1));
                 if (!splat_entity_ids.empty()) filterScalar(splat_entity_ids, int32_t(-1));
+                if (!splat_uids.empty()) filterScalar(splat_uids, uint64_t(0u));
                 if (!splat_states.empty()) filterScalar(splat_states, uint32_t(5u));
                 if (use_local_cell_credits_) filterScalar(splat_cell_ids, int32_t(-1));
                 if (!splat_anchors_host.empty()) {
@@ -1989,13 +2006,19 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                 }
             );
 
-            // MC-1: Update splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host, splat_cell_ids for relocated dead splats
-            if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_) {
+            // MC-1: Update splat_group_ids, splat_entity_ids, splat_uids, splat_states, splat_anchors_host, splat_cell_ids for relocated dead splats
+            if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_ || !splat_uids.empty()) {
                 copyFromDevice(buffers.mcmc_index_map);
                 if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
                     splat_group_ids.resize(num_splats, -1);
                 if (!splat_entity_ids.empty() && splat_entity_ids.size() < num_splats)
                     splat_entity_ids.resize(num_splats, -1);
+                if (splat_uids.size() < num_splats) {
+                    size_t old_sz = splat_uids.size();
+                    splat_uids.resize(num_splats);
+                    for (size_t k = old_sz; k < num_splats; ++k)
+                        splat_uids[k] = next_splat_uid_++;
+                }
                 if (!splat_states.empty() && splat_states.size() < num_splats)
                     splat_states.resize(num_splats, 0xFFFFFFFFu);
                 if (!splat_anchors_host.empty() && splat_anchors_host.size() < 8 * num_splats)
@@ -2021,6 +2044,8 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                         if (!splat_entity_ids.empty()) {
                             splat_entity_ids[i] = old_eids[src];
                         }
+                        // Relocated dead splat becomes a brand-new Gaussian identity (never inherits old evidence)
+                        splat_uids[i] = next_splat_uid_++;
                         if (!splat_states.empty()) {
                             splat_states[i] = old_sts[src];
                         }
@@ -2193,6 +2218,16 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     resizeAndCopyDeviceBuffer(buffers.splat_anchor, 8 * alloc_size, false);
                 if (use_local_cell_credits_)
                     resizeAndCopyDeviceBuffer(buffers.splat_cell_ids, alloc_size, false);
+                if (splat_uids.size() < num_splats) {
+                    size_t old_sz = splat_uids.size();
+                    splat_uids.resize(num_splats);
+                    for (size_t k = old_sz; k < num_splats; ++k)
+                        splat_uids[k] = next_splat_uid_++;
+                }
+                splat_uids.resize(new_num_splats);
+                for (size_t k = 0; k < num_add; ++k) {
+                    splat_uids[num_splats + k] = next_splat_uid_++;
+                }
                 if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_) {
                     copyFromDevice(buffers.mcmc_index_map);
                     if (!splat_group_ids.empty()) {
@@ -2466,9 +2501,9 @@ void VulkanGSTrainer::executeMortonSorting(
     applyIndex(buffers.default_grad, 2);
     barrierAllGaussParams(buffers);
 
-    // MC-1: Permute splat_group_ids, splat_entity_ids, splat_states, splat_anchors_host, and splat_cell_ids to match Morton-sorted order
+    // MC-1: Permute splat_group_ids, splat_entity_ids, splat_uids, splat_states, splat_anchors_host, and splat_cell_ids to match Morton-sorted order
     if (!splat_group_ids.empty() || !splat_entity_ids.empty() || !splat_states.empty() ||
-        !splat_anchors_host.empty() || use_local_cell_credits_) {
+        !splat_anchors_host.empty() || use_local_cell_credits_ || !splat_uids.empty()) {
         copyFromDevice(buffers.sorted_gauss_idx());
         const auto& idx_buf = buffers.sorted_gauss_idx();
         auto permuteScalar = [&](auto& vec, auto fill) {
@@ -2490,6 +2525,9 @@ void VulkanGSTrainer::executeMortonSorting(
         }
         if (!splat_entity_ids.empty()) {
             permuteScalar(splat_entity_ids, int32_t(-1));
+        }
+        if (!splat_uids.empty()) {
+            permuteScalar(splat_uids, uint64_t(0u));
         }
         if (!splat_states.empty()) {
             permuteScalar(splat_states, uint32_t(5u));
@@ -3259,7 +3297,7 @@ void VulkanGSTrainer::reanchor_splats_sparse(
     }
 }
 
-void VulkanGSTrainer::decay_opacities_sparse(
+VulkanGSTrainer::DecayOpacityStats VulkanGSTrainer::decay_opacities_sparse(
     VulkanGSPipelineBuffers& buffers,
     const uint32_t* rows,
     size_t count,
@@ -3274,31 +3312,66 @@ void VulkanGSTrainer::decay_opacities_sparse(
     if (!std::isfinite(min_opacity) || min_opacity <= 0.0f || min_opacity >= 1.0f) {
         throw std::invalid_argument("decay_opacities_sparse: min_opacity must be finite and in (0, 1)");
     }
-    if (count == 0 || buffers.num_splats == 0 || rows == nullptr)
-        return;
+    DecayOpacityStats stats;
+    stats.proposed = count;
+    if (count == 0 || buffers.num_splats == 0 || rows == nullptr) {
+        stats.skipped_out_of_range = (buffers.num_splats == 0) ? count : 0;
+        return stats;
+    }
     std::vector<uint32_t> valid_rows;
     valid_rows.reserve(count);
     for (size_t k = 0; k < count; ++k) {
         uint32_t r = rows[k];
         if (r < buffers.num_splats) {
             valid_rows.push_back(r);
+        } else {
+            stats.skipped_out_of_range++;
         }
     }
     if (valid_rows.empty())
-        return;
+        return stats;
     std::sort(valid_rows.begin(), valid_rows.end());
     valid_rows.erase(std::unique(valid_rows.begin(), valid_rows.end()), valid_rows.end());
-    const size_t n_valid = valid_rows.size();
+    stats.deduped = valid_rows.size();
+
+    std::vector<uint32_t> eligible_rows;
+    eligible_rows.reserve(valid_rows.size());
+    for (uint32_t r : valid_rows) {
+        bool prot = false;
+        if (respect_protected_states) {
+            if (r < splat_states.size()) {
+                uint32_t base = splat_states[r] & 0xFFFFu;
+                if (base == 0u || base == 1u || base == 3u)
+                    prot = true;
+            }
+            if (!prot && r < splat_group_ids.size()) {
+                int32_t gid = splat_group_ids[r];
+                if (gid >= 0 && static_cast<size_t>(gid) < buffers.group_state.size()) {
+                    uint32_t gst = buffers.group_state[gid];
+                    if (gst == 1u || gst == 2u)
+                        prot = true;
+                }
+            }
+        }
+        if (prot) {
+            stats.skipped_protected++;
+        } else {
+            eligible_rows.push_back(r);
+        }
+    }
+    stats.applied = eligible_rows.size();
+    if (eligible_rows.empty())
+        return stats;
 
     ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
     resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * buffers.num_splats, true);
-    resizeDeviceBuffer(group_op_rows, n_valid);
-    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, valid_rows.data(), n_valid * sizeof(uint32_t));
+    resizeDeviceBuffer(group_op_rows, eligible_rows.size());
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, eligible_rows.data(), eligible_rows.size() * sizeof(uint32_t));
 
     {
         DEVICE_GUARD;
         Uniform32_t uniforms[6];
-        uniforms[0].u = static_cast<uint32_t>(n_valid);
+        uniforms[0].u = static_cast<uint32_t>(eligible_rows.size());
         uniforms[1].f = delta_logit;
         uniforms[2].f = min_opacity;
         uniforms[3].u = reset_moments ? 1u : 0u;
@@ -3313,7 +3386,7 @@ void VulkanGSTrainer::decay_opacities_sparse(
             { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
         }, COMPUTE_SHADER_READ_WRITE);
         executeCompute(
-            {{n_valid, 64}},
+            {{eligible_rows.size(), 64}},
             &uniforms, sizeof(uniforms),
             pipeline_mcmc.decay_opacity_rows,
             {
@@ -3330,6 +3403,7 @@ void VulkanGSTrainer::decay_opacities_sparse(
             { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
         }, COMPUTE_SHADER_READ_WRITE);
     }
+    return stats;
 }
 
 void VulkanGSTrainer::retract_group_sparse(
@@ -3564,6 +3638,18 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
     };
     remap(splat_group_ids);
     remap(splat_entity_ids);
+    if (!splat_uids.empty()) {
+        if (splat_uids.size() < old_n) {
+            size_t old_sz = splat_uids.size();
+            splat_uids.resize(old_n);
+            for (size_t k = old_sz; k < old_n; ++k)
+                splat_uids[k] = next_splat_uid_++;
+        }
+        std::vector<uint64_t> out_uid(new_n);
+        for (size_t k = 0; k < new_n; ++k)
+            out_uid[k] = splat_uids[keep[k]];
+        splat_uids = std::move(out_uid);
+    }
     if (use_local_cell_credits_)
         remap(splat_cell_ids);
     if (!splat_states.empty()) {
@@ -3778,6 +3864,16 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         splat_group_ids.resize(old_n, -1);
     splat_group_ids.resize(new_n, -1);
     std::memcpy(splat_group_ids.data() + old_n, add_gids.data(), n_add * sizeof(int32_t));
+    if (splat_uids.size() < old_n) {
+        size_t old_sz = splat_uids.size();
+        splat_uids.resize(old_n);
+        for (size_t k = old_sz; k < old_n; ++k)
+            splat_uids[k] = next_splat_uid_++;
+    }
+    splat_uids.resize(new_n);
+    for (size_t k = 0; k < n_add; ++k) {
+        splat_uids[old_n + k] = next_splat_uid_++;
+    }
     if (new_splat_states != nullptr || !splat_states.empty()) {
         if (splat_states.size() < old_n)
             splat_states.resize(old_n, 0xFFFFFFFFu);

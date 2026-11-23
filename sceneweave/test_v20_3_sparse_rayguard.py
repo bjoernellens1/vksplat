@@ -114,7 +114,52 @@ def test_decay_opacities_sparse_protected_states_and_groups(tmp_path):
         assert so_after[idx, 3] < so_before[idx, 3] - 1e-3, f"Eligible row {idx} was not decayed!"
 
     # Explicit override respect_protected_states=False decays protected rows too
-    mod.decay_opacities_sparse(np.array([0, 3], dtype=np.uint32), 3.0, 1e-4, True, False)
+    st_override = mod.decay_opacities_sparse(np.array([0, 3], dtype=np.uint32), 3.0, 1e-4, True, False)
+    assert st_override == {"proposed": 2, "deduped": 2, "skipped_out_of_range": 0, "skipped_protected": 0, "applied": 2}
     so_override = np.asarray(mod.get_scales_opacities_packed(), dtype=np.float32).reshape(-1, 4)
     assert so_override[0, 3] < so_before[0, 3] - 1e-3
     assert so_override[3, 3] < so_before[3, 3] - 1e-3
+
+
+def test_splat_uids_lifecycle_and_decay_stats(tmp_path):
+    ds = sc.build_dataset(tmp_path / "ds", n_points=128, w=64, h=48)
+    mod = sc.new_trainer(ds, tmp_path / "out", mcmc_protect_structural_groups=True)
+    uids0 = np.asarray(mod.get_splat_uids(), dtype=np.uint64)
+    assert len(uids0) == 128
+    assert len(np.unique(uids0)) == 128
+
+    # Append preserves existing UIDs and assigns strictly larger monotonic UIDs
+    rng = np.random.default_rng(7)
+    mod.append_splats_preserving_optimizer(*sc.make_batch(rng, 24, 10))
+    mod.append_splats_preserving_optimizer(*sc.make_batch(rng, 16, 11))
+    uids1 = np.asarray(mod.get_splat_uids(), dtype=np.uint64)
+    assert len(uids1) == 168
+    assert np.array_equal(uids1[:128], uids0)
+    assert np.all(uids1[128:] > uids0.max())
+    assert len(np.unique(uids1)) == 168
+
+    # Compact retracted group 10 preserves exact UIDs of surviving splats (0..127 and group 11)
+    mod.set_group_state(10, 3)  # RETRACTED
+    mod.compact_retracted()
+    uids2 = np.asarray(mod.get_splat_uids(), dtype=np.uint64)
+    assert len(uids2) == 144
+    assert np.array_equal(uids2[:128], uids0)
+    assert np.array_equal(uids2[128:], uids1[152:])
+
+    # Snapshot / restore round-trip preserves splat_uids bit-identically
+    snap = mod.snapshot_optimizer_state()
+    mod.append_splats_preserving_optimizer(*sc.make_batch(rng, 8, 12))
+    assert len(mod.get_splat_uids()) == 152
+    mod.restore_optimizer_state(snap)
+    assert np.array_equal(np.asarray(mod.get_splat_uids(), dtype=np.uint64), uids2)
+
+    # Exact DecayOpacityStats accounting (duplicates + OOB + protected + eligible)
+    states = np.full((len(uids2),), 5, dtype=np.uint32)
+    states[0] = 3  # METRIC_VERIFIED (protected)
+    mod.set_splat_states(states)
+    st = mod.decay_opacities_sparse(np.array([0, 0, 2, 2, 3, 99999], dtype=np.uint32), 2.5, 1e-4, True, True)
+    assert st["proposed"] == 6
+    assert st["skipped_out_of_range"] == 1
+    assert st["deduped"] == 3
+    assert st["skipped_protected"] == 1
+    assert st["applied"] == 2
