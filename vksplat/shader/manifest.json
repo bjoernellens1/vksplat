@@ -31,7 +31,7 @@
         "mcmc.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
-                "slang/mcmc.slang": "bee7fc1130376445b4d2ffd8f7841779ab62fe3a4b148dded5c67f743fb5caf6",
+                "slang/mcmc.slang": "17729166437bb82765d443486752f92be3526deebc51767603ad2dfead8c553f",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
             "outputs": {
@@ -43,6 +43,7 @@
                 "shader/generated/mcmc_compute_probs.spv": "09270eb2c554f83df8666469244e2fd59c2621cb3c92c2cb52f3c872db6eac78",
                 "shader/generated/mcmc_compute_relocation.spv": "f32591d8be8c2120aabd63e9f38b6e3846cb26b16cca640826a43d953fe2c365",
                 "shader/generated/mcmc_compute_relocation_index_map.spv": "6f71535444ce38fcae2806f284e137921ac174dad4f7f62c05ea424f1c097af2",
+                "shader/generated/mcmc_decay_opacity_rows.spv": "90614241e0e6ae307a04be33f23c1bdc81509cfbda2b9c50494dd9de9e83c549",
                 "shader/generated/mcmc_inject_noise.spv": "91a7202b0334d8238368f687d11aa64330431144ebaef7f0136fe4d3e01477cd",
                 "shader/generated/mcmc_mask_retracted_group.spv": "f9e85b5b5e4ca3d7f072a5fc4a021ad1e60a2b9869b059cdd1e89b835696b921",
                 "shader/generated/mcmc_update_add.spv": "b2e7dbf58f17d5f92770e34e6a289aa30a6fe026dd03bd35766ad4f917bf0820",

@@ -162,6 +162,7 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_mcmc.update_group_rows, spirv_paths.at("mcmc_update_group_rows"));
     createComputePipeline(pipeline_mcmc.compact_gather, spirv_paths.at("mcmc_compact_gather"));
     createComputePipeline(pipeline_mcmc.compact_gather_sh, spirv_paths.at("mcmc_compact_gather_sh"));
+    createComputePipeline(pipeline_mcmc.decay_opacity_rows, spirv_paths.at("mcmc_decay_opacity_rows"));
     createComputePipeline(pipeline_morton_sort.compute_stats, spirv_paths.at("morton_sort_compute_stats"));
     createComputePipeline(pipeline_morton_sort.generate_keys, spirv_paths.at("morton_sort_generate_keys"));
     createComputePipeline(pipeline_morton_sort.apply_indices, spirv_paths.at("morton_sort_apply_indices"));
@@ -3255,6 +3256,61 @@ void VulkanGSTrainer::reanchor_splats_sparse(
 
     if (states != nullptr) {
         set_splat_states_sparse(buffers, rows, states, count);
+    }
+}
+
+void VulkanGSTrainer::decay_opacities_sparse(
+    VulkanGSPipelineBuffers& buffers,
+    const uint32_t* rows,
+    size_t count,
+    float delta_logit,
+    float min_opacity,
+    bool reset_moments
+) {
+    if (count == 0 || buffers.num_splats == 0 || rows == nullptr)
+        return;
+    std::vector<uint32_t> valid_rows;
+    valid_rows.reserve(count);
+    for (size_t k = 0; k < count; ++k) {
+        uint32_t r = rows[k];
+        if (r < buffers.num_splats) {
+            valid_rows.push_back(r);
+        }
+    }
+    const size_t n_valid = valid_rows.size();
+    if (n_valid == 0)
+        return;
+
+    resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * buffers.num_splats, true);
+    resizeDeviceBuffer(group_op_rows, n_valid);
+    uploadDeviceSlice(group_op_rows.deviceBuffer, 0, valid_rows.data(), n_valid * sizeof(uint32_t));
+
+    {
+        DEVICE_GUARD;
+        Uniform32_t uniforms[4];
+        uniforms[0].u = static_cast<uint32_t>(n_valid);
+        uniforms[1].f = delta_logit;
+        uniforms[2].f = min_opacity;
+        uniforms[3].u = reset_moments ? 1u : 0u;
+        bufferMemoryBarrier({
+            { group_op_rows.deviceBuffer, TRANSFER_WRITE },
+            { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+        executeCompute(
+            {{n_valid, 64}},
+            &uniforms, sizeof(uniforms),
+            pipeline_mcmc.decay_opacity_rows,
+            {
+                group_op_rows.deviceBuffer,
+                buffers.scales_opacs.deviceBuffer,
+                buffers.g_scales_opacs.deviceBuffer,
+            }
+        );
+        bufferMemoryBarrier({
+            { buffers.scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { buffers.g_scales_opacs.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
     }
 }
 
