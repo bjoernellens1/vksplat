@@ -518,6 +518,7 @@ public:
         py::array_t<float, py::array::c_style | py::array::forcecast> sigma_n
     ) {
         constexpr uint32_t kSurfel2DFlag = 0x00010000u;
+        constexpr uint32_t kPromoted3DFlag = 0x00020000u;
         constexpr uint32_t kLegacyState = 0xFFFFFFFFu;
         if (rows.size() != sigma_n.size())
             throw std::invalid_argument("rows and sigma_n must have the same length");
@@ -536,7 +537,7 @@ public:
             uint32_t idx = rptr[k];
             if (idx >= n) continue;
             if (sts[idx] != kLegacyState) {
-                sts[idx] = sts[idx] & (~kSurfel2DFlag);
+                sts[idx] = (sts[idx] & (~kSurfel2DFlag)) | kPromoted3DFlag;
             }
             if ((4 * idx + 2) < buffers.scales_opacs.size()) {
                 buffers.scales_opacs[4 * idx + 2] = std::max(sptr[k], 1e-4f);

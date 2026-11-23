@@ -15,7 +15,7 @@
         },
         "morton_sort.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/morton_sort.slang": "2a887e3d31ebcee06043f879205f678ca2c9db14692c9ebec875056fe1169e15",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
@@ -30,7 +30,7 @@
         },
         "mcmc.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/mcmc.slang": "bee7fc1130376445b4d2ffd8f7841779ab62fe3a4b148dded5c67f743fb5caf6",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
@@ -52,7 +52,7 @@
         },
         "default.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/default.slang": "119bd8b0bd94066791ce5b15d155f96a3bc2a228b9f8fc3c7dd64668d93cec8f",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9"
             },
@@ -86,7 +86,7 @@
         },
         "sparse_tiles.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/sparse_tiles.slang": "affa98426d74240821d0c9684ff9a52789daa04173c2f198cc009375f4dafbf7"
             },
             "outputs": {
@@ -104,7 +104,7 @@
         },
         "fused_projection_backward_optimizer.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/fused_projection_backward_optimizer.slang": "a2069c6c737a7d97132d1c0ed3603a56f31a9ec906584b94d87307d6043491b9",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9",
@@ -143,7 +143,7 @@
                 "slang/alphablend_shader_bwd_per_pixel.slang": "0f11047642ba4508d78dcfa8db40570559b78451bde597d2f304d59536430cfd",
                 "slang/alphablend_shader_bwd_per_splat.slang": "1568430e083272b5044ff8ecbf80caccc3c5f08960ee2986dcec49e9b3975e1c",
                 "slang/alphablend_shader_bwd_tensor.slang": "075c20cf569375a809301ca1f70a1a658521dccd5d58e7d9a81a29d5d3b277aa",
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e"
             },
             "outputs": {
@@ -157,7 +157,7 @@
         },
         "tile_shader.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/tile_shader.slang": "ae4936128f5adb217cf74b19ea4be1ee90007ded10e22bb61b549afb43475676",
                 "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e"
             },
@@ -168,7 +168,7 @@
         },
         "vertex_shader.slang": {
             "sources": {
-                "slang/config.slang": "41e99e4ae1eb5bc55a5dbf60c39daf616b8d8613db14935de705fa3995c3d7ea",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
                 "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e",
                 "slang/vertex_shader.slang": "6c76579bef6b2ffa402ecd41ffd70d878142a56e4a63ad10fcbb2a2e43242462"

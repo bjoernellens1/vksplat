@@ -110,19 +110,29 @@ def test_surfel_2d_zero_normal_scale_and_promotion_to_3d():
 
         st2 = np.asarray(mod.get_splat_states(), dtype=np.uint32)
         assert np.all((st2[rows_prom] & 0x00010000) == 0), "Promoted rows must clear SURFEL_2D flag"
+        assert np.all((st2[rows_prom] & 0x00020000) != 0), "Promoted rows must set GPU-resident PROMOTED_3D bit 17"
         assert np.all((st2[rows_keep] & 0x00010000) != 0), "Unpromoted planar rows must remain SURFEL_2D"
+        assert np.all((st2[rows_keep] & 0x00020000) == 0), "Unpromoted planar rows must not set PROMOTED_3D"
         sc2 = np.asarray(mod.get_scales_opacities_packed(), dtype=np.float32).reshape(-1, 4)
         assert np.allclose(sc2[rows_prom, 2], 0.025, atol=1e-5)
         assert np.allclose(sc2[rows_keep, 2], 0.0, atol=1e-7)
 
-        # Train another 20 steps: 8 remain 2D (scales.z == 0), 24 are volumetric 3D (scales.z > 0)!
+        # Verify PROMOTED_3D bit 17 survives snapshot/restore and further Morton-sorted training steps!
+        snap = mod.snapshot_optimizer_state()
         for step in range(30, 50):
             mod.train_step(0, step)
         mod.render_train(0)
         st3 = np.asarray(mod.get_splat_states(), dtype=np.uint32)
         is_2d_3 = (st3 & 0x00010000) != 0
+        is_prom_3 = (st3 & 0x00020000) != 0
         assert int(is_2d_3.sum()) == 8
+        assert int(is_prom_3.sum()) == 8
         sc3 = np.asarray(mod.get_scales_opacities_packed(), dtype=np.float32).reshape(-1, 4)
         assert np.all(np.isfinite(sc3))
         assert np.all(sc3[~is_2d_3, 2] > 0.005)
         assert np.allclose(sc3[is_2d_3, 2], 0.0, atol=1e-7)
+
+        mod.restore_optimizer_state(snap)
+        st4 = np.asarray(mod.get_splat_states(), dtype=np.uint32)
+        assert int(((st4 & 0x00010000) != 0).sum()) == 8
+        assert int(((st4 & 0x00020000) != 0).sum()) == 8
