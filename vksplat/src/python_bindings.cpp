@@ -165,6 +165,7 @@ public:
             "mcmc_update_group_rows",
             "mcmc_compact_gather",
             "mcmc_compact_gather_sh",
+            "mcmc_decay_opacity_rows",
             "morton_sort_compute_stats",
             "morton_sort_generate_keys",
             "morton_sort_apply_indices",
@@ -590,6 +591,16 @@ public:
         const uint32_t* st_ptr = (states.size() == (py::ssize_t)n) ? states.data() : nullptr;
         trainer.reanchor_splats_sparse(buffers, rows.data(), xyz.data(), scales.data(), quats.data(), dc_ptr, st_ptr, n);
     }
+    void decay_opacities_sparse(
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> rows,
+        float delta_logit,
+        float min_opacity = 1e-4f,
+        bool reset_moments = true,
+        bool respect_protected_states = true
+    ) {
+        size_t n = static_cast<size_t>(rows.size());
+        trainer.decay_opacities_sparse(buffers, rows.data(), n, delta_logit, min_opacity, reset_moments, respect_protected_states);
+    }
     void set_freeze_skip_backward(bool enabled) { config.freeze_skip_backward = enabled; }
     void set_async_frame_upload(bool enabled) { trainer.waitUploads(); trainer.async_frame_upload = enabled; }
     void force_backward_variant(int impl) { trainer.forceBackwardImpl(impl); }
@@ -886,17 +897,17 @@ public:
             snap["splat_anchor"] = buffer_to_array<float, float>(buffers.splat_anchor, 8, (size_t)-1, "mean");
         }
         if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.g_xyz_ws.deviceSize() > 0) {
-            snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws, 6, (size_t)-1, "mean");
-            snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1, 48, (size_t)-1, "mean");
-            snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2, 48, (size_t)-1, "mean");
-            snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations, 8, (size_t)-1, "mean");
-            snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs, 8, (size_t)-1, "mean");
+            snap["g_xyz_ws"] = buffer_to_array<float, float>(buffers.g_xyz_ws);
+            snap["g_sh_coeffs_1"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_1);
+            snap["g_sh_coeffs_2"] = buffer_to_array<float, float>(buffers.g_sh_coeffs_2);
+            snap["g_rotations"] = buffer_to_array<float, float>(buffers.g_rotations);
+            snap["g_scales_opacs"] = buffer_to_array<float, float>(buffers.g_scales_opacs);
         }
         if (buffers.default_grad.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_grad.deviceSize() > 0) {
-            snap["default_grad"] = buffer_to_array<float, float>(buffers.default_grad, 2, (size_t)-1, "mean");
+            snap["default_grad"] = buffer_to_array<float, float>(buffers.default_grad);
         }
         if (buffers.default_radii.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_radii.deviceSize() > 0) {
-            snap["default_radii"] = buffer_to_array<float, float>(buffers.default_radii, 1, (size_t)-1, "mean");
+            snap["default_radii"] = buffer_to_array<float, float>(buffers.default_radii);
         }
         return snap;
     }
@@ -1683,6 +1694,10 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_anchors", &VkSplat::get_splat_anchors, "Read back per-splat (N, 8) normalized anchors")
         .def("reanchor_splats_sparse", &VkSplat::reanchor_splats_sparse, "Pre-step sparse re-anchoring of observed structural surfels onto measured depth + RGB",
              py::arg("rows"), py::arg("xyz_norm"), py::arg("scales_norm"), py::arg("quats_norm"), py::arg("sh_dc"), py::arg("states"))
+        .def("decay_opacities_sparse", &VkSplat::decay_opacities_sparse,
+             "GPU-resident sparse logit-space opacity decay for contradicted splats (deduplicates rows, validates parameters, protects unobserved/verified/locked states)",
+             py::arg("rows"), py::arg("delta_logit") = 2.5f, py::arg("min_opacity") = 1e-4f,
+             py::arg("reset_moments") = true, py::arg("respect_protected_states") = true)
         .def("supports_imagined_protection", [](VkSplat&) { return true; }, "True when the optimizer and MCMC kernels keep IMAGINED (state 1) group geometry/opacity frozen")
         .def("set_sparse_backward", &VkSplat::set_sparse_backward,
              "Sparse tile backward: quantile in [0,1) (0 = dense), halo tiles, every full_every-th step dense",

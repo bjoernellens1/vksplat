@@ -252,6 +252,7 @@ class ShaderCompiler:
                 ("compute_add_index_map", 20), ("compute_add", 21), ("update_add", 22),
                 ("mask_retracted_group", 30), ("clamp_scales", 31),
                 ("update_group_rows", 32), ("compact_gather", 33), ("compact_gather_sh", 34),
+                ("decay_opacity_rows", 35),
             ]
         ], ["strategy_utils.slang", "config.slang"]))
 

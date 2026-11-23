@@ -17,6 +17,7 @@
 #define MCMC_PHASE_UpdateGroupRows 32
 #define MCMC_PHASE_CompactGather 33
 #define MCMC_PHASE_CompactGatherSH 34
+#define MCMC_PHASE_DecayOpacityRows 35
 
 #ifndef MCMC_PHASE
 #define MCMC_PHASE -1
@@ -69,6 +70,15 @@ struct MaskGroupUniforms {
 
 struct UpdateGroupRowsUniforms {
     uint32_t num_rows;
+};
+
+struct DecayOpacityRowsUniforms {
+    uint32_t num_rows;
+    float delta_logit;
+    float min_opacity;
+    uint32_t reset_moments;
+    uint32_t respect_protected_states;
+    uint32_t num_groups;
 };
 
 struct CompactUniforms {
@@ -697,3 +707,54 @@ void compactGatherSH(
 }
 
 #endif  // MCMC_PHASE == MCMC_PHASE_CompactGatherSH
+
+
+#if MCMC_PHASE == MCMC_PHASE_DecayOpacityRows
+
+// Sparse logit-space opacity decay for contradicted splats (RayGuard):
+// decays scales_opacs[r].w in logit space without full-buffer readback/upload,
+// optionally protects PREDICTED_UNOBSERVED (0), OBSERVED_UNCERTAIN (1), METRIC_VERIFIED (3),
+// and IMAGINED (1) / LOCKED (2) structural groups, and optionally zeroes ONLY the opacity (.w)
+// Adam moments of affected rows.
+layout(binding=0) StructuredBuffer<uint32_t> rows;           // (R,) deduplicated splat indices
+layout(binding=1) RWStructuredBuffer<float4> scales_opacs;   // (N, 4)
+layout(binding=2) RWStructuredBuffer<float4> g_scales_opacs; // (N, 2, 4)
+layout(binding=3) StructuredBuffer<int32_t> group_ids;       // (N,)
+layout(binding=4) StructuredBuffer<uint32_t> group_state;    // (G,) 0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED
+layout(binding=5) StructuredBuffer<uint32_t> splat_state;    // (N,)
+
+#define decayOpacityRows main
+
+[numthreads(GROUP_SIZE_SPARSE, 1, 1)]
+void decayOpacityRows(
+    int32_t3 thread_id : SV_DispatchThreadID,
+    uniform DecayOpacityRowsUniforms uniforms
+) {
+    const uint32_t t = thread_id.x;
+    if (t >= uniforms.num_rows)
+        return;
+    const uint32_t r = rows[t];
+    if (uniforms.respect_protected_states != 0u) {
+        const uint32_t st = splat_base_state(splat_state[r]);
+        if (st == 0u || st == 1u || st == 3u)
+            return;
+        const int32_t gid = group_ids[r];
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
+            const uint32_t gst = group_state[gid];
+            if (gst == 1u || gst == 2u)
+                return;
+        }
+    }
+    float4 so = scales_opacs[r];
+    const float p = clamp(so.w, 1e-7f, 1.0f - 1e-7f);
+    const float logit = log(p / (1.0f - p)) - uniforms.delta_logit;
+    const float new_p = 1.0f / (1.0f + exp(-clamp(logit, -20.0f, 20.0f)));
+    so.w = max(new_p, uniforms.min_opacity);
+    scales_opacs[r] = so;
+    if (uniforms.reset_moments != 0u) {
+        g_scales_opacs[2u * r + 0u].w = 0.0f;
+        g_scales_opacs[2u * r + 1u].w = 0.0f;
+    }
+}
+
+#endif  // MCMC_PHASE == MCMC_PHASE_DecayOpacityRows
