@@ -141,6 +141,11 @@ void VulkanGSTrainer::cleanup() {
     ago_telemetry_buf_.shrink_to_fit();
     ago_telemetry_enabled_ = false;
     ago_last_step_ = 0;
+    destroyBuffer(ago_select_summary_buf_.deviceBuffer);
+    ago_select_summary_buf_.clear();
+    ago_select_summary_buf_.shrink_to_fit();
+    last_ago_summary_ = {};
+    ago_prev_mean_gain_ = 0.0f;
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -208,6 +213,7 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_morton_sort.update_buffer, spirv_paths.at("morton_sort_update_buffer"));
     createComputePipeline(pipeline_morton_sort.update_buffer_sh, spirv_paths.at("morton_sort_update_buffer_sh"));
     createComputePipeline(pipeline_appearance_init, spirv_paths.at("appearance_init"));
+    createComputePipeline(pipeline_ago_select_active_set, spirv_paths.at("ago_select_active_set"));
 
     rng.seed(42);
 }
@@ -1164,6 +1170,8 @@ void VulkanGSTrainer::reset_ago_telemetry(size_t num_splats) {
     DEVICE_GUARD;
     const size_t target_floats = 8 * std::max<size_t>(1, num_splats);
     clearDeviceBuffer(ago_telemetry_buf_, target_floats);
+    last_ago_summary_ = {};
+    ago_prev_mean_gain_ = 0.0f;
 }
 
 std::vector<float> VulkanGSTrainer::get_ago_telemetry_host(size_t num_splats) {
@@ -1191,6 +1199,180 @@ void VulkanGSTrainer::set_ago_telemetry_host(const float* data, size_t n_floats)
     HOST_GUARD;
     resizeDeviceBuffer(ago_telemetry_buf_, n_floats);
     uploadDeviceSlice(ago_telemetry_buf_.deviceBuffer, 0, data, n_floats * sizeof(float));
+}
+
+VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_active_set_gpu(
+    const TrainerConfig& config,
+    VulkanGSPipelineBuffers& buffers,
+    float gain_threshold,
+    float newborn_warmup_steps,
+    bool exclude_frozen
+) {
+    const size_t n = buffers.num_splats;
+    AgoActiveSetSummary summary{};
+    summary.num_gaussians = static_cast<uint32_t>(n);
+    summary.gain_threshold = gain_threshold;
+    if (n == 0) {
+        invalidateActiveIndexDispatch();
+        active_set_generation_ = map_generation_;
+        summary.active_fraction = 0.0f;
+        last_ago_summary_ = summary;
+        ago_prev_mean_gain_ = 0.0f;
+        return summary;
+    }
+
+    ensureGroupBuffersOnDevice(buffers, n);
+    if (ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_telemetry_buf_.deviceSize() < 8 * n) {
+        DEVICE_GUARD;
+        resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * n, true);
+    }
+    if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() < n) {
+        resizeDeviceBuffer(active_indices_buf_, n);
+    }
+    if (ago_select_summary_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_select_summary_buf_.deviceSize() < 4) {
+        resizeDeviceBuffer(ago_select_summary_buf_, 4);
+    }
+
+    uint32_t raw_summary[4] = {0u, 0u, 0u, 0u};
+    allocStagingBuffer(sizeof(raw_summary));
+    {
+        std::lock_guard<std::mutex> lock(stager.mutex);
+        {
+            DEVICE_GUARD;
+            vkCmdFillBuffer(
+                command_buffer,
+                ago_select_summary_buf_.deviceBuffer.buffer,
+                0,
+                sizeof(raw_summary),
+                0u
+            );
+
+            Uniform32_t u[8];
+            u[0].u = static_cast<uint32_t>(n);
+            u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+            u[2].u = config.mcmc_protect_structural_groups ? 1u : 0u;
+            u[3].u = exclude_frozen ? 1u : 0u;
+            u[4].f = gain_threshold;
+            u[5].f = newborn_warmup_steps;
+            u[6].u = 0u;
+            u[7].u = 0u;
+
+            bufferMemoryBarrier({
+                { ago_select_summary_buf_.deviceBuffer, TRANSFER_WRITE },
+                { ago_telemetry_buf_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { active_indices_buf_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+
+            executeCompute(
+                {{n, 256}},
+                &u, sizeof(u),
+                pipeline_ago_select_active_set,
+                {
+                    ago_telemetry_buf_.deviceBuffer,
+                    buffers.splat_state.deviceBuffer,
+                    buffers.group_ids.deviceBuffer,
+                    buffers.group_state.deviceBuffer,
+                    active_indices_buf_.deviceBuffer,
+                    ago_select_summary_buf_.deviceBuffer,
+                }
+            );
+
+            bufferMemoryBarrier({
+                { active_indices_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { ago_select_summary_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+
+            VkBufferCopy copy_region{};
+            copy_region.srcOffset = 0;
+            copy_region.dstOffset = 0;
+            copy_region.size = sizeof(raw_summary);
+            vkCmdCopyBuffer(
+                command_buffer,
+                ago_select_summary_buf_.deviceBuffer.buffer,
+                stager.buffer,
+                1,
+                &copy_region
+            );
+        }
+        HOST_GUARD;
+        void* mapped = nullptr;
+        vkMapMemory(device, stager.memory, 0, sizeof(raw_summary), 0, &mapped);
+        memcpy(raw_summary, mapped, sizeof(raw_summary));
+        vkUnmapMemory(device, stager.memory);
+    }
+
+    const uint32_t active_cnt = std::min<uint32_t>(raw_summary[0], static_cast<uint32_t>(n));
+    float total_gain = 0.0f;
+    float max_gain = 0.0f;
+    memcpy(&total_gain, &raw_summary[1], sizeof(float));
+    const uint32_t eligible_cnt = std::min<uint32_t>(raw_summary[2], static_cast<uint32_t>(n));
+    memcpy(&max_gain, &raw_summary[3], sizeof(float));
+    if (!std::isfinite(total_gain) || total_gain < 0.0f)
+        total_gain = 0.0f;
+    if (!std::isfinite(max_gain) || max_gain < 0.0f)
+        max_gain = 0.0f;
+
+    const float mean_gain = (eligible_cnt > 0u)
+        ? (total_gain / static_cast<float>(eligible_cnt))
+        : 0.0f;
+
+    active_set_generation_ = map_generation_;
+    if (active_cnt == 0u) {
+        // Cleanly fall back to full dispatch so training never stalls on an empty active set
+        active_splat_count_ = 0u;
+        use_active_index_dispatch_ = false;
+        summary.active_count = 0u;
+        summary.active_fraction = 0.0f;
+        summary.fell_back_to_full = true;
+    } else if (active_cnt < static_cast<uint32_t>(n)) {
+        active_splat_count_ = active_cnt;
+        use_active_index_dispatch_ = true;
+        summary.active_count = active_cnt;
+        summary.active_fraction = static_cast<float>(active_cnt) / static_cast<float>(n);
+        summary.fell_back_to_full = false;
+    } else {
+        active_splat_count_ = static_cast<uint32_t>(n);
+        use_active_index_dispatch_ = false;
+        summary.active_count = static_cast<uint32_t>(n);
+        summary.active_fraction = 1.0f;
+        summary.fell_back_to_full = false;
+    }
+
+    summary.eligible_count = eligible_cnt;
+    summary.total_predicted_gain = total_gain;
+    summary.mean_predicted_gain = mean_gain;
+    summary.max_predicted_gain = max_gain;
+
+    last_ago_summary_ = summary;
+    ago_prev_mean_gain_ = mean_gain;
+    return summary;
+}
+
+VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_adaptive_active_set_gpu(
+    const TrainerConfig& config,
+    VulkanGSPipelineBuffers& buffers,
+    float target_gain_ratio,
+    float newborn_warmup_steps,
+    bool exclude_frozen
+) {
+    const float ratio = std::isfinite(target_gain_ratio) ? std::max(0.0f, target_gain_ratio) : 0.0f;
+    const float thr = std::max(0.0f, ago_prev_mean_gain_ * ratio);
+    return select_ago_active_set_gpu(config, buffers, thr, newborn_warmup_steps, exclude_frozen);
+}
+
+VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::get_ago_step_gain_summary(size_t current_num_gaussians) const {
+    AgoActiveSetSummary out = last_ago_summary_;
+    if (out.num_gaussians == 0u && current_num_gaussians > 0) {
+        out.num_gaussians = static_cast<uint32_t>(current_num_gaussians);
+        out.active_count = use_active_index_dispatch_
+            ? active_splat_count_
+            : static_cast<uint32_t>(current_num_gaussians);
+        out.active_fraction = static_cast<float>(out.active_count) / static_cast<float>(current_num_gaussians);
+    }
+    return out;
 }
 
 void VulkanGSTrainer::set_train_depth(

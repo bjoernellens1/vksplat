@@ -347,6 +347,11 @@ class ShaderCompiler:
             ShaderJob("appearance_init", {}),
         ], ["config.slang"]))
 
+        # GPU-resident AGO-2 active-set compaction & step-gain summary
+        jobs.append(("ago_select_active_set.slang", [
+            ShaderJob("ago_select_active_set", {}),
+        ], ["config.slang"]))
+
         return jobs
 
     def compile_all(self, force: bool = False) -> bool:

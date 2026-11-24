@@ -190,6 +190,15 @@
             "outputs": {
                 "shader/generated/appearance_init.spv": "871ab7b9f7d1787d74677b951b4430e72fe4c7dc1d1fabe65323fc000af3edf5"
             }
+        },
+        "ago_select_active_set.slang": {
+            "sources": {
+                "slang/ago_select_active_set.slang": "ea201caa154db6764b669c95847628129b2e296c44477ace3b136c1a08642bb6",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
+            },
+            "outputs": {
+                "shader/generated/ago_select_active_set.spv": "c01f5301a2a5b69c3b55e9cd7c4c60ecb16a5b735b66c5b6fc48610ddca929dc"
+            }
         }
     }
 }

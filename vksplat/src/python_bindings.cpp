@@ -178,6 +178,7 @@ public:
             "morton_sort_update_buffer",
             "morton_sort_update_buffer_sh",
             "appearance_init",
+            "ago_select_active_set",
         };
         std::map<std::string, std::string> spirv_paths_dict;
         for (std::string name : spirv_paths) {
@@ -1141,6 +1142,47 @@ public:
         d["num_gaussians"] = n;
         d["step"] = trainer.get_ago_last_step();
         return d;
+    }
+
+    static py::dict _ago_summary_to_dict(const VulkanGSTrainer::AgoActiveSetSummary& s) {
+        py::dict d;
+        d["active_count"] = static_cast<int64_t>(s.active_count);
+        d["num_gaussians"] = static_cast<int64_t>(s.num_gaussians);
+        d["active_fraction"] = static_cast<double>(s.active_fraction);
+        d["total_predicted_gain"] = static_cast<double>(s.total_predicted_gain);
+        d["mean_predicted_gain"] = static_cast<double>(s.mean_predicted_gain);
+        d["max_predicted_gain"] = static_cast<double>(s.max_predicted_gain);
+        d["eligible_count"] = static_cast<int64_t>(s.eligible_count);
+        d["gain_threshold"] = static_cast<double>(s.gain_threshold);
+        d["fell_back_to_full"] = s.fell_back_to_full;
+        return d;
+    }
+
+    py::dict select_ago_active_set_gpu(
+        float gain_threshold = 0.0f,
+        float newborn_warmup_steps = 2.0f,
+        bool exclude_frozen = true
+    ) {
+        const auto s = trainer.select_ago_active_set_gpu(
+            config, buffers, gain_threshold, newborn_warmup_steps, exclude_frozen
+        );
+        return _ago_summary_to_dict(s);
+    }
+
+    py::dict select_ago_adaptive_active_set_gpu(
+        float target_gain_ratio = 0.5f,
+        float newborn_warmup_steps = 2.0f,
+        bool exclude_frozen = true
+    ) {
+        const auto s = trainer.select_ago_adaptive_active_set_gpu(
+            config, buffers, target_gain_ratio, newborn_warmup_steps, exclude_frozen
+        );
+        return _ago_summary_to_dict(s);
+    }
+
+    py::dict get_ago_step_gain_summary() const {
+        const auto s = trainer.get_ago_step_gain_summary(buffers.num_splats);
+        return _ago_summary_to_dict(s);
     }
 
     // D1 opt-in native differentiable physical expected-depth supervision
@@ -2853,6 +2895,18 @@ PYBIND11_MODULE(vksplat, m) {
              "Zero all accumulated AGO-0 per-Gaussian telemetry counters on device")
         .def("get_ago_telemetry", &VkSplat::get_ago_telemetry,
              "Read back per-Gaussian AGO-0 telemetry dict (grad_norm, update_norm, predicted_gain, abs_proj_grad, update_count, contrib_sum, last_step_updated, last_predicted_gain, num_gaussians, step)")
+        .def("select_ago_active_set_gpu", &VkSplat::select_ago_active_set_gpu,
+             "GPU-resident AGO-2 active-set compaction directly into active_indices_buf_ with 16-byte summary readback",
+             py::arg("gain_threshold") = 0.0f,
+             py::arg("newborn_warmup_steps") = 2.0f,
+             py::arg("exclude_frozen") = true)
+        .def("select_ago_adaptive_active_set_gpu", &VkSplat::select_ago_adaptive_active_set_gpu,
+             "Single-dispatch GPU-resident adaptive AGO-2 active-set selection using prev_mean_gain * target_gain_ratio",
+             py::arg("target_gain_ratio") = 0.5f,
+             py::arg("newborn_warmup_steps") = 2.0f,
+             py::arg("exclude_frozen") = true)
+        .def("get_ago_step_gain_summary", &VkSplat::get_ago_step_gain_summary,
+             "Return cached 16-byte GPU AGO-2 step-gain summary without per-Gaussian readback")
         .def("snapshot_ago_state", &VkSplat::snapshot_ago_state,
              "Take an exact byte-identical snapshot of Gaussian parameters, all Adam moments, strategy state, active set, and step for AGO-1 counterfactual probes")
         .def("restore_ago_state", &VkSplat::restore_ago_state,
