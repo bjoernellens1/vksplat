@@ -28,6 +28,10 @@ layout(binding=14) StructuredBuffer<uint32_t> group_state;
 layout(binding=15) StructuredBuffer<uint32_t> splat_state;
 layout(binding=16) StructuredBuffer<float4> splat_anchor;  // (N, 2): [0]=(p_meas_xyz, w_depth), [1]=(normal_xyz, w_plane)
 layout(binding=17) StructuredBuffer<uint32_t> active_indices;  // (active_splat_count,) compact non-frozen splat indices
+// AGO-0 opt-in per-Gaussian telemetry: 2 float4s (8 floats) per Gaussian:
+//   [2*i + 0] = (grad_norm, update_norm, predicted_gain, abs_proj_grad)  -- accumulated sums since reset
+//   [2*i + 1] = (update_count, contrib_sum, last_step_updated, last_predicted_gain)
+layout(binding=18) RWStructuredBuffer<float4> ago_telemetry;
 
 
 // Adam optimizer
@@ -78,6 +82,8 @@ struct ShaderUniforms {
     float normal_scale_cap;
     uint32_t active_splat_count;
     uint32_t use_active_index_dispatch;
+    uint32_t ago_telemetry_enabled;
+    uint32_t _ago_pad;
 };
 
 
@@ -227,13 +233,25 @@ void main(
     uint32_t g1_idx = 2*g_idx;
     uint32_t g2_idx = 2*g_idx+1;
 
+    const bool collect_ago = (uniforms.ago_telemetry_enabled != 0u);
+    float ago_grad_sq = 0.0f;
+    float ago_upd_sq = 0.0f;
+    float ago_pred_gain = 0.0f;
+
     // means
     if (!imagined) {
         float3 x = gauss.xyz_ws;
+        float3 x_old = x;
         float3 v = v_xyz_ws;
         float3 g1 = read_mean(g_idx, g_xyz_ws, 2, 0);
         float3 g2 = read_mean(g_idx, g_xyz_ws, 2, 1);
         optimizer_update(x, v, g1, g2, g1_sc, g2_sc, uniforms.lr_means);
+        if (collect_ago) {
+            float3 delta = x - x_old;
+            ago_grad_sq += dot(v, v);
+            ago_upd_sq += dot(delta, delta);
+            ago_pred_gain += -dot(v, delta);
+        }
         write_mean(x, g_idx, xyz_ws);
         write_mean(g1, g_idx, g_xyz_ws, 2, 0);
         write_mean(g2, g_idx, g_xyz_ws, 2, 1);
@@ -242,10 +260,17 @@ void main(
     // rotations (normalized)
     if (!imagined) {
         float4 x = gauss.rotations;
+        float4 x_old = x;
         float4 v = v_rotation; // TODO: should ideally project when NORMALIZE_QUATS_IN_OPTIMIZER is True
         float4 g1 = g_rotations[g1_idx];
         float4 g2 = g_rotations[g2_idx];
         optimizer_update(x, v, g1, g2, g1_sc, g2_sc, uniforms.lr_quats);
+        if (collect_ago) {
+            float4 delta = x - x_old;
+            ago_grad_sq += dot(v, v);
+            ago_upd_sq += dot(delta, delta);
+            ago_pred_gain += -dot(v, delta);
+        }
         rotations[g_idx] = bool(NORMALIZE_QUATS_IN_OPTIMIZER) ? normalize(x) : x;
         g_rotations[g1_idx] = g1;
         g_rotations[g2_idx] = g2;
@@ -267,6 +292,7 @@ void main(
             log(max(x.xyz, 1e-8)),  // scale: u = ln(x)
             log(max(x.w,1e-8) / max(1.0-x.w,1e-8))  // opacity: u = logit(x)
         );
+        float4 u_old = u;
         float4 dLdu = float4(
             v.xyz * x.xyz,  // scale: dL/du = dL/dx * dx/du = v * x
             v.w * x.w*(1.0-x.w)  // opacity: dL/du = dL/dx * dx/du = v * x(1-x)
@@ -277,6 +303,12 @@ void main(
         float lr_sz = is_surfel_2d ? 0.0f : uniforms.lr_scales;
         float4 lr = float4(uniforms.lr_scales, uniforms.lr_scales, lr_sz, opac_lr);
         optimizer_update(u, dLdu, g1, g2, g1_sc, g2_sc, lr);
+        if (collect_ago) {
+            float4 delta_u = u - u_old;
+            ago_grad_sq += dot(dLdu, dLdu);
+            ago_upd_sq += dot(delta_u, delta_u);
+            ago_pred_gain += -dot(dLdu, delta_u);
+        }
 
         // map (no blanket opacity floor: false priors remain retractable!)
         x.xyz = exp(u.xyz);  // scale: x = exp(u)
@@ -308,14 +340,43 @@ void main(
         float4 lr = (cid%12 == 0) ? float4(lr0, lr0, lr0, lr1) : float4(lr1);
 
         float4 x = get_sh_coeff_4(gauss.sh_coeffs, di);
+        float4 x_old = x;
         float4 v = is_zero_grad ? float4(0) :
             get_sh_coeff_4(v_gauss.d.sh_coeffs, di);
         // default optimizer (Adam)
         float4 g1 = g_sh_coeffs_1[bid];
         float4 g2 = g_sh_coeffs_2[bid];
         optimizer_update(x, v, g1, g2, g1_sc, g2_sc, lr);
+        if (collect_ago && di == 0) {
+            float3 v_dc = v.xyz;
+            float3 delta_dc = (x - x_old).xyz;
+            ago_grad_sq += dot(v_dc, v_dc);
+            ago_upd_sq += dot(delta_dc, delta_dc);
+            ago_pred_gain += -dot(v_dc, delta_dc);
+        }
         sh_coeffs[bid] = x;
         g_sh_coeffs_1[bid] = g1;
         g_sh_coeffs_2[bid] = g2;
+    }
+
+    if (collect_ago) {
+        float g_norm = sqrt(ago_grad_sq);
+        if (g_norm > 0.0f) {
+            float u_norm = sqrt(ago_upd_sq);
+            float proj_g = length(v_out_xy_vs);
+            uint base = 2u * g_idx;
+            float4 t0 = ago_telemetry[base + 0u];
+            float4 t1 = ago_telemetry[base + 1u];
+            t0.x += g_norm;
+            t0.y += u_norm;
+            t0.z += ago_pred_gain;
+            t0.w += proj_g;
+            t1.x += 1.0f;
+            t1.y += gauss.opacities;
+            t1.z = f_step;
+            t1.w = ago_pred_gain;
+            ago_telemetry[base + 0u] = t0;
+            ago_telemetry[base + 1u] = t1;
+        }
     }
 }

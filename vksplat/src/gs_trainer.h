@@ -245,6 +245,16 @@ public:
     uint64_t get_active_set_generation() const { return active_set_generation_; }
     uint32_t get_active_splat_count() const { return active_splat_count_; }
     bool get_use_active_index_dispatch() const { return use_active_index_dispatch_; }
+    std::vector<uint32_t> get_active_indices_host();
+
+    // AGO-0 opt-in zero-perturbation per-Gaussian telemetry (8 floats/Gaussian)
+    void set_ago_telemetry_enabled(bool enabled, size_t num_splats = 0);
+    bool get_ago_telemetry_enabled() const { return ago_telemetry_enabled_; }
+    void reset_ago_telemetry(size_t num_splats);
+    std::vector<float> get_ago_telemetry_host(size_t num_splats);
+    void set_ago_telemetry_host(const float* data, size_t n_floats);
+    int get_ago_last_step() const { return ago_last_step_; }
+    void set_ago_last_step(int step) { ago_last_step_ = step; }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
     void uploadFrameImage(Buffer<uint8_t>& image, const uint8_t* rgba_pixels, size_t n_bytes);
@@ -523,6 +533,11 @@ private:
     uint64_t map_generation_ = 1u;
     uint64_t active_set_generation_ = 0u;
 
+    // AGO-0 opt-in per-Gaussian telemetry (8 floats/Gaussian, zero overhead when disabled)
+    bool ago_telemetry_enabled_ = false;
+    Buffer<float> ago_telemetry_buf_;
+    int ago_last_step_ = 0;
+
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
@@ -532,7 +547,7 @@ private:
     _ComputePipeline pipeline_ssim_grad = _ComputePipeline(5);
     _ComputePipeline pipeline_ssim_stats_ds2 = _ComputePipeline(3);  // SSIM on the 2x2 box-averaged images
     _ComputePipeline pipeline_ssim_grad_ds2 = _ComputePipeline(5);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(18);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(19);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
         _ComputePipeline compute_grow_mask = _ComputePipeline(10);

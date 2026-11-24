@@ -1098,6 +1098,321 @@ public:
         }
     }
 
+    // AGO-0 opt-in zero-perturbation per-Gaussian telemetry
+    void set_ago_telemetry_enabled(bool enabled) {
+        size_t cap = buffers.num_splats;
+        if (config.strategy == TrainerConfig::Strategy::MCMC)
+            cap = std::max(cap, config.mcmc_alloc_cap());
+        trainer.set_ago_telemetry_enabled(enabled, cap);
+    }
+
+    bool get_ago_telemetry_enabled() const {
+        return trainer.get_ago_telemetry_enabled();
+    }
+
+    void reset_ago_telemetry() {
+        size_t cap = buffers.num_splats;
+        if (config.strategy == TrainerConfig::Strategy::MCMC)
+            cap = std::max(cap, config.mcmc_alloc_cap());
+        trainer.reset_ago_telemetry(cap);
+    }
+
+    py::dict get_ago_telemetry() {
+        const size_t n = buffers.num_splats;
+        std::vector<float> raw = trainer.get_ago_telemetry_host(n);
+        auto make_col = [&](size_t col) -> py::array_t<float> {
+            py::array_t<float> arr({static_cast<py::ssize_t>(n)});
+            float* dst = arr.mutable_data();
+            for (size_t i = 0; i < n; ++i) {
+                dst[i] = raw[8 * i + col];
+            }
+            return arr;
+        };
+        py::dict d;
+        d["grad_norm"] = make_col(0);
+        d["update_norm"] = make_col(1);
+        d["predicted_gain"] = make_col(2);
+        d["abs_proj_grad"] = make_col(3);
+        d["update_count"] = make_col(4);
+        d["contrib_sum"] = make_col(5);
+        d["last_step_updated"] = make_col(6);
+        d["last_predicted_gain"] = make_col(7);
+        d["num_gaussians"] = n;
+        d["step"] = trainer.get_ago_last_step();
+        return d;
+    }
+
+    // AGO-1 exact state snapshot & restore for byte-identical counterfactual gain probes
+    py::dict snapshot_ago_state() {
+        py::dict snap = snapshot_optimizer_state();
+        const size_t n = buffers.num_splats;
+        snap["num_gaussians"] = n;
+        snap["step"] = trainer.get_ago_last_step();
+
+        // Friendly parameter aliases alongside raw packed arrays
+        auto xyz_arr = snap["xyz_ws"].cast<py::array_t<float>>();
+        auto rot_arr = snap["rotations"].cast<py::array_t<float>>();
+        auto sh_arr = snap["sh_coeffs"].cast<py::array_t<float>>();
+        auto so_arr = snap["scales_opacs"].cast<py::array_t<float>>();
+        snap["means"] = xyz_arr;
+        snap["quats"] = rot_arr;
+
+        // Slice scales (N, 3), opacities (N,), sh0 (N, 1, 3), shN (N, 15, 3)
+        auto so_buf = so_arr.unchecked<2>();
+        py::array_t<float> scales_arr({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(3)});
+        py::array_t<float> opacs_arr({static_cast<py::ssize_t>(n)});
+        auto sc_mut = scales_arr.mutable_unchecked<2>();
+        auto op_mut = opacs_arr.mutable_unchecked<1>();
+        for (size_t i = 0; i < n; ++i) {
+            sc_mut(i, 0) = so_buf(i, 0);
+            sc_mut(i, 1) = so_buf(i, 1);
+            sc_mut(i, 2) = so_buf(i, 2);
+            op_mut(i) = so_buf(i, 3);
+        }
+        snap["scales"] = scales_arr;
+        snap["opacities"] = opacs_arr;
+
+        auto sh_buf = sh_arr.unchecked<3>();
+        py::array_t<float> sh0_arr({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(1), static_cast<py::ssize_t>(3)});
+        py::array_t<float> shN_arr({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(15), static_cast<py::ssize_t>(3)});
+        auto sh0_mut = sh0_arr.mutable_unchecked<3>();
+        auto shN_mut = shN_arr.mutable_unchecked<3>();
+        for (size_t i = 0; i < n; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                sh0_mut(i, 0, c) = sh_buf(i, 0, c);
+            }
+            for (int k = 0; k < 15; ++k) {
+                for (int c = 0; c < 3; ++c) {
+                    shN_mut(i, k, c) = sh_buf(i, k + 1, c);
+                }
+            }
+        }
+        snap["sh0"] = sh0_arr;
+        snap["shN"] = shN_arr;
+
+        snap["has_optimizer_moments"] = snap.contains(py::str("g_xyz_ws"));
+        snap["has_default_grad"] = snap.contains(py::str("default_grad"));
+        snap["has_default_radii"] = snap.contains(py::str("default_radii"));
+
+        if (buffers.group_state.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.group_state.deviceSize() > 0) {
+            snap["group_state"] = buffer_to_array<uint32_t, uint32_t>(buffers.group_state);
+        }
+
+        std::vector<uint32_t> active = trainer.get_active_indices_host();
+        if (!active.empty()) {
+            snap["active_set"] = py::array_t<uint32_t>({static_cast<py::ssize_t>(active.size())},
+                                                       {static_cast<py::ssize_t>(sizeof(uint32_t))},
+                                                       active.data());
+        } else {
+            snap["active_set"] = py::none();
+        }
+
+        if (trainer.get_ago_telemetry_enabled() && n > 0) {
+            std::vector<float> tel = trainer.get_ago_telemetry_host(n);
+            snap["ago_telemetry"] = py::array_t<float>({static_cast<py::ssize_t>(tel.size())},
+                                                       {static_cast<py::ssize_t>(sizeof(float))},
+                                                       tel.data());
+        } else {
+            snap["ago_telemetry"] = py::none();
+        }
+
+        return snap;
+    }
+
+    void restore_ago_state(py::dict snap) {
+        size_t n = snap.contains(py::str("num_gaussians"))
+            ? snap["num_gaussians"].cast<size_t>()
+            : snap["num_splats"].cast<size_t>();
+        int step = snap.contains(py::str("step")) ? snap["step"].cast<int>() : 0;
+
+        {
+            DeviceGuard guard(&trainer);
+            buffers.num_splats = n;
+            trainer.set_ago_last_step(step);
+
+            // Upload primary Gaussian parameters
+            if (snap.contains(py::str("xyz_ws"))) {
+                array_to_buffer(snap["xyz_ws"].cast<py::array_t<float>>(), buffers.xyz_ws);
+            } else {
+                array_to_buffer(snap["means"].cast<py::array_t<float>>(), buffers.xyz_ws);
+            }
+
+            if (snap.contains(py::str("sh_coeffs"))) {
+                auto sh_arr = snap["sh_coeffs"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                auto sh_buf = sh_arr.request();
+                buffers.sh_coeffs.assign(static_cast<float*>(sh_buf.ptr),
+                                         static_cast<float*>(sh_buf.ptr) + sh_buf.size);
+            } else {
+                auto sh0_arr = snap["sh0"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                auto shN_arr = snap["shN"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                auto sh0_b = sh0_arr.unchecked<3>();
+                auto shN_b = shN_arr.unchecked<3>();
+                buffers.sh_coeffs.resize(n * 16 * 3);
+                for (size_t i = 0; i < n; ++i) {
+                    for (int c = 0; c < 3; ++c)
+                        buffers.sh_coeffs[i * 48 + c] = sh0_b(i, 0, c);
+                    for (int k = 0; k < 15; ++k)
+                        for (int c = 0; c < 3; ++c)
+                            buffers.sh_coeffs[i * 48 + (k + 1) * 3 + c] = shN_b(i, k, c);
+                }
+            }
+            buffers.reorderSH(buffers.sh_coeffs);
+            trainer.copyToDevice(buffers.sh_coeffs);
+
+            if (snap.contains(py::str("rotations"))) {
+                array_to_buffer(snap["rotations"].cast<py::array_t<float>>(), buffers.rotations);
+            } else {
+                array_to_buffer(snap["quats"].cast<py::array_t<float>>(), buffers.rotations);
+            }
+
+            if (snap.contains(py::str("scales_opacs"))) {
+                array_to_buffer(snap["scales_opacs"].cast<py::array_t<float>>(), buffers.scales_opacs);
+            } else {
+                auto sc_arr = snap["scales"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                auto op_arr = snap["opacities"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                buffers.assignScalesOpacs(buffers.scales_opacs, n, sc_arr.data(), op_arr.data());
+                trainer.copyToDevice(buffers.scales_opacs);
+            }
+
+            // Restore or zero all 5 Adam moment buffers
+            if (snap.contains(py::str("g_xyz_ws"))) {
+                array_to_buffer(snap["g_xyz_ws"].cast<py::array_t<float>>(), buffers.g_xyz_ws);
+                array_to_buffer(snap["g_sh_coeffs_1"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_1);
+                array_to_buffer(snap["g_sh_coeffs_2"].cast<py::array_t<float>>(), buffers.g_sh_coeffs_2);
+                array_to_buffer(snap["g_rotations"].cast<py::array_t<float>>(), buffers.g_rotations);
+                array_to_buffer(snap["g_scales_opacs"].cast<py::array_t<float>>(), buffers.g_scales_opacs);
+            } else {
+                auto clear_if_alloc = [&](Buffer<float>& buf) {
+                    if (buf.deviceBuffer.buffer != VK_NULL_HANDLE && buf.deviceSize() > 0) {
+                        trainer.clearDeviceBuffer(buf, buf.deviceSize());
+                    }
+                };
+                clear_if_alloc(buffers.g_xyz_ws);
+                clear_if_alloc(buffers.g_sh_coeffs_1);
+                clear_if_alloc(buffers.g_sh_coeffs_2);
+                clear_if_alloc(buffers.g_rotations);
+                clear_if_alloc(buffers.g_scales_opacs);
+            }
+
+            // Restore or zero strategy running_grad/running_count & radii buffers
+            if (snap.contains(py::str("default_grad"))) {
+                array_to_buffer(snap["default_grad"].cast<py::array_t<float>>(), buffers.default_grad);
+            } else if (buffers.default_grad.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_grad.deviceSize() > 0) {
+                trainer.clearDeviceBuffer(buffers.default_grad, buffers.default_grad.deviceSize());
+            }
+            if (snap.contains(py::str("default_radii"))) {
+                array_to_buffer(snap["default_radii"].cast<py::array_t<float>>(), buffers.default_radii);
+            } else if (buffers.default_radii.deviceBuffer.buffer != VK_NULL_HANDLE && buffers.default_radii.deviceSize() > 0) {
+                trainer.clearDeviceBuffer(buffers.default_radii, buffers.default_radii.deviceSize());
+            }
+
+            // Restore group/entity/UID/state/anchor/cell metadata
+            if (snap.contains(py::str("splat_group_ids"))) {
+                set_splat_group_ids(snap["splat_group_ids"].cast<py::array_t<int32_t>>());
+            }
+            if (snap.contains(py::str("group_state"))) {
+                array_to_buffer(snap["group_state"].cast<py::array_t<uint32_t>>(), buffers.group_state);
+            }
+            if (snap.contains(py::str("splat_entity_ids"))) {
+                set_splat_entity_ids(snap["splat_entity_ids"].cast<py::array_t<int32_t>>());
+            }
+            if (snap.contains(py::str("splat_uids"))) {
+                auto u_arr = snap["splat_uids"].cast<py::array_t<uint64_t, py::array::c_style | py::array::forcecast>>();
+                std::vector<uint64_t> u_vec(u_arr.data(), u_arr.data() + u_arr.size());
+                uint64_t next_u = snap.contains(py::str("next_splat_uid"))
+                    ? snap["next_splat_uid"].cast<uint64_t>()
+                    : (u_vec.empty() ? 1u : (*std::max_element(u_vec.begin(), u_vec.end()) + 1u));
+                trainer.set_splat_uids_vec(std::move(u_vec), next_u);
+            }
+            if (snap.contains(py::str("splat_states"))) {
+                set_splat_states(snap["splat_states"].cast<py::array_t<uint32_t>>());
+            } else {
+                trainer.set_splat_states_vec({});
+                buffers.splat_state.assign(std::max<size_t>(1, n), 0xFFFFFFFFu);
+                trainer.copyToDevice(buffers.splat_state);
+            }
+            if (snap.contains(py::str("use_local_cell_credits")) && snap["use_local_cell_credits"].cast<bool>()) {
+                auto cids = snap["splat_cell_ids"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                auto creds = snap["cell_credits"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                py::array_t<int32_t, py::array::c_style | py::array::forcecast> elig;
+                const int32_t* elig_ptr = nullptr;
+                if (snap.contains(py::str("cell_eligible"))) {
+                    elig = snap["cell_eligible"].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                    if (elig.size() == creds.size())
+                        elig_ptr = elig.data();
+                }
+                trainer.set_local_cell_credits(
+                    buffers, cids.data(), static_cast<size_t>(cids.size()),
+                    creds.data(), static_cast<size_t>(creds.size()), elig_ptr
+                );
+            } else {
+                trainer.clear_local_cell_credits();
+            }
+            if (snap.contains(py::str("splat_anchor"))) {
+                set_splat_anchors(snap["splat_anchor"].cast<py::array_t<float>>());
+            } else {
+                trainer.set_splat_anchors(buffers, nullptr, 0);
+            }
+
+            // Restore budget/schedule scalars
+            if (snap.contains(py::str("growth_cap"))) {
+                trainer.set_growth_cap(snap["growth_cap"].cast<size_t>());
+            }
+            if (snap.contains(py::str("cap_max"))) {
+                set_densification_budget(
+                    snap["cap_max"].cast<int>(),
+                    snap.contains(py::str("cap_speculative_max")) ? snap["cap_speculative_max"].cast<int>() : -1,
+                    snap.contains(py::str("grow_factor")) ? snap["grow_factor"].cast<float>() : -1.0f,
+                    snap.contains(py::str("refine_every")) ? snap["refine_every"].cast<int>() : -1
+                );
+            }
+            if (snap.contains(py::str("structural_reset_opa")))
+                config.structural_reset_opa = snap["structural_reset_opa"].cast<float>();
+            if (snap.contains(py::str("feature_lr_final_scale")))
+                config.feature_lr_final_scale = snap["feature_lr_final_scale"].cast<float>();
+            if (snap.contains(py::str("opacity_lr_final_scale")))
+                config.opacity_lr_final_scale = snap["opacity_lr_final_scale"].cast<float>();
+            if (snap.contains(py::str("scale_lr_final_scale")))
+                config.scale_lr_final_scale = snap["scale_lr_final_scale"].cast<float>();
+            if (snap.contains(py::str("max_steps")))
+                config.max_steps = snap["max_steps"].cast<int>();
+
+            if (config.strategy == TrainerConfig::Strategy::MCMC) {
+                const size_t alloc_size = std::max(n, config.mcmc_alloc_cap());
+                trainer.resizeAndCopyDeviceBuffer(buffers.xyz_ws, 3 * alloc_size, false);
+                trainer.resizeAndCopyDeviceBuffer(buffers.sh_coeffs, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), false);
+                trainer.resizeAndCopyDeviceBuffer(buffers.rotations, 4 * alloc_size, false);
+                trainer.resizeAndCopyDeviceBuffer(buffers.scales_opacs, 4 * alloc_size, false);
+                if (buffers.g_xyz_ws.deviceBuffer.buffer != VK_NULL_HANDLE) {
+                    trainer.resizeAndCopyDeviceBuffer(buffers.g_xyz_ws, 2 * 3 * alloc_size, true);
+                    trainer.resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_1, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), true);
+                    trainer.resizeAndCopyDeviceBuffer(buffers.g_sh_coeffs_2, 16 * 3 * _CEIL_ROUND(alloc_size, SH_REORDER_SIZE), true);
+                    trainer.resizeAndCopyDeviceBuffer(buffers.g_rotations, 2 * 4 * alloc_size, true);
+                    trainer.resizeAndCopyDeviceBuffer(buffers.g_scales_opacs, 2 * 4 * alloc_size, true);
+                }
+                if (trainer.has_local_cell_credits()) {
+                    trainer.resizeAndCopyDeviceBuffer(buffers.splat_cell_ids, alloc_size, false);
+                }
+            }
+        }
+
+        // Restore or clear AGO telemetry buffer
+        if (snap.contains(py::str("ago_telemetry")) && !snap["ago_telemetry"].is_none()) {
+            auto tel_arr = snap["ago_telemetry"].cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            trainer.set_ago_telemetry_host(tel_arr.data(), static_cast<size_t>(tel_arr.size()));
+        } else {
+            trainer.set_ago_telemetry_host(nullptr, 0);
+        }
+
+        // Bump map_generation_ cleanly and restore active_set if one was active
+        trainer.bumpMapGeneration();
+        if (snap.contains(py::str("active_set")) && !snap["active_set"].is_none()) {
+            auto act_arr = snap["active_set"].cast<py::array_t<uint32_t, py::array::c_style | py::array::forcecast>>();
+            std::vector<uint32_t> act_vec(act_arr.data(), act_arr.data() + act_arr.size());
+            trainer.set_active_indices_gpu(act_vec, n);
+        }
+    }
+
     size_t num_train() { return trainer.num_train(); }
     size_t num_val() { return trainer.num_val(); }
 
@@ -2430,6 +2745,18 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_optimizer_moments", &VkSplat::get_optimizer_moments, "Device readback of the Adam moments and densification statistics (diagnostic)")
         .def("snapshot_optimizer_state", &VkSplat::snapshot_optimizer_state, "Take a non-destructive snapshot of Gaussian parameters and Adam optimizer state")
         .def("restore_optimizer_state", &VkSplat::restore_optimizer_state, "Restore a non-destructive snapshot of Gaussian parameters and Adam optimizer state", py::arg("snap"))
+        .def("set_ago_telemetry_enabled", &VkSplat::set_ago_telemetry_enabled,
+             "Enable or disable opt-in zero-perturbation AGO-0 per-Gaussian telemetry", py::arg("enabled"))
+        .def("get_ago_telemetry_enabled", &VkSplat::get_ago_telemetry_enabled,
+             "Return whether AGO-0 per-Gaussian telemetry is enabled")
+        .def("reset_ago_telemetry", &VkSplat::reset_ago_telemetry,
+             "Zero all accumulated AGO-0 per-Gaussian telemetry counters on device")
+        .def("get_ago_telemetry", &VkSplat::get_ago_telemetry,
+             "Read back per-Gaussian AGO-0 telemetry dict (grad_norm, update_norm, predicted_gain, abs_proj_grad, update_count, contrib_sum, last_step_updated, last_predicted_gain, num_gaussians, step)")
+        .def("snapshot_ago_state", &VkSplat::snapshot_ago_state,
+             "Take an exact byte-identical snapshot of Gaussian parameters, all Adam moments, strategy state, active set, and step for AGO-1 counterfactual probes")
+        .def("restore_ago_state", &VkSplat::restore_ago_state,
+             "Restore an exact snapshot from snapshot_ago_state() and bump map_generation cleanly", py::arg("snapshot"))
         .def("cleanup", &VkSplat::cleanup, "Cleanup Vulkan resources")
         .DEF_BUFFER_ARRAY(xyz_ws, float, 3, (size_t)-1, "mean")
         .DEF_BUFFER_ARRAY(sh_coeffs, float, 16, 3, "sh")

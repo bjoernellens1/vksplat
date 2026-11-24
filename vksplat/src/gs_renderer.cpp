@@ -103,8 +103,8 @@ void VulkanGSRenderer::executeProjectionForward(
     VulkanGSPipelineBuffers& buffers,
     size_t alloc_reserve
 ) {
-    PerfTimer::Timer<PerfTimer::ProjectionForward> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::ProjectionForward> timer(this);
 
     size_t num_splats = buffers.num_splats;
 
@@ -143,8 +143,8 @@ void VulkanGSRenderer::executeGenerateKeys(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
-    PerfTimer::Timer<PerfTimer::GenerateKeys> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::GenerateKeys> timer(this);
 
     size_t num_elements = buffers.num_splats;
     size_t num_indices = buffers.num_indices;
@@ -199,8 +199,8 @@ void VulkanGSRenderer::executeComputeTileRanges(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
-    PerfTimer::Timer<PerfTimer::ComputeTileRanges> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::ComputeTileRanges> timer(this);
 
     size_t num_indices = buffers.num_indices;
     size_t num_tiles = (size_t)(uniforms.grid_height*uniforms.grid_width);
@@ -229,8 +229,8 @@ void VulkanGSRenderer::executeRasterizeForward(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
-    PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
 
     size_t num_pixels = uniforms.image_height * uniforms.image_width;
 
@@ -376,6 +376,7 @@ void VulkanGSRenderer::executeRasterizeBackward(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
+    DEVICE_GUARD;
     std::shared_ptr<void> timer = nullptr;
     RasterBackwardImpl scheduled_impl = RasterBackwardImpl::Default;
     if (RASTERIZE_BACKWARD_USE_SCHEDULING) {
@@ -399,8 +400,6 @@ void VulkanGSRenderer::executeRasterizeBackward(
     }
 
     size_t num_elements = buffers.num_splats;
-    
-    DEVICE_GUARD;
 
     clearDeviceBuffer(buffers.v_xy_vs, 2*num_elements);
     clearDeviceBuffer(buffers.v_inv_cov_vs_opacity, 4*num_elements);
@@ -469,8 +468,8 @@ void VulkanGSRenderer::executeCumsum(
     Buffer<int32_t> &input_buffer,
     Buffer<int32_t> &output_buffer
 ) {
-    PerfTimer::Timer<PerfTimer::_Cumsum> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::_Cumsum> timer(this);
 
     size_t num_elements = input_buffer.deviceSize();
     const size_t block_0 = 1024;
@@ -664,6 +663,7 @@ void VulkanGSRenderer::executeSort(
     VulkanGSPipelineBuffers& buffers,
     int num_bits
 ) {
+    DEVICE_GUARD;
     PerfTimer::Timer<PerfTimer::SortRTS> timer(this);
 
     size_t num_elements = buffers.unsorted_keys().deviceSize();
@@ -697,7 +697,6 @@ void VulkanGSRenderer::executeSort(
     resizeDeviceBuffer(buffers.sorted_keys(), num_elements);
     resizeDeviceBuffer(buffers.sorted_gauss_idx(), num_elements);
 
-    DEVICE_GUARD;
     clearDeviceBuffer(globalHistogram, num_passes * sizeof(sortingKey_t)*RADIX);
     bufferMemoryBarrier({
         { globalHistogram.deviceBuffer, TRANSFER_WRITE },
@@ -942,8 +941,8 @@ void VulkanGSRenderer::executeSelectSparseTiles(
     float quantile,
     int halo
 ) {
-    PerfTimer::Timer<PerfTimer::SelectSparseTiles> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::SelectSparseTiles> timer(this);
     const uint32_t num_tiles = uniforms.grid_width * uniforms.grid_height;
     if (num_tiles > sparse_capacity)
         _THROW_ERROR("sparse tile buffers too small for this image");
@@ -1068,8 +1067,8 @@ void VulkanGSRenderer::executeWhere(
     Buffer<int32_t> &input_buffer,
     Buffer<int32_t> &output_buffer
 ) {
-    PerfTimer::Timer<PerfTimer::_Where> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::_Where> timer(this);
 
     size_t num_elements = input_buffer.deviceSize();
 
