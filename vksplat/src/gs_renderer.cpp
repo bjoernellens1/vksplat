@@ -272,8 +272,8 @@ void VulkanGSRenderer::executeRasterizeForwardDepth(
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers
 ) {
-    PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
 
     size_t num_pixels = uniforms.image_height * uniforms.image_width;
 

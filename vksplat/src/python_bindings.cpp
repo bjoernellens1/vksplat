@@ -1611,9 +1611,12 @@ public:
         } else {
             {
                 py::gil_scoped_release release;
-                projection_forward();
-                process_tiles();
-                trainer.executeRasterizeForwardDepth(uniforms, buffers);
+                {
+                    auto deviceGuard = DeviceGuard(&trainer);
+                    projection_forward();
+                    process_tiles();
+                    trainer.executeRasterizeForwardDepth(uniforms, buffers);
+                }
                 trainer.copyFromDevice(buffers.pixel_state);
                 trainer.copyFromDevice(buffers.pixel_depth);
             }
