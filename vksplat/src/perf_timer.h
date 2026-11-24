@@ -30,6 +30,8 @@ namespace PerfTimer {
     _(DefaultPostBackward) \
     _(MCMCPostBackward) \
     _(MortonSorting) \
+    _(RayGuard) \
+    _(AppearanceInit) \
     _(_RasterizeBackwardScheduling_PerPixel) \
     _(_RasterizeBackwardScheduling_PerSplat) \
     _(_RasterizeBackwardScheduling_Tensor_0_8_0) \
@@ -46,6 +48,8 @@ enum TrainStage {
 
 
 void reset();
+void reset_stage_timers();
+double get_stage_total_time_s(TrainStage stage);
 
 void hostTic();
 void hostToc();

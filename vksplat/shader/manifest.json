@@ -180,6 +180,15 @@
             "outputs": {
                 "shader/generated/projection_forward.spv": "f5b9d0bf2ea3d4468b29f99aed0f79e3c06b3de1cbd00b634c9d8720343111c8"
             }
+        },
+        "appearance_init.slang": {
+            "sources": {
+                "slang/appearance_init.slang": "f9d9844b23b32e07d2e97a317b74011826fcbd9d986bb8724b7a0369f523f9d0",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
+            },
+            "outputs": {
+                "shader/generated/appearance_init.spv": "4946dbc088aed1b757c2e539ba4e41e785e0f4f9e9ad4ef5799103208821a3ba"
+            }
         }
     }
 }

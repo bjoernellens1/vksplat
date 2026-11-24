@@ -106,6 +106,21 @@ void VulkanGSTrainer::cleanup() {
     destroyBuffer(group_op_rows.deviceBuffer);
     destroyBuffer(group_op_vals.deviceBuffer);
     destroyBuffer(compact_scratch.deviceBuffer);
+    destroyBuffer(rayguard_ev_.deviceBuffer);
+    destroyBuffer(rayguard_ev_scratch_.deviceBuffer);
+    destroyBuffer(rayguard_depth_.deviceBuffer);
+    destroyBuffer(rayguard_stats_.deviceBuffer);
+    destroyBuffer(appear_means_.deviceBuffer);
+    destroyBuffer(appear_normals_.deviceBuffer);
+    destroyBuffer(appear_fallback_.deviceBuffer);
+    destroyBuffer(appear_view_params_.deviceBuffer);
+    destroyBuffer(appear_rgb_u8_.deviceBuffer);
+    destroyBuffer(appear_depth_f32_.deviceBuffer);
+    destroyBuffer(appear_out_sh_.deviceBuffer);
+    destroyBuffer(appear_out_rgb_.deviceBuffer);
+    destroyBuffer(appear_out_obs_.deviceBuffer);
+    destroyBuffer(appear_out_wsum_.deviceBuffer);
+    destroyBuffer(appear_out_se_.deviceBuffer);
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -172,6 +187,7 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_morton_sort.apply_indices_sh, spirv_paths.at("morton_sort_apply_indices_sh"));
     createComputePipeline(pipeline_morton_sort.update_buffer, spirv_paths.at("morton_sort_update_buffer"));
     createComputePipeline(pipeline_morton_sort.update_buffer_sh, spirv_paths.at("morton_sort_update_buffer_sh"));
+    createComputePipeline(pipeline_appearance_init, spirv_paths.at("appearance_init"));
 
     rng.seed(42);
 }
@@ -3584,6 +3600,7 @@ VulkanGSTrainer::DecayOpacityStats VulkanGSTrainer::observe_and_apply_rayguard_g
     const float min_1mcos = 1.0f - std::cos(min_parallax_deg * 3.14159265358979323846f / 180.0f);
     {
         DEVICE_GUARD;
+        PerfTimer::Timer<PerfTimer::RayGuard> timer(this);
         Uniform32_t u_obs[25];
         u_obs[0].u = static_cast<uint32_t>(n);
         u_obs[1].u = static_cast<uint32_t>(width);
@@ -4166,4 +4183,197 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         counters.append_reallocs++;
     counters.append_fence_waits += counters.fence_waits_total - fence_waits_before;
     return buffers.num_splats;
+}
+
+VulkanGSTrainer::AppearanceInitResult VulkanGSTrainer::project_and_fit_sh_vulkan(
+    const float* means_world,
+    const float* normals_world,
+    size_t n_points,
+    const uint8_t* rgb_views_u8,
+    size_t n_views,
+    int h_rgb,
+    int w_rgb,
+    int rgb_channels,
+    const float* depth_views_f32,
+    int h_d,
+    int w_d,
+    const float* view_params_24,
+    const float* fallback_rgb_f32,
+    int sh_degree,
+    float reg_lambda,
+    float depth_tol_m,
+    float min_cos_angle
+) {
+    if (sh_degree < 0 || sh_degree > 1) {
+        throw std::invalid_argument("project_and_fit_sh_vulkan: sh_degree must be 0 or 1");
+    }
+    if (!std::isfinite(reg_lambda) || reg_lambda < 0.0f) {
+        throw std::invalid_argument("project_and_fit_sh_vulkan: reg_lambda must be finite and >= 0");
+    }
+    if (!std::isfinite(depth_tol_m) || depth_tol_m < 0.0f) {
+        throw std::invalid_argument("project_and_fit_sh_vulkan: depth_tol_m must be finite and >= 0");
+    }
+    if (!std::isfinite(min_cos_angle)) {
+        throw std::invalid_argument("project_and_fit_sh_vulkan: min_cos_angle must be finite");
+    }
+
+    auto t_total_0 = std::chrono::steady_clock::now();
+    AppearanceInitResult res;
+    res.sh_coeffs.assign(n_points * 48, 0.0f);
+    res.rgb_init.assign(n_points * 3, 0.5f);
+    res.obs_count.assign(n_points, 0);
+    res.weight_sum.assign(n_points, 0.0f);
+
+    constexpr float kShC0 = 0.28209479177387814f;
+    if (n_points == 0 || n_views == 0) {
+        if (n_points > 0 && fallback_rgb_f32 != nullptr) {
+            for (size_t i = 0; i < n_points; ++i) {
+                for (int c = 0; c < 3; ++c) {
+                    float v = std::clamp(fallback_rgb_f32[3 * i + c], 0.0f, 1.0f);
+                    res.rgb_init[3 * i + c] = v;
+                    res.sh_coeffs[48 * i + c] = (v - 0.5f) / kShC0;
+                }
+            }
+        }
+        auto t_total_1 = std::chrono::steady_clock::now();
+        res.total_wall_ms = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
+        return res;
+    }
+
+    if (h_rgb <= 0 || w_rgb <= 0 || h_d <= 0 || w_d <= 0 || (rgb_channels != 3 && rgb_channels != 4)) {
+        throw std::invalid_argument("project_and_fit_sh_vulkan: invalid image/depth dimensions or rgb_channels");
+    }
+
+    // Upload inputs to reusable device buffers
+    resizeDeviceBuffer(appear_means_, 3 * n_points);
+    uploadDeviceSlice(appear_means_.deviceBuffer, 0, means_world, 3 * n_points * sizeof(float));
+
+    const bool has_normals = (normals_world != nullptr);
+    if (has_normals) {
+        resizeDeviceBuffer(appear_normals_, 3 * n_points);
+        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, normals_world, 3 * n_points * sizeof(float));
+    } else {
+        float dummy_n[3] = {0.0f, 0.0f, 0.0f};
+        resizeDeviceBuffer(appear_normals_, 3);
+        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, dummy_n, sizeof(dummy_n));
+    }
+
+    resizeDeviceBuffer(appear_fallback_, 3 * n_points);
+    uploadDeviceSlice(appear_fallback_.deviceBuffer, 0, fallback_rgb_f32, 3 * n_points * sizeof(float));
+
+    resizeDeviceBuffer(appear_view_params_, 24 * n_views);
+    uploadDeviceSlice(appear_view_params_.deviceBuffer, 0, view_params_24, 24 * n_views * sizeof(float));
+
+    const size_t rgb_bytes = n_views * static_cast<size_t>(h_rgb) * static_cast<size_t>(w_rgb) * static_cast<size_t>(rgb_channels);
+    const size_t rgb_padded = ((rgb_bytes + 7u) & ~size_t(3u)) + 4u;
+    resizeDeviceBuffer(appear_rgb_u8_, rgb_padded);
+    uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, 0, rgb_views_u8, rgb_bytes);
+    if (rgb_padded > rgb_bytes) {
+        uint8_t zeros[12] = {};
+        uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, rgb_bytes, zeros, rgb_padded - rgb_bytes);
+    }
+
+    const size_t depth_elems = n_views * static_cast<size_t>(h_d) * static_cast<size_t>(w_d);
+    resizeDeviceBuffer(appear_depth_f32_, depth_elems);
+    uploadDeviceSlice(appear_depth_f32_.deviceBuffer, 0, depth_views_f32, depth_elems * sizeof(float));
+
+    // Allocate output buffers
+    resizeDeviceBuffer(appear_out_sh_, 48 * n_points);
+    resizeDeviceBuffer(appear_out_rgb_, 3 * n_points);
+    resizeDeviceBuffer(appear_out_obs_, n_points);
+    resizeDeviceBuffer(appear_out_wsum_, n_points);
+    resizeDeviceBuffer(appear_out_se_, n_points);
+
+    const double gpu_t0_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
+    auto t_kern_0 = std::chrono::steady_clock::now();
+    {
+        DEVICE_GUARD;
+        PerfTimer::Timer<PerfTimer::AppearanceInit> timer(this);
+
+        Uniform32_t u[12];
+        u[0].u = static_cast<uint32_t>(n_points);
+        u[1].u = static_cast<uint32_t>(n_views);
+        u[2].u = static_cast<uint32_t>(h_rgb);
+        u[3].u = static_cast<uint32_t>(w_rgb);
+        u[4].u = static_cast<uint32_t>(h_d);
+        u[5].u = static_cast<uint32_t>(w_d);
+        u[6].u = static_cast<uint32_t>(rgb_channels);
+        u[7].u = has_normals ? 1u : 0u;
+        u[8].u = static_cast<uint32_t>(sh_degree);
+        u[9].f = reg_lambda;
+        u[10].f = depth_tol_m;
+        u[11].f = min_cos_angle;
+
+        bufferMemoryBarrier({
+            { appear_means_.deviceBuffer, TRANSFER_WRITE },
+            { appear_normals_.deviceBuffer, TRANSFER_WRITE },
+            { appear_fallback_.deviceBuffer, TRANSFER_WRITE },
+            { appear_view_params_.deviceBuffer, TRANSFER_WRITE },
+            { appear_rgb_u8_.deviceBuffer, TRANSFER_WRITE },
+            { appear_depth_f32_.deviceBuffer, TRANSFER_WRITE },
+        }, COMPUTE_SHADER_READ);
+
+        executeCompute(
+            {{n_points, 256}},
+            &u, sizeof(u),
+            pipeline_appearance_init,
+            {
+                appear_means_.deviceBuffer,
+                appear_normals_.deviceBuffer,
+                appear_fallback_.deviceBuffer,
+                appear_view_params_.deviceBuffer,
+                appear_rgb_u8_.deviceBuffer,
+                appear_depth_f32_.deviceBuffer,
+                appear_out_sh_.deviceBuffer,
+                appear_out_rgb_.deviceBuffer,
+                appear_out_obs_.deviceBuffer,
+                appear_out_wsum_.deviceBuffer,
+                appear_out_se_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { appear_out_sh_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { appear_out_rgb_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { appear_out_obs_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { appear_out_wsum_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { appear_out_se_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, TRANSFER_READ);
+    }
+    auto t_kern_1 = std::chrono::steady_clock::now();
+    const double gpu_t1_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
+    const double host_kern_ms = std::chrono::duration<double, std::milli>(t_kern_1 - t_kern_0).count();
+    res.kernel_wall_ms = (gpu_t1_s > gpu_t0_s) ? ((gpu_t1_s - gpu_t0_s) * 1000.0) : host_kern_ms;
+
+    std::vector<float> se_num_vec(n_points, 0.0f);
+    downloadDeviceSlice(appear_out_sh_.deviceBuffer, 0, res.sh_coeffs.data(), 48 * n_points * sizeof(float));
+    downloadDeviceSlice(appear_out_rgb_.deviceBuffer, 0, res.rgb_init.data(), 3 * n_points * sizeof(float));
+    downloadDeviceSlice(appear_out_obs_.deviceBuffer, 0, res.obs_count.data(), n_points * sizeof(int32_t));
+    downloadDeviceSlice(appear_out_wsum_.deviceBuffer, 0, res.weight_sum.data(), n_points * sizeof(float));
+    downloadDeviceSlice(appear_out_se_.deviceBuffer, 0, se_num_vec.data(), n_points * sizeof(float));
+
+    bool any_multi = false;
+    for (size_t i = 0; i < n_points; ++i) {
+        if (res.obs_count[i] >= 2) {
+            any_multi = true;
+            break;
+        }
+    }
+    double se_num_total = 0.0;
+    double se_den_total = 0.0;
+    for (size_t i = 0; i < n_points; ++i) {
+        bool use = any_multi ? (res.obs_count[i] >= 2) : (res.obs_count[i] > 0);
+        if (use) {
+            se_num_total += static_cast<double>(se_num_vec[i]);
+            se_den_total += static_cast<double>(res.weight_sum[i]);
+        }
+    }
+    res.wls_sh_fit_rmse = (se_den_total > 0.0) ? std::sqrt(std::max(se_num_total, 0.0) / se_den_total) : 0.0;
+
+    auto t_total_1 = std::chrono::steady_clock::now();
+    res.total_wall_ms = std::max(
+        std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count(),
+        res.kernel_wall_ms
+    );
+    return res;
 }

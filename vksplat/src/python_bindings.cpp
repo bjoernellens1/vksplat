@@ -175,6 +175,7 @@ public:
             "morton_sort_apply_indices_sh",
             "morton_sort_update_buffer",
             "morton_sort_update_buffer_sh",
+            "appearance_init",
         };
         std::map<std::string, std::string> spirv_paths_dict;
         for (std::string name : spirv_paths) {
@@ -1597,6 +1598,250 @@ public:
         return PerfTimer::get_summary();
     }
 
+    py::dict get_gpu_stage_timestamps_ms() {
+        auto ms = [](PerfTimer::TrainStage s) -> double {
+            return PerfTimer::get_stage_total_time_s(s) * 1000.0;
+        };
+        const double forward_ms =
+            ms(PerfTimer::ProjectionForward) +
+            ms(PerfTimer::CalculateIndexBufferOffset) +
+            ms(PerfTimer::GenerateKeys) +
+            ms(PerfTimer::SortRTS) +
+            ms(PerfTimer::ComputeTileRanges) +
+            ms(PerfTimer::RasterizeForward);
+        const double backward_ms =
+            ms(PerfTimer::CopyTrainImageToDevice) +
+            ms(PerfTimer::ComputeSSIMGradient) +
+            ms(PerfTimer::SelectSparseTiles) +
+            ms(PerfTimer::RasterizeBackward);
+        const double optimizer_ms =
+            ms(PerfTimer::FusedProjectionBackwardOptimizerStep) +
+            ms(PerfTimer::DefaultPostBackward) +
+            ms(PerfTimer::MCMCPostBackward) +
+            ms(PerfTimer::MortonSorting);
+        const double rayguard_ms = ms(PerfTimer::RayGuard);
+        const double appear_init_ms = ms(PerfTimer::AppearanceInit);
+        const double total_gpu_ms = forward_ms + backward_ms + optimizer_ms + rayguard_ms + appear_init_ms;
+
+        py::dict d;
+        d["forward_ms"] = forward_ms;
+        d["backward_ms"] = backward_ms;
+        d["optimizer_ms"] = optimizer_ms;
+        d["rayguard_ms"] = rayguard_ms;
+        d["appear_init_ms"] = appear_init_ms;
+        d["total_gpu_ms"] = total_gpu_ms;
+        d["timestamp_queries_enabled"] = trainer.isTimestampQueriesEnabled();
+        return d;
+    }
+
+    void reset_gpu_stage_timestamps() {
+        PerfTimer::reset_stage_timers();
+    }
+
+    py::dict compact_mode0_active_set() {
+        const size_t n_total = buffers.num_splats;
+        const auto& splat_sts = trainer.get_splat_states();
+        const auto& gids = trainer.get_splat_group_ids();
+        const auto& gstate = buffers.group_state;
+        const bool protect_locked = config.mcmc_protect_structural_groups;
+
+        size_t n_frozen_mode0 = 0;
+        for (size_t i = 0; i < n_total; ++i) {
+            const uint32_t raw_st = (i < splat_sts.size()) ? splat_sts[i] : 0xFFFFFFFFu;
+            const uint32_t base_st = (raw_st == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (raw_st & 0xFFFFu);
+            const int32_t gid = (i < gids.size()) ? gids[i] : -1;
+            const uint32_t gs = (gid >= 0 && static_cast<size_t>(gid) < gstate.size()) ? gstate[gid] : 0u;
+            bool frozen = false;
+            if (gs == 3u) {
+                frozen = true;
+            } else if (base_st == 4u) {
+                frozen = true;
+            } else if (base_st == 0xFFFFFFFFu && gs == 2u && protect_locked) {
+                frozen = true;
+            }
+            if (frozen)
+                ++n_frozen_mode0;
+        }
+        const size_t n_active_trainable = n_total - n_frozen_mode0;
+        const double active_fraction = (n_total > 0)
+            ? (static_cast<double>(n_active_trainable) / static_cast<double>(n_total))
+            : 0.0;
+
+        if (n_total > 0) {
+            set_freeze_flags();
+        }
+
+        py::dict d;
+        d["n_total"] = n_total;
+        d["n_frozen_mode0"] = n_frozen_mode0;
+        d["n_active_trainable"] = n_active_trainable;
+        d["active_fraction"] = active_fraction;
+        return d;
+    }
+
+    py::dict project_and_fit_sh_vulkan(
+        py::array_t<float, py::array::c_style | py::array::forcecast> means_world,
+        py::object normals_world_obj,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgb_views_u8,
+        py::array_t<float, py::array::c_style | py::array::forcecast> depth_views_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> k_rgb_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> k_depth_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> w2c_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> cam_o_f32,
+        py::object fallback_rgb_obj = py::none(),
+        int sh_degree = 1,
+        float reg_lambda = 0.25f,
+        float depth_tol_m = 0.12f,
+        float min_cos_angle = 0.15f
+    ) {
+        auto mbuf = means_world.request();
+        if (mbuf.ndim != 2 || mbuf.shape[1] != 3)
+            throw std::invalid_argument("means_world must have shape (N, 3)");
+        const size_t n_points = static_cast<size_t>(mbuf.shape[0]);
+
+        py::array_t<float, py::array::c_style | py::array::forcecast> normals_arr;
+        const float* normals_ptr = nullptr;
+        if (!normals_world_obj.is_none()) {
+            normals_arr = normals_world_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto nbuf = normals_arr.request();
+            if (nbuf.ndim != 2 || static_cast<size_t>(nbuf.shape[0]) != n_points || nbuf.shape[1] != 3)
+                throw std::invalid_argument("normals_world must have shape (N, 3)");
+            normals_ptr = static_cast<const float*>(nbuf.ptr);
+        }
+
+        std::vector<float> fallback_vec(3 * n_points, 0.5f);
+        if (!fallback_rgb_obj.is_none()) {
+            auto fb_arr = fallback_rgb_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto fbuf = fb_arr.request();
+            const float* fptr = static_cast<const float*>(fbuf.ptr);
+            if (fbuf.ndim == 1 && fbuf.shape[0] == 3) {
+                for (size_t i = 0; i < n_points; ++i) {
+                    fallback_vec[3 * i + 0] = std::clamp(fptr[0], 0.0f, 1.0f);
+                    fallback_vec[3 * i + 1] = std::clamp(fptr[1], 0.0f, 1.0f);
+                    fallback_vec[3 * i + 2] = std::clamp(fptr[2], 0.0f, 1.0f);
+                }
+            } else if (fbuf.ndim == 2 && static_cast<size_t>(fbuf.shape[0]) == n_points && fbuf.shape[1] == 3) {
+                for (size_t i = 0; i < 3 * n_points; ++i)
+                    fallback_vec[i] = std::clamp(fptr[i], 0.0f, 1.0f);
+            } else {
+                throw std::invalid_argument("fallback_rgb_f32 must have shape (3,) or (N, 3)");
+            }
+        }
+
+        auto rbuf = rgb_views_u8.request();
+        auto dbuf = depth_views_f32.request();
+        if (rbuf.ndim != 4 || (rbuf.shape[3] != 3 && rbuf.shape[3] != 4))
+            throw std::invalid_argument("rgb_views_u8 must have shape (V, H_rgb, W_rgb, 3 or 4)");
+        if (dbuf.ndim != 3)
+            throw std::invalid_argument("depth_views_f32 must have shape (V, H_d, W_d)");
+        const size_t n_views = static_cast<size_t>(rbuf.shape[0]);
+        if (static_cast<size_t>(dbuf.shape[0]) != n_views)
+            throw std::invalid_argument("rgb_views_u8 and depth_views_f32 must have matching view count V");
+
+        auto krbuf = k_rgb_f32.request();
+        auto kdbuf = k_depth_f32.request();
+        auto w2cbuf = w2c_f32.request();
+        auto obuf = cam_o_f32.request();
+
+        if (static_cast<size_t>(krbuf.shape[0]) != n_views ||
+            static_cast<size_t>(kdbuf.shape[0]) != n_views ||
+            static_cast<size_t>(w2cbuf.shape[0]) != n_views ||
+            static_cast<size_t>(obuf.shape[0]) != n_views) {
+            throw std::invalid_argument("Camera parameter arrays must all have leading dimension V");
+        }
+        if (obuf.ndim != 2 || obuf.shape[1] != 3)
+            throw std::invalid_argument("cam_o_f32 must have shape (V, 3)");
+
+        auto extract_k = [](const py::buffer_info& b, size_t v, float out[4], const char* name) {
+            const float* p = static_cast<const float*>(b.ptr);
+            if (b.ndim == 3 && b.shape[1] == 3 && b.shape[2] == 3) {
+                const float* kv = p + 9 * v;
+                out[0] = kv[0];  // fx
+                out[1] = kv[4];  // fy
+                out[2] = kv[2];  // cx
+                out[3] = kv[5];  // cy
+            } else if (b.ndim == 2 && b.shape[1] == 4) {
+                const float* kv = p + 4 * v;
+                out[0] = kv[0];
+                out[1] = kv[1];
+                out[2] = kv[2];
+                out[3] = kv[3];
+            } else {
+                throw std::invalid_argument(std::string(name) + " must have shape (V, 3, 3) or (V, 4)");
+            }
+        };
+
+        std::vector<float> view_params(24 * n_views, 0.0f);
+        const float* w2c_ptr = static_cast<const float*>(w2cbuf.ptr);
+        const float* o_ptr = static_cast<const float*>(obuf.ptr);
+        const bool w2c_4x4 = (w2cbuf.ndim == 3 && w2cbuf.shape[1] == 4 && w2cbuf.shape[2] == 4);
+        const bool w2c_3x4 = (w2cbuf.ndim == 3 && w2cbuf.shape[1] == 3 && w2cbuf.shape[2] == 4);
+        if (!w2c_4x4 && !w2c_3x4)
+            throw std::invalid_argument("w2c_f32 must have shape (V, 4, 4) or (V, 3, 4)");
+
+        const size_t w2c_stride = w2c_4x4 ? 16 : 12;
+        for (size_t v = 0; v < n_views; ++v) {
+            float* dst = &view_params[24 * v];
+            const float* wv = w2c_ptr + w2c_stride * v;
+            std::memcpy(dst + 0, wv + 0, 4 * sizeof(float));
+            std::memcpy(dst + 4, wv + 4, 4 * sizeof(float));
+            std::memcpy(dst + 8, wv + 8, 4 * sizeof(float));
+            dst[12] = o_ptr[3 * v + 0];
+            dst[13] = o_ptr[3 * v + 1];
+            dst[14] = o_ptr[3 * v + 2];
+            dst[15] = 0.0f;
+            extract_k(krbuf, v, dst + 16, "k_rgb_f32");
+            extract_k(kdbuf, v, dst + 20, "k_depth_f32");
+        }
+
+        auto res = trainer.project_and_fit_sh_vulkan(
+            static_cast<const float*>(mbuf.ptr),
+            normals_ptr,
+            n_points,
+            static_cast<const uint8_t*>(rbuf.ptr),
+            n_views,
+            static_cast<int>(rbuf.shape[1]),
+            static_cast<int>(rbuf.shape[2]),
+            static_cast<int>(rbuf.shape[3]),
+            static_cast<const float*>(dbuf.ptr),
+            static_cast<int>(dbuf.shape[1]),
+            static_cast<int>(dbuf.shape[2]),
+            view_params.data(),
+            fallback_vec.data(),
+            sh_degree,
+            reg_lambda,
+            depth_tol_m,
+            min_cos_angle
+        );
+
+        py::array_t<float> sh_out({(py::ssize_t)n_points, (py::ssize_t)16, (py::ssize_t)3});
+        if (!res.sh_coeffs.empty())
+            std::memcpy(sh_out.mutable_data(), res.sh_coeffs.data(), res.sh_coeffs.size() * sizeof(float));
+
+        py::array_t<float> rgb_out({(py::ssize_t)n_points, (py::ssize_t)3});
+        if (!res.rgb_init.empty())
+            std::memcpy(rgb_out.mutable_data(), res.rgb_init.data(), res.rgb_init.size() * sizeof(float));
+
+        py::array_t<int32_t> obs_out({(py::ssize_t)n_points});
+        if (!res.obs_count.empty())
+            std::memcpy(obs_out.mutable_data(), res.obs_count.data(), res.obs_count.size() * sizeof(int32_t));
+
+        py::array_t<float> wsum_out({(py::ssize_t)n_points});
+        if (!res.weight_sum.empty())
+            std::memcpy(wsum_out.mutable_data(), res.weight_sum.data(), res.weight_sum.size() * sizeof(float));
+
+        py::dict d;
+        d["sh_coeffs"] = sh_out;
+        d["rgb_init"] = rgb_out;
+        d["obs_count"] = obs_out;
+        d["weight_sum"] = wsum_out;
+        d["wls_sh_fit_rmse"] = res.wls_sh_fit_rmse;
+        d["kernel_wall_ms"] = res.kernel_wall_ms;
+        d["total_wall_ms"] = res.total_wall_ms;
+        d["backend"] = "vulkan_slang";
+        return d;
+    }
+
     std::map<std::string, uint64_t> get_work_counters() {
         // the device counter is read first so that its own fence is already part of fence_waits_total
         const uint64_t sparse_tiles = PerfTimer::work_counters.backward_sparse_passes > 0 ? trainer.sparseTilesDispatched() : 0;
@@ -1746,6 +1991,23 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_vram_usage", &VkSplat::get_vram_usage, "Get VRAM Usage")
         .def("get_peak_vram_usage", &VkSplat::get_peak_vram_usage, "Get peak VRAM Usage")
         .def("get_timing_breakdown", &VkSplat::get_timing_breakdown, "Get timing for each step since start")
+        .def("get_gpu_stage_timestamps_ms", &VkSplat::get_gpu_stage_timestamps_ms,
+             "Get aggregated Vulkan GPU timestamp durations in milliseconds by pipeline stage")
+        .def("reset_gpu_stage_timestamps", &VkSplat::reset_gpu_stage_timestamps,
+             "Reset Vulkan GPU stage timestamp accumulators")
+        .def("compact_mode0_active_set", &VkSplat::compact_mode0_active_set,
+             "Sync freeze flags and return Mode-0 frozen vs. active trainable Gaussian counts")
+        .def("project_and_fit_sh_vulkan", &VkSplat::project_and_fit_sh_vulkan,
+             "Native Slang/Vulkan multi-view RGB-D projection and regularized WLS degree-0/1 SH initializer",
+             py::arg("means_world"), py::arg("normals_world"),
+             py::arg("rgb_views_u8"), py::arg("depth_views_f32"),
+             py::arg("k_rgb_f32"), py::arg("k_depth_f32"),
+             py::arg("w2c_f32"), py::arg("cam_o_f32"),
+             py::arg("fallback_rgb_f32") = py::none(),
+             py::arg("sh_degree") = 1,
+             py::arg("reg_lambda") = 0.25f,
+             py::arg("depth_tol_m") = 0.12f,
+             py::arg("min_cos_angle") = 0.15f)
         .def("get_work_counters", &VkSplat::get_work_counters,
              "Cumulative tile-intersection (num_indices) and backward-dispatch counters since initialize; no extra readback")
         .def("get_vram_breakdown", &VkSplat::get_vram_breakdown, "Get VRAM for each buffer at the current moment")

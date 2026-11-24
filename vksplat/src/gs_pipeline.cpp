@@ -627,6 +627,20 @@ void VulkanGSPipeline::createQueryPools() {
     queryPoolCreateInfo.queryCount = MAX_TIMESTAMP_QUERY_COUNT;
     if (vkCreateQueryPool(device, &queryPoolCreateInfo, nullptr, &timestamp_query_pool) != VK_SUCCESS)
         _THROW_ERROR("Failed to create timestamp query pool");
+
+    timestamp_queries_enabled = false;
+    if (timestamp_query_pool != VK_NULL_HANDLE && physical_device != VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physical_device, &props);
+        uint32_t qf_count = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, nullptr);
+        std::vector<VkQueueFamilyProperties> qf_props(qf_count);
+        if (qf_count > 0) {
+            vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, qf_props.data());
+        }
+        bool valid_bits = (queue_family_index < qf_count) && (qf_props[queue_family_index].timestampValidBits > 0);
+        timestamp_queries_enabled = (props.limits.timestampPeriod > 0.0f) && valid_bits;
+    }
 }
 
 void VulkanGSPipeline::createShaderModule(const std::vector<uint32_t>& spirv_code, VkShaderModule *pShaderModule) {

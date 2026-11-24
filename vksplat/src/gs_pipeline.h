@@ -73,6 +73,7 @@ public:
     }
     bool writeTimestamp(int delta);
     bool writeTimestampNoExcept(int delta);
+    bool isTimestampQueriesEnabled() const { return timestamp_queries_enabled; }
     // Batched steps: only the first step of a batch records the full stage breakdown, the others only the
     // timers the backward-variant scheduler needs (the query pool is small).
     bool timestamp_scheduling_only = false;
@@ -182,6 +183,7 @@ protected:
     void waitAppendFence();
     void freeAppendStage();
     VkQueryPool timestamp_query_pool;
+    bool timestamp_queries_enabled = false;
 
     enum class DeviceVendor {
         Unknown,
