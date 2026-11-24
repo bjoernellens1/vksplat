@@ -10,6 +10,7 @@ groupshared float4 collected_inv_cov_vs_opacity[TILE_SIZE];
 #endif
 
 groupshared uint32_t collected_idx[TILE_SIZE];
+groupshared float collected_depths[TILE_SIZE];
 
 groupshared float subgroup_shared[TILE_SIZE];
 
@@ -30,6 +31,12 @@ layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile l
 layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
 layout(binding=13) StructuredBuffer<uint32_t> group_state;
 layout(binding=14) StructuredBuffer<uint32_t> splat_state;
+layout(binding=15) RWByteAddressBuffer out_ago_contrib;
+layout(binding=16) RWByteAddressBuffer out_ago_abs_grad;
+layout(binding=17) StructuredBuffer<float> depths;
+layout(binding=18) StructuredBuffer<float4> final_depth_state;
+layout(binding=19) StructuredBuffer<float2> train_depth_weight;
+layout(binding=20) RWByteAddressBuffer out_v_depths;
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -62,13 +69,34 @@ void main(
     int splats_left_to_process = tile_idx_end - tile_idx_start;
     uint32_t current_splat_offset = tile_idx_end - tile_idx_start;
 
+    const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
+    const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f);
+
     float4 current_pixel_state = float4(0.0);
     int32_t n_contrib_fwd = 0;
+    float d_exp_pix = 0.0f;
+    float g_D_eff = 0.0f;
+    float v_T_depth = 0.0f;
     if (is_inside) {
         uint32_t pix_id = pix_coord.y * W + pix_coord.x;
         current_pixel_state = final_pixel_state[pix_id];
         n_contrib_fwd = n_contributors[pix_id];
         d_current_pixel_state = v_current_pixel_state[pix_id];
+        if (depth_enabled) {
+            float4 pd = final_depth_state[pix_id];
+            float d_exp_norm = pd.x;
+            float acc_alpha = pd.z;
+            float2 dw = train_depth_weight[pix_id];
+            if (dw.x > 0.0f && dw.y > 0.0f && acc_alpha > 0.1f) {
+                float d_exp_m = d_exp_norm * uniforms.depth_inv_scale;
+                float r = d_exp_m - dw.x;
+                float delta = uniforms.depth_huber_delta;
+                float d_huber = clamp(r, -delta, delta) / delta;
+                float g_D_norm = (uniforms.depth_loss_scale * dw.y * d_huber) * uniforms.depth_inv_scale;
+                g_D_eff = g_D_norm / acc_alpha;
+                d_exp_pix = d_exp_norm;
+            }
+        }
     }
 
     // Subgroup-first early contributor bound (ported from eligsir-native 06_alpha_backward:m5_subgroup_first)
@@ -99,6 +127,9 @@ void main(
             uint32_t coll_id = uint32_t(sorted_gauss_idx[tile_idx_end - uint32_t(progress) - 1]);
             collected_idx[thread_rank] = coll_id;
             collected_splats[thread_rank] = load_splat_alphablend(coll_id, xy_vs, inv_cov_vs_opacity, rgb);
+            if (depth_enabled) {
+                collected_depths[thread_rank] = depths[coll_id];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
 
@@ -117,6 +148,9 @@ void main(
                 float2 d_xy_vs = float2(0.0);
                 float4 d_inv_cov_vs_opacity = float4(0.0);
                 float3 d_rgb = float3(0.0);
+                float d_depth = 0.0;
+                float ago_contrib = 0.0;
+                float ago_abs_grad = 0.0;
             #endif
 
             bool active = false;
@@ -128,6 +162,8 @@ void main(
                     active = true;
                     // Undo pixel state
                     current_pixel_state = undo_pixel_state(current_pixel_state, gauss_rgba);
+                    float T_i = current_pixel_state.a;
+                    float alpha_i = gauss_rgba.a;
 
                     // Back-prop automatically through blending and gaussian evaluation.
                     dp_g = diffPair(g);
@@ -136,11 +172,26 @@ void main(
 
                     bwd_diff(update_pixel_state)(dp_current_pixel_state, dp_gauss_rgba, d_current_pixel_state);
                     d_current_pixel_state = dp_current_pixel_state.getDifferential();
+                    float4 d_gauss_rgba = dp_gauss_rgba.d;
+                    if (depth_enabled && g_D_eff != 0.0f) {
+                        float z_i = collected_depths[j];
+                        float depth_d = g_D_eff * (z_i - d_exp_pix);
+                        float d_alpha_depth = T_i * (depth_d - v_T_depth);
+                        v_T_depth = v_T_depth * (1.0f - alpha_i) + alpha_i * depth_d;
+                        d_gauss_rgba.a += d_alpha_depth;
+                        d_depth = T_i * alpha_i * g_D_eff;
+                    }
                     if (freeze != 2) {  // protected LOCKED: the recurrence above is all that is needed
-                        bwd_diff(evaluate_splat)(dp_g, center_pix_coord, dp_gauss_rgba.d);
+                        bwd_diff(evaluate_splat)(dp_g, center_pix_coord, d_gauss_rgba);
                         d_xy_vs = dp_g.d.xy_vs;
                         d_inv_cov_vs_opacity = dp_g.d.inv_cov_vs_opacity;
                         d_rgb = dp_g.d.rgb;
+                    }
+                    if (ago_enabled) {
+                        ago_contrib = T_i * alpha_i;
+                        if (freeze == 0) {
+                            ago_abs_grad = length(d_xy_vs);
+                        }
                     }
                 }
             }
@@ -169,6 +220,9 @@ void main(
             float temp_p0, temp_p1;
             float temp_s0, temp_s1, temp_s2, temp_s3;
             float temp_c0, temp_c1, temp_c2;
+            float temp_d = 0.0;
+            float temp_ago_c = 0.0;
+            float temp_ago_g = 0.0;
             temp_p0 = 0.0; temp_p1 = 0.0; temp_s0 = 0.0; temp_s1 = 0.0; temp_s2 = 0.0; temp_s3 = 0.0;
             if (freeze == 0) {
                 subgroupSumF32(temp_p0, d_xy_vs.x);
@@ -177,6 +231,15 @@ void main(
                 subgroupSumF32(temp_s1, d_inv_cov_vs_opacity.y);
                 subgroupSumF32(temp_s2, d_inv_cov_vs_opacity.z);
                 subgroupSumF32(temp_s3, d_inv_cov_vs_opacity.w);
+                if (depth_enabled) {
+                    subgroupSumF32(temp_d, d_depth);
+                }
+                if (ago_enabled) {
+                    subgroupSumF32(temp_ago_g, ago_abs_grad);
+                }
+            }
+            if (ago_enabled) {
+                subgroupSumF32(temp_ago_c, ago_contrib);
             }
             subgroupSumF32(temp_c0, float(d_rgb.x));
             subgroupSumF32(temp_c1, float(d_rgb.y));
@@ -202,6 +265,13 @@ void main(
                 _ATOMIC_ADD(v_rgb, 3*g_idx+0, temp_c0);
                 _ATOMIC_ADD(v_rgb, 3*g_idx+1, temp_c1);
                 _ATOMIC_ADD(v_rgb, 3*g_idx+2, temp_c2);
+                if (depth_enabled) {
+                    _ATOMIC_ADD(out_v_depths, g_idx, temp_d);
+                }
+                if (ago_enabled) {
+                    _ATOMIC_ADD(out_ago_contrib, g_idx, temp_ago_c);
+                    _ATOMIC_ADD(out_ago_abs_grad, g_idx, temp_ago_g);
+                }
             }
 
         #endif  // EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD

@@ -25,6 +25,8 @@ groupshared float2 collected_xy_vs[TILE_SIZE];  // 2 KB
 groupshared float4 collected_inv_cov_vs_opacity[TILE_SIZE];  // 4 KB
 
 groupshared float3 collected_rgb[TILE_SIZE];  // 3 KB or 4 KB
+groupshared float collected_depths[TILE_SIZE];  // 1 KB
+groupshared float shared_g_D_eff[TILE_SIZE];  // 1 KB
 
 #if !USE_SUBGROUP_OPERATIONS
 groupshared float splat_embeds[TILE_SIZE][6];  // 6 KB or 8 KB
@@ -93,6 +95,12 @@ layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile l
 layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
 layout(binding=13) StructuredBuffer<uint32_t> group_state;
 layout(binding=14) StructuredBuffer<uint32_t> splat_state;
+layout(binding=15) RWByteAddressBuffer out_ago_contrib;
+layout(binding=16) RWByteAddressBuffer out_ago_abs_grad;
+layout(binding=17) StructuredBuffer<float> depths;
+layout(binding=18) StructuredBuffer<float4> final_depth_state;
+layout(binding=19) StructuredBuffer<float2> train_depth_weight;
+layout(binding=20) RWByteAddressBuffer out_v_depths;
 
 
 [shader("compute")]
@@ -115,9 +123,14 @@ void main(
     uint pixel_batch_rank = groupThreadID.x / SPLAT_BATCH_SIZE;
     uint group_thread_rank = pixel_batch_rank * SPLAT_BATCH_SIZE + thread_rank;
 
+    const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
+    const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f);
+
     float pixel_T = 0.0;
     float4 v_pixel_state = float4(0.0);
     int n_contrib_fwd = 0;
+    float d_exp_pix = 0.0f;
+    float g_D_eff = 0.0f;
     {
         const uint pi = group_thread_rank;
         uint2 pix_coord = tbound0 + uint2(pi%TILE_WIDTH, pi/TILE_WIDTH);
@@ -128,6 +141,24 @@ void main(
             pixel_T = final_pixel_state[pix_id].w;
             n_contrib_fwd = n_contributors[pix_id];
             v_pixel_state = v_current_pixel_state[pix_id];
+            if (depth_enabled) {
+                float4 pd = final_depth_state[pix_id];
+                float d_exp_norm = pd.x;
+                float acc_alpha = pd.z;
+                float2 dw = train_depth_weight[pix_id];
+                if (dw.x > 0.0f && dw.y > 0.0f && acc_alpha > 0.1f) {
+                    float d_exp_m = d_exp_norm * uniforms.depth_inv_scale;
+                    float r = d_exp_m - dw.x;
+                    float delta = uniforms.depth_huber_delta;
+                    float d_huber = clamp(r, -delta, delta) / delta;
+                    float g_D_norm = (uniforms.depth_loss_scale * dw.y * d_huber) * uniforms.depth_inv_scale;
+                    g_D_eff = g_D_norm / acc_alpha;
+                    d_exp_pix = d_exp_norm;
+                }
+            }
+        }
+        if (depth_enabled) {
+            shared_g_D_eff[pi] = g_D_eff;
         }
     }
 
@@ -173,6 +204,9 @@ void main(
                 collected_xy_vs[group_thread_rank] = splat.xy_vs;
                 collected_inv_cov_vs_opacity[group_thread_rank] = splat.inv_cov_vs_opacity;
                 collected_rgb[group_thread_rank] = splat.rgb;
+                if (depth_enabled) {
+                    collected_depths[group_thread_rank] = depths[splat_id];
+                }
             }
           #if !USE_SUBGROUP_OPERATIONS
             float es[6];
@@ -225,11 +259,15 @@ void main(
                 T /= 1.0 - a;
                 
                 float3 rgb = collected_rgb[collected_base + si];
-                
+                float total_d = dot(v_rgb, rgb);
+                if (depth_enabled && g_D_eff != 0.0f) {
+                    total_d += g_D_eff * (collected_depths[collected_base + si] - d_exp_pix);
+                }
+
                 float aT = a * T;
-                float v_a = aT * (dot(v_rgb, rgb) - v_T) * float(a < ALPHA_BLEND_MAX_OPACITY);
-                v_T = v_T * (1.0-a) + a * dot(v_rgb, rgb);
-                
+                float v_a = aT * (total_d - v_T) * float(a < ALPHA_BLEND_MAX_OPACITY);
+                v_T = v_T * (1.0-a) + a * total_d;
+
                 shared_alpha[si][pi] = float2(aT, v_a);
             }
             pixel_T = T;
@@ -245,6 +283,9 @@ void main(
             float2 v_xy_vs = float2(0.0);
             float4 v_inv_cov_vs_opacity = float4(0.0);
             float3 v_rgb = float3(0.0);
+            float v_depth = 0.0;
+            float ago_contrib = 0.0;
+            float ago_abs_grad = 0.0;
 
             const int si = thread_rank;
             float v[6] = {0, 0, 0, 0, 0, 0};
@@ -282,6 +323,20 @@ void main(
                 for (int k = 0; k < 6; k++)
                     v[k] += w * ep[k];
                 v_rgb += a * loaded_rgb;
+                if (depth_enabled) {
+                    v_depth += a * shared_g_D_eff[pi];
+                }
+                if (ago_enabled && a > 0.0f) {
+                    ago_contrib += a;
+                    float2 pix_xy = float2(tbound0 + uint2(pi % TILE_WIDTH, pi / TILE_WIDTH));
+                    float2 d_pix = pix_xy - splat.xy_vs;
+                    float3 g_ic = splat.inv_cov_vs_opacity.xyz;
+                    float2 d_xy_pix = float2(
+                        (g_ic.x * d_pix.x + g_ic.y * d_pix.y) * w,
+                        (g_ic.y * d_pix.x + g_ic.z * d_pix.y) * w
+                    );
+                    ago_abs_grad += length(d_xy_pix);
+                }
             }
 
             embedSBwd(
@@ -294,10 +349,34 @@ void main(
                 v_xy_vs = float2(0);
                 v_inv_cov_vs_opacity = float4(0);
                 v_rgb = float3(0);
+                v_depth = 0.0;
+                ago_contrib = 0.0;
+                ago_abs_grad = 0.0;
             }
 
             if (!(splat_id >= 0))
                 continue;
+
+            if (depth_enabled || ago_enabled) {
+                int32_t g_id_direct = collected_idx[splat_id];
+                const uint freeze_direct = splat_freeze_mode(g_id_direct, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state);
+              #if USE_EMULATED_F32_ATOMIC
+                #define _ATOMIC_ADD_EXTRA(buffer, address, value) \
+                    if (value != 0.0) AtomicAddFloat(buffer, (address)*sizeof(float), value);
+              #else
+                #define _ATOMIC_ADD_EXTRA(buffer, address, value) \
+                    if (value != 0.0) buffer.InterlockedAddF32((address)*sizeof(float), value);
+              #endif
+                if (depth_enabled && freeze_direct == 0) {
+                    _ATOMIC_ADD_EXTRA(out_v_depths, g_id_direct, v_depth);
+                }
+                if (ago_enabled) {
+                    _ATOMIC_ADD_EXTRA(out_ago_contrib, g_id_direct, ago_contrib);
+                    if (freeze_direct == 0) {
+                        _ATOMIC_ADD_EXTRA(out_ago_abs_grad, g_id_direct, ago_abs_grad);
+                    }
+                }
+            }
           #if GROUP_REDUCE_BEFORE_ATOMIC > 0
             v = { v_xy_vs.x, v_xy_vs.y, v_inv_cov_vs_opacity.x, v_inv_cov_vs_opacity.y,
                   v_inv_cov_vs_opacity.z, v_inv_cov_vs_opacity.w };

@@ -47,7 +47,7 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     uint32_t active_splat_count;
     uint32_t use_active_index_dispatch;
     uint32_t ago_telemetry_enabled;
-    uint32_t _ago_pad;
+    uint32_t depth_loss_enabled;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -93,12 +93,18 @@ VulkanGSTrainer::~VulkanGSTrainer() {
 void VulkanGSTrainer::cleanup() {
     HOST_GUARD;
 
-    for (auto im : dataset_train) {
+    for (auto& im : dataset_train) {
         destroyBuffer(im.buffer.deviceBuffer);
         im.buffer.clear();
         im.buffer.shrink_to_fit();
+        destroyBuffer(im.depth_weight.deviceBuffer);
+        im.depth_weight.clear();
+        im.depth_weight.shrink_to_fit();
+        im.has_depth = false;
     }
     dataset_train.clear();
+    depth_loss_weight_ = 0.0f;
+    depth_huber_delta_ = 0.15f;
 
     for (auto im : dataset_val) {
         destroyBuffer(im.buffer.deviceBuffer);
@@ -928,6 +934,12 @@ void VulkanGSTrainer::camera_to_uniforms(const Camera &cam, VulkanGSRendererUnif
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
             uniforms.world_view_transform[4*i+j] = cam.world_view_transform[i][j];
+
+    uniforms.ago_telemetry_enabled = 0u;
+    uniforms.depth_loss_scale = 0.0f;
+    uniforms.depth_huber_delta = 0.15f;
+    uniforms.depth_inv_scale = 1.0f;
+    uniforms._pad_depth = 0.0f;
 }
 
 float VulkanGSTrainer::get_world_to_normalized_scale() const {
@@ -1181,6 +1193,65 @@ void VulkanGSTrainer::set_ago_telemetry_host(const float* data, size_t n_floats)
     uploadDeviceSlice(ago_telemetry_buf_.deviceBuffer, 0, data, n_floats * sizeof(float));
 }
 
+void VulkanGSTrainer::set_train_depth(
+    size_t frame_idx,
+    const float* depth_m,
+    const float* weight_map,
+    int h,
+    int w
+) {
+    if (frame_idx >= dataset_train.size()) {
+        throw std::out_of_range("set_train_depth: frame_idx out of range");
+    }
+    auto& img = dataset_train[frame_idx];
+    if (h != img.camera.h || w != img.camera.w) {
+        throw std::invalid_argument(
+            "set_train_depth: depth_m shape (" + std::to_string(h) + ", " + std::to_string(w) +
+            ") does not match frame shape (" + std::to_string(img.camera.h) + ", " +
+            std::to_string(img.camera.w) + ")"
+        );
+    }
+    const size_t n_pix = static_cast<size_t>(h) * static_cast<size_t>(w);
+    HOST_GUARD;
+    img.depth_weight.resize(2 * n_pix);
+    for (size_t i = 0; i < n_pix; ++i) {
+        const float d = (std::isfinite(depth_m[i]) && depth_m[i] > 0.0f) ? depth_m[i] : 0.0f;
+        float wt = 0.0f;
+        if (d > 0.0f) {
+            if (weight_map != nullptr) {
+                wt = (std::isfinite(weight_map[i]) && weight_map[i] > 0.0f) ? weight_map[i] : 0.0f;
+            } else {
+                wt = 1.0f;
+            }
+        }
+        img.depth_weight[2 * i + 0] = d;
+        img.depth_weight[2 * i + 1] = wt;
+    }
+    copyToDevice(img.depth_weight);
+    img.has_depth = true;
+}
+
+void VulkanGSTrainer::clear_train_depths() {
+    HOST_GUARD;
+    for (auto& img : dataset_train) {
+        destroyBuffer(img.depth_weight.deviceBuffer);
+        img.depth_weight.clear();
+        img.depth_weight.shrink_to_fit();
+        img.has_depth = false;
+    }
+}
+
+void VulkanGSTrainer::set_depth_loss_weight(float lambda_depth, float huber_delta) {
+    if (!std::isfinite(lambda_depth) || lambda_depth < 0.0f) {
+        throw std::invalid_argument("set_depth_loss_weight: lambda_depth must be finite and >= 0");
+    }
+    if (!std::isfinite(huber_delta) || huber_delta <= 0.0f) {
+        throw std::invalid_argument("set_depth_loss_weight: huber_delta must be finite and > 0");
+    }
+    depth_loss_weight_ = lambda_depth;
+    depth_huber_delta_ = huber_delta;
+}
+
 void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     const TrainerConfig &config,
     const VulkanGSRendererUniforms& uniforms,
@@ -1200,11 +1271,22 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
         dispatch_active && active_splat_count_ > 0u && active_splat_count_ < num_splats;
     const size_t dispatch_count = use_active_dispatch ? static_cast<size_t>(active_splat_count_) : num_splats;
 
-    bufferMemoryBarrier({
+    const bool depth_loss_active = (uniforms.depth_loss_scale > 0.0f &&
+                                    buffers.v_depths.deviceBuffer.buffer != VK_NULL_HANDLE);
+    std::vector<std::pair<_VulkanBuffer, BarrierMask>> opt_barriers = {
         { buffers.tiles_touched.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.v_xy_vs.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
         { buffers.v_inv_cov_vs_opacity.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
         { buffers.v_rgb.deviceBuffer, COMPUTE_SHADER_READ_WRITE },
-    }, COMPUTE_SHADER_READ);
+    };
+    if (ago_telemetry_enabled_ && ago_contrib_step_buf_.deviceBuffer.buffer != VK_NULL_HANDLE) {
+        opt_barriers.push_back({ ago_contrib_step_buf_.deviceBuffer, COMPUTE_SHADER_READ_WRITE });
+        opt_barriers.push_back({ ago_abs_grad_step_buf_.deviceBuffer, COMPUTE_SHADER_READ_WRITE });
+    }
+    if (depth_loss_active) {
+        opt_barriers.push_back({ buffers.v_depths.deviceBuffer, COMPUTE_SHADER_READ_WRITE });
+    }
+    bufferMemoryBarrier(opt_barriers, COMPUTE_SHADER_READ);
 
     VulkanGSFusedProjectionBackwardOptimizerUniforms shaderUniforms;
     shaderUniforms.step = step;
@@ -1270,7 +1352,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.active_splat_count = use_active_dispatch ? active_splat_count_ : static_cast<uint32_t>(num_splats);
     shaderUniforms.use_active_index_dispatch = use_active_dispatch ? 1u : 0u;
     shaderUniforms.ago_telemetry_enabled = ago_telemetry_enabled_ ? 1u : 0u;
-    shaderUniforms._ago_pad = 0u;
+    shaderUniforms.depth_loss_enabled = depth_loss_active ? 1u : 0u;
     ago_last_step_ = step;
     if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() == 0) {
         resizeDeviceBuffer(active_indices_buf_, 1);
@@ -1282,6 +1364,10 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
         alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
     if (ago_telemetry_enabled_) {
         resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * alloc_size, true);
+        if (ago_contrib_step_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_contrib_step_buf_.deviceSize() < num_splats) {
+            clearDeviceBuffer(ago_contrib_step_buf_, std::max<size_t>(1, num_splats));
+            clearDeviceBuffer(ago_abs_grad_step_buf_, std::max<size_t>(1, num_splats));
+        }
     } else if (ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_telemetry_buf_.deviceSize() == 0) {
         resizeDeviceBuffer(ago_telemetry_buf_, 8);
     }
@@ -1309,6 +1395,9 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             buffers.splat_anchor.deviceBuffer,
             active_indices_buf_.deviceBuffer,
             ago_telemetry_buf_.deviceBuffer,
+            ago_telemetry_enabled_ ? ago_contrib_step_buf_.deviceBuffer : ago_telemetry_buf_.deviceBuffer,
+            ago_telemetry_enabled_ ? ago_abs_grad_step_buf_.deviceBuffer : ago_telemetry_buf_.deviceBuffer,
+            depth_loss_active ? buffers.v_depths.deviceBuffer : ago_telemetry_buf_.deviceBuffer,
         },
         GATE_OPTIMIZER
     );
@@ -2812,6 +2901,7 @@ void VulkanGSTrainer::clear_train_images() {
     HOST_GUARD;
     for (auto& img : dataset_train) {
         destroyBuffer(img.buffer.deviceBuffer);
+        destroyBuffer(img.depth_weight.deviceBuffer);
     }
     dataset_train.clear();
 }
@@ -2957,6 +3047,12 @@ void VulkanGSTrainer::replace_train_image_from_memory(
         throw std::runtime_error("replace_train_image_from_memory: train_idx out of range");
     }
     auto& slot = dataset_train[train_idx];
+    if (slot.has_depth) {
+        destroyBuffer(slot.depth_weight.deviceBuffer);
+        slot.depth_weight.clear();
+        slot.depth_weight.shrink_to_fit();
+        slot.has_depth = false;
+    }
     slot.image_path = image_name;
     slot.camera.model = Camera::PINHOLE;
     slot.camera.h = h;

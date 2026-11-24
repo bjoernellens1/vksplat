@@ -426,6 +426,8 @@ void VulkanGSPipeline::destroyBuffer(_VulkanBuffer &buffer) {
         if (current_vram < buffer.allocSize)
             _THROW_ERROR("Negative VRAM");
         current_vram -= buffer.allocSize;
+        buffer.allocSize = 0;
+        buffer.size = 0;
     }
 }
 
