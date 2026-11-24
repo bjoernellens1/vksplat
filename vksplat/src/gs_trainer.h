@@ -258,6 +258,34 @@ public:
     int get_ago_last_step() const { return ago_last_step_; }
     void set_ago_last_step(int step) { ago_last_step_ = step; }
 
+    // AGO-2 GPU-resident zero-readback active-set selection & 16-byte step-gain summary
+    struct AgoActiveSetSummary {
+        uint32_t active_count = 0u;
+        uint32_t num_gaussians = 0u;
+        uint32_t eligible_count = 0u;
+        float active_fraction = 1.0f;
+        float total_predicted_gain = 0.0f;
+        float mean_predicted_gain = 0.0f;
+        float max_predicted_gain = 0.0f;
+        float gain_threshold = 0.0f;
+        bool fell_back_to_full = false;
+    };
+    AgoActiveSetSummary select_ago_active_set_gpu(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float gain_threshold = 0.0f,
+        float newborn_warmup_steps = 2.0f,
+        bool exclude_frozen = true
+    );
+    AgoActiveSetSummary select_ago_adaptive_active_set_gpu(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float target_gain_ratio = 0.5f,
+        float newborn_warmup_steps = 2.0f,
+        bool exclude_frozen = true
+    );
+    AgoActiveSetSummary get_ago_step_gain_summary(size_t current_num_gaussians) const;
+
     // D1 opt-in native differentiable physical expected-depth supervision
     void set_train_depth(size_t frame_idx, const float* depth_m, const float* weight_map, int h, int w);
     void clear_train_depths();
@@ -552,6 +580,12 @@ private:
     bool ago_telemetry_enabled_ = false;
     Buffer<float> ago_telemetry_buf_;
     int ago_last_step_ = 0;
+
+    // AGO-2 GPU-resident active-set compaction & 16-byte summary buffer
+    Buffer<uint32_t> ago_select_summary_buf_;
+    _ComputePipeline pipeline_ago_select_active_set = _ComputePipeline(6);
+    AgoActiveSetSummary last_ago_summary_{};
+    float ago_prev_mean_gain_ = 0.0f;
 
     // D1 opt-in differentiable physical expected-depth loss (strictly opt-in; 0.0 = disabled)
     float depth_loss_weight_ = 0.0f;
