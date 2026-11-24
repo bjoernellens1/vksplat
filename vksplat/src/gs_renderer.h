@@ -24,7 +24,11 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     uint32_t use_tile_list;  // 1: backward kernels run over the compacted active-tile list
     uint32_t freeze_flags;  // bit 0: IMAGINED groups present, bit 1: protected LOCKED groups present (backward skips their atomics)
     uint32_t num_groups;
-    float _pad_tile2;
+    uint32_t ago_telemetry_enabled;
+    float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
+    float depth_huber_delta;   // Huber delta in meters
+    float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
+    float _pad_depth;
 });
 
 
@@ -41,7 +45,11 @@ public:
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForwardDepth(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
-    void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+    void executeRasterizeBackward(
+        const VulkanGSRendererUniforms& uniforms,
+        VulkanGSPipelineBuffers& buffers,
+        const _VulkanBuffer* train_depth_weight_buf = nullptr
+    );
     // true when the backward pass of the scheduler pick `impl` is dispatched per pixel (2D) rather than per tile
     static bool backwardImplIsPerPixel(int impl) { return impl == 0; }
 
@@ -141,12 +149,15 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
     _ComputePipelinePair pipeline_rasterize_forward_depth = _ComputePipelinePair(9);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
-        _ComputePipelinePair(15),  // per pixel
-        _ComputePipelinePair(15),  // per splat
-        _ComputePipelinePair(15),  // tensor
-        _ComputePipelinePair(15),  // tensor
-        _ComputePipelinePair(15),  // tensor
+        _ComputePipelinePair(21),  // per pixel
+        _ComputePipelinePair(21),  // per splat
+        _ComputePipelinePair(21),  // tensor
+        _ComputePipelinePair(21),  // tensor
+        _ComputePipelinePair(21),  // tensor
     };
+    // Per-step AGO rasterize-backward scratch buffers (zeroed & accumulated only when ago_telemetry_enabled != 0)
+    Buffer<float> ago_contrib_step_buf_;
+    Buffer<float> ago_abs_grad_step_buf_;
     struct _CumsumComputePipeline {
         _ComputePipeline single_pass = _ComputePipeline(2);
         _ComputePipeline block_scan = _ComputePipeline(3);

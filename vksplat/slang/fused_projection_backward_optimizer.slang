@@ -32,6 +32,9 @@ layout(binding=17) StructuredBuffer<uint32_t> active_indices;  // (active_splat_
 //   [2*i + 0] = (grad_norm, update_norm, predicted_gain, abs_proj_grad)  -- accumulated sums since reset
 //   [2*i + 1] = (update_count, contrib_sum, last_step_updated, last_predicted_gain)
 layout(binding=18) RWStructuredBuffer<float4> ago_telemetry;
+layout(binding=19) StructuredBuffer<float> ago_contrib_step;   // per-step sum(T * alpha) from rasterize backward
+layout(binding=20) StructuredBuffer<float> ago_abs_grad_step;  // per-step sum(length(dL_dmean2d_pixel))
+layout(binding=21) StructuredBuffer<float> v_output_depths;    // per-Gaussian dL/dz_cam from depth loss
 
 
 // Adam optimizer
@@ -83,7 +86,7 @@ struct ShaderUniforms {
     uint32_t active_splat_count;
     uint32_t use_active_index_dispatch;
     uint32_t ago_telemetry_enabled;
-    uint32_t _ago_pad;
+    uint32_t depth_loss_enabled;
 };
 
 
@@ -146,12 +149,12 @@ void main(
     float2 v_out_xy_vs = is_zero_grad ? float2(0) : v_output_xy_vs[g_idx];
     float4 v_out_inv_cov_vs_opac = is_zero_grad ? float4(0) :
       v_output_inv_cov_vs[g_idx];
-    float v_out_depths = 0.0;
+    float v_out_depths = (uniforms.depth_loss_enabled != 0u && !is_zero_grad) ? v_output_depths[g_idx] : 0.0f;
     float3 v_out_rgb = is_zero_grad ? float3(0) :
       float3(read_t3_float3(g_idx, v_output_rgb));
 
     if (!is_zero_grad) {
-        is_zero_grad = all(v_out_xy_vs == 0.0f) && all(v_out_inv_cov_vs_opac == 0.0f) && all(v_out_rgb == 0.0f);
+        is_zero_grad = all(v_out_xy_vs == 0.0f) && all(v_out_inv_cov_vs_opac == 0.0f) && all(v_out_rgb == 0.0f) && (v_out_depths == 0.0f);
     }
 
     // Freeze Adam momentum and regularization on unobserved steps (zero pixel differential)
@@ -265,13 +268,14 @@ void main(
         float4 g1 = g_rotations[g1_idx];
         float4 g2 = g_rotations[g2_idx];
         optimizer_update(x, v, g1, g2, g1_sc, g2_sc, uniforms.lr_quats);
+        float4 x_applied = bool(NORMALIZE_QUATS_IN_OPTIMIZER) ? normalize(x) : x;
         if (collect_ago) {
-            float4 delta = x - x_old;
+            float4 delta_q = x_applied - x_old;
             ago_grad_sq += dot(v, v);
-            ago_upd_sq += dot(delta, delta);
-            ago_pred_gain += -dot(v, delta);
+            ago_upd_sq += dot(delta_q, delta_q);
+            ago_pred_gain += -dot(v, delta_q);
         }
-        rotations[g_idx] = bool(NORMALIZE_QUATS_IN_OPTIMIZER) ? normalize(x) : x;
+        rotations[g_idx] = x_applied;
         g_rotations[g1_idx] = g1;
         g_rotations[g2_idx] = g2;
     }
@@ -347,12 +351,11 @@ void main(
         float4 g1 = g_sh_coeffs_1[bid];
         float4 g2 = g_sh_coeffs_2[bid];
         optimizer_update(x, v, g1, g2, g1_sc, g2_sc, lr);
-        if (collect_ago && di == 0) {
-            float3 v_dc = v.xyz;
-            float3 delta_dc = (x - x_old).xyz;
-            ago_grad_sq += dot(v_dc, v_dc);
-            ago_upd_sq += dot(delta_dc, delta_dc);
-            ago_pred_gain += -dot(v_dc, delta_dc);
+        if (collect_ago) {
+            float4 delta_sh = x - x_old;
+            ago_grad_sq += dot(v, v);
+            ago_upd_sq += dot(delta_sh, delta_sh);
+            ago_pred_gain += -dot(v, delta_sh);
         }
         sh_coeffs[bid] = x;
         g_sh_coeffs_1[bid] = g1;
@@ -361,19 +364,20 @@ void main(
 
     if (collect_ago) {
         float g_norm = sqrt(ago_grad_sq);
-        if (g_norm > 0.0f) {
-            float u_norm = sqrt(ago_upd_sq);
-            float proj_g = length(v_out_xy_vs);
+        float u_norm = sqrt(ago_upd_sq);
+        if (u_norm > 1e-12f || g_norm > 0.0f) {
             uint base = 2u * g_idx;
             float4 t0 = ago_telemetry[base + 0u];
             float4 t1 = ago_telemetry[base + 1u];
             t0.x += g_norm;
             t0.y += u_norm;
             t0.z += ago_pred_gain;
-            t0.w += proj_g;
-            t1.x += 1.0f;
-            t1.y += gauss.opacities;
-            t1.z = f_step;
+            t0.w += ago_abs_grad_step[g_idx];
+            if (u_norm > 1e-12f) {
+                t1.x += 1.0f;
+                t1.z = f_step;
+            }
+            t1.y += ago_contrib_step[g_idx];
             t1.w = ago_pred_gain;
             ago_telemetry[base + 0u] = t0;
             ago_telemetry[base + 1u] = t1;

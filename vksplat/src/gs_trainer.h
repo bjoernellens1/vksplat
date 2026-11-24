@@ -162,6 +162,8 @@ public:
         std::string mask_path;
         Camera camera;
         Buffer<uint8_t> buffer;  // (h, w, 4)
+        Buffer<float> depth_weight;  // (h * w * 2) interleaved [depth_m, weight], empty if no depth attached
+        bool has_depth = false;
     };
 
     void initialize(const std::map<std::string, std::string> &spirv_paths, int device_id);
@@ -255,6 +257,19 @@ public:
     void set_ago_telemetry_host(const float* data, size_t n_floats);
     int get_ago_last_step() const { return ago_last_step_; }
     void set_ago_last_step(int step) { ago_last_step_ = step; }
+
+    // D1 opt-in native differentiable physical expected-depth supervision
+    void set_train_depth(size_t frame_idx, const float* depth_m, const float* weight_map, int h, int w);
+    void clear_train_depths();
+    void set_depth_loss_weight(float lambda_depth, float huber_delta = 0.15f);
+    float get_depth_loss_weight() const { return depth_loss_weight_; }
+    float get_depth_huber_delta() const { return depth_huber_delta_; }
+    bool frame_has_depth_loss(size_t train_idx) const {
+        return depth_loss_weight_ > 0.0f && train_idx < dataset_train.size() && dataset_train[train_idx].has_depth;
+    }
+    const _VulkanBuffer* get_train_depth_buffer(size_t train_idx) const {
+        return frame_has_depth_loss(train_idx) ? &dataset_train[train_idx].depth_weight.deviceBuffer : nullptr;
+    }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
     void uploadFrameImage(Buffer<uint8_t>& image, const uint8_t* rgba_pixels, size_t n_bytes);
@@ -538,6 +553,10 @@ private:
     Buffer<float> ago_telemetry_buf_;
     int ago_last_step_ = 0;
 
+    // D1 opt-in differentiable physical expected-depth loss (strictly opt-in; 0.0 = disabled)
+    float depth_loss_weight_ = 0.0f;
+    float depth_huber_delta_ = 0.15f;
+
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
@@ -547,7 +566,7 @@ private:
     _ComputePipeline pipeline_ssim_grad = _ComputePipeline(5);
     _ComputePipeline pipeline_ssim_stats_ds2 = _ComputePipeline(3);  // SSIM on the 2x2 box-averaged images
     _ComputePipeline pipeline_ssim_grad_ds2 = _ComputePipeline(5);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(19);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(22);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
         _ComputePipeline compute_grow_mask = _ComputePipeline(10);

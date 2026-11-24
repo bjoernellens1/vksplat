@@ -769,7 +769,11 @@ struct Uniforms {
     uint use_tile_list;
     uint freeze_flags;  // bit 0: IMAGINED groups present, bit 1: protected LOCKED groups present (0: no lookup)
     uint num_groups;
-    float _pad_tile2;
+    uint ago_telemetry_enabled;
+    float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
+    float depth_huber_delta;   // Huber delta in meters
+    float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
+    float _pad_depth;
 }
 
 // Per-splat evidence states (Sub-Plan V17.7) + SURFEL_2D primitive flag (defined in config.slang)

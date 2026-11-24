@@ -109,14 +109,14 @@
         "fused_projection_backward_optimizer.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
-                "slang/fused_projection_backward_optimizer.slang": "3dd8acdabed3f994769d8685e270221efe161250d13f377c50a1fb2995953f4d",
+                "slang/fused_projection_backward_optimizer.slang": "a4dc694228ac74fd18f418ee6b48c2bda42602ace06fb7f871c0ec2dc56ec814",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9",
-                "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e",
+                "slang/utils.slang": "55448853c3b379a88d2b7c2389145426aa4c8f20a25973bae2bbca2026d0ef07",
                 "slang/vertex_shader.slang": "6c76579bef6b2ffa402ecd41ffd70d878142a56e4a63ad10fcbb2a2e43242462"
             },
             "outputs": {
-                "shader/generated/fused_projection_backward_optimizer.spv": "9e09527022521624dcac3a4bb5d08322a71c962437206dac5810b5e026cc185d"
+                "shader/generated/fused_projection_backward_optimizer.spv": "f748b9d301ea02c712ff07e479613c97ed113fe4c01c775aa4213a2aabf0fd6f"
             }
         },
         "ssim.slang": {
@@ -144,42 +144,42 @@
         "alphablend_shader.slang": {
             "sources": {
                 "slang/alphablend_shader.slang": "76aa16e6d914cee56f0e4fc98d409eae1cb4edce6e87f1e85bbd5c87f7902b90",
-                "slang/alphablend_shader_bwd_per_pixel.slang": "0f11047642ba4508d78dcfa8db40570559b78451bde597d2f304d59536430cfd",
-                "slang/alphablend_shader_bwd_per_splat.slang": "1568430e083272b5044ff8ecbf80caccc3c5f08960ee2986dcec49e9b3975e1c",
-                "slang/alphablend_shader_bwd_tensor.slang": "075c20cf569375a809301ca1f70a1a658521dccd5d58e7d9a81a29d5d3b277aa",
+                "slang/alphablend_shader_bwd_per_pixel.slang": "c01e2db972b49c3f7040bdaf7532dc12229c53312774fd75a03b83bba9256663",
+                "slang/alphablend_shader_bwd_per_splat.slang": "e0c40a606b27fa0197b303d1fc26705c8bd2189c12d5a09f1797d1361f673cad",
+                "slang/alphablend_shader_bwd_tensor.slang": "0beda38d7edf442100f84285c500b043f61ac506daa6fc37f1f69983a7c15b12",
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
-                "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e"
+                "slang/utils.slang": "55448853c3b379a88d2b7c2389145426aa4c8f20a25973bae2bbca2026d0ef07"
             },
             "outputs": {
-                "shader/generated/rasterize_backward_0.spv": "1c039dc329fac839af9cff14048e26aa39a1b579f7af6d98fe3485ee6e53703a",
-                "shader/generated/rasterize_backward_1.spv": "108c59c1199befecf81d06e3695572d6d6581f7a8333334de0c691c1739a28e1",
-                "shader/generated/rasterize_backward_2.spv": "a0728873465a87b8c8809eacb86443c9874aa5ce6135b822d667c6673b8a6924",
-                "shader/generated/rasterize_backward_3.spv": "b954cb3d08ea5c77a61aa113840170d26277a4f725ba0737f20032d6ef8fd73d",
-                "shader/generated/rasterize_backward_4.spv": "2660fcf72de777af91ef5f7f9158e835cd9462184980e131f0111528a7eabd1b",
-                "shader/generated/rasterize_forward.spv": "48cad5b2a33af23f365da742d2b17a62a9ceb7343763b5c52d82a7df72ccb8f9",
-                "shader/generated/rasterize_forward_depth.spv": "53a78fba3f018f3c7d354aa80725d234c7266e1002f649048f1cf593a09c2163"
+                "shader/generated/rasterize_backward_0.spv": "1641366ba9759eee5029d7b6281993010ede93198f79b2a8e6689755f9d68ff2",
+                "shader/generated/rasterize_backward_1.spv": "de8eed6983f46ca645a75aff1494ad23b59e62f4c466c474caca04652dcc6e64",
+                "shader/generated/rasterize_backward_2.spv": "e60a1f2ce563c766f5d767cb38ca74087b3875216da8f4c5dab521bd5015169b",
+                "shader/generated/rasterize_backward_3.spv": "4b85608e2afea6d82e824a041555316c76684e7e68d7d172195325222167ea09",
+                "shader/generated/rasterize_backward_4.spv": "ac1e5ee0a076c16a565aa7a7db9df5edb44046048be88a170e8af9be41d2cba9",
+                "shader/generated/rasterize_forward.spv": "518322636d9d99fd3e2dfb8df16a25bf41d57b456e39dc907dea7881d66f0cf8",
+                "shader/generated/rasterize_forward_depth.spv": "cc64ca210321b09e727bb5d6d3c1026758d896fadf8834a7eda1d6615e28c486"
             }
         },
         "tile_shader.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/tile_shader.slang": "ae4936128f5adb217cf74b19ea4be1ee90007ded10e22bb61b549afb43475676",
-                "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e"
+                "slang/utils.slang": "55448853c3b379a88d2b7c2389145426aa4c8f20a25973bae2bbca2026d0ef07"
             },
             "outputs": {
-                "shader/generated/compute_tile_ranges.spv": "c2811f9969640265965a86a7e0e304a882e17db9d4e3fe970a8920e2db4af00c",
-                "shader/generated/generate_keys.spv": "924919cbbed3884965d9006bbd2109397be3f6122c33b5c10ece90bee1e9704f"
+                "shader/generated/compute_tile_ranges.spv": "1c9a971eff470fae918384bd02cd749ccd213892a20e35971bcd7467909c1b7d",
+                "shader/generated/generate_keys.spv": "3f3f4348b5feb907e09e43fe132b78997a47394a184d71b124556a2148084979"
             }
         },
         "vertex_shader.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
-                "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e",
+                "slang/utils.slang": "55448853c3b379a88d2b7c2389145426aa4c8f20a25973bae2bbca2026d0ef07",
                 "slang/vertex_shader.slang": "6c76579bef6b2ffa402ecd41ffd70d878142a56e4a63ad10fcbb2a2e43242462"
             },
             "outputs": {
-                "shader/generated/projection_forward.spv": "f5b9d0bf2ea3d4468b29f99aed0f79e3c06b3de1cbd00b634c9d8720343111c8"
+                "shader/generated/projection_forward.spv": "76636bd81e3feff7294399b8cbb89c11e4bfea43dfb8fd06d10d60e660c465ab"
             }
         },
         "appearance_init.slang": {

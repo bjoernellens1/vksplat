@@ -18,6 +18,7 @@ public:
     TrainerConfig config;
     bool isect_capacity_forced = false;  // test hook: skip the proactive capacity growth once
     size_t last_isects = 0;  // intersection count of the last gated step (sizes the next batch)
+    const _VulkanBuffer* current_train_depth_buf = nullptr;  // active frame's depth+weight GPU buffer when D1 depth loss is enabled
 
     template<typename Ti, typename To, bool on_device=true>
     py::array_t<To> buffer_to_array(
@@ -1142,6 +1143,86 @@ public:
         return d;
     }
 
+    // D1 opt-in native differentiable physical expected-depth supervision
+    void set_train_depth(
+        size_t frame_idx,
+        py::array_t<float, py::array::c_style | py::array::forcecast> depth_m,
+        py::object weight_map = py::none()
+    ) {
+        auto d_buf = depth_m.request();
+        if (d_buf.ndim != 2) {
+            throw std::invalid_argument("set_train_depth: depth_m must be a 2D (H, W) float32 array");
+        }
+        const int h = static_cast<int>(d_buf.shape[0]);
+        const int w = static_cast<int>(d_buf.shape[1]);
+        const float* w_ptr = nullptr;
+        py::array_t<float, py::array::c_style | py::array::forcecast> w_arr;
+        if (!weight_map.is_none()) {
+            w_arr = weight_map.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto w_buf = w_arr.request();
+            if (w_buf.ndim != 2 || w_buf.shape[0] != h || w_buf.shape[1] != w) {
+                throw std::invalid_argument("set_train_depth: weight_map must match depth_m shape (H, W)");
+            }
+            w_ptr = static_cast<const float*>(w_buf.ptr);
+        }
+        trainer.set_train_depth(frame_idx, static_cast<const float*>(d_buf.ptr), w_ptr, h, w);
+    }
+
+    void clear_train_depths() {
+        current_train_depth_buf = nullptr;
+        trainer.clear_train_depths();
+    }
+
+    void set_depth_loss_weight(float lambda_depth, float huber_delta = 0.15f) {
+        trainer.set_depth_loss_weight(lambda_depth, huber_delta);
+    }
+
+    float get_depth_loss_weight() const {
+        return trainer.get_depth_loss_weight();
+    }
+
+    // Explicit optimization active-set API (independent of evidence-based freezing)
+    void set_active_set(py::array_t<int64_t, py::array::c_style | py::array::forcecast> indices) {
+        auto buf = indices.request();
+        if (buf.ndim != 1) {
+            throw std::invalid_argument("set_active_set: indices must be a 1D integer array");
+        }
+        const size_t n = buffers.num_splats;
+        const int64_t* ptr = static_cast<const int64_t*>(buf.ptr);
+        const size_t count = static_cast<size_t>(buf.size);
+        std::vector<uint32_t> active;
+        active.reserve(count);
+        std::vector<uint8_t> seen(n, 0);
+        for (size_t i = 0; i < count; ++i) {
+            const int64_t idx = ptr[i];
+            if (idx < 0 || static_cast<size_t>(idx) >= n) {
+                throw std::out_of_range(
+                    "set_active_set: index " + std::to_string(idx) +
+                    " out of range for num_gaussians=" + std::to_string(n)
+                );
+            }
+            const uint32_t u = static_cast<uint32_t>(idx);
+            if (!seen[u]) {
+                seen[u] = 1;
+                active.push_back(u);
+            }
+        }
+        trainer.set_active_indices_gpu(active, n);
+    }
+
+    void clear_active_set() {
+        trainer.invalidateActiveIndexDispatch();
+    }
+
+    py::array_t<uint32_t> get_active_set() {
+        std::vector<uint32_t> active = trainer.get_active_indices_host();
+        return py::array_t<uint32_t>(
+            {static_cast<py::ssize_t>(active.size())},
+            {static_cast<py::ssize_t>(sizeof(uint32_t))},
+            active.data()
+        );
+    }
+
     // AGO-1 exact state snapshot & restore for byte-identical counterfactual gain probes
     py::dict snapshot_ago_state() {
         py::dict snap = snapshot_optimizer_state();
@@ -1198,8 +1279,9 @@ public:
             snap["group_state"] = buffer_to_array<uint32_t, uint32_t>(buffers.group_state);
         }
 
-        std::vector<uint32_t> active = trainer.get_active_indices_host();
-        if (!active.empty()) {
+        if (trainer.get_use_active_index_dispatch() &&
+            trainer.get_active_set_generation() == trainer.get_map_generation()) {
+            std::vector<uint32_t> active = trainer.get_active_indices_host();
             snap["active_set"] = py::array_t<uint32_t>({static_cast<py::ssize_t>(active.size())},
                                                        {static_cast<py::ssize_t>(sizeof(uint32_t))},
                                                        active.data());
@@ -1636,7 +1718,11 @@ public:
     
     void rasterize_forward() {
         try {
-            trainer.executeRasterizeForward(uniforms, buffers);
+            if (uniforms.depth_loss_scale > 0.0f) {
+                trainer.executeRasterizeForwardDepth(uniforms, buffers);
+            } else {
+                trainer.executeRasterizeForward(uniforms, buffers);
+            }
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeRasterizeForward failed");
         }
@@ -1645,7 +1731,7 @@ public:
     void rasterize_backward() {
         set_freeze_flags();
         try {
-            trainer.executeRasterizeBackward(uniforms, buffers);
+            trainer.executeRasterizeBackward(uniforms, buffers, current_train_depth_buf);
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeRasterizeBackward failed");
         }
@@ -1720,6 +1806,7 @@ public:
     void set_train_image(size_t train_idx) {
         trainer.get_train_camera(train_idx, uniforms);
         uniforms.use_tile_list = 0;
+        current_train_depth_buf = nullptr;
     }
 
     // Tells the raster backward which frozen groups exist so that it skips their gradient atomics. The group
@@ -1755,6 +1842,19 @@ public:
         // sentinel: every sparse_full_every-th step is dense so converged tiles are re-verified
         uniforms.use_tile_list = config.sparse_tile_quantile > 0.0f && config.sparse_full_every > 1 &&
                                  step % config.sparse_full_every != 0;
+        uniforms.ago_telemetry_enabled = trainer.get_ago_telemetry_enabled() ? 1u : 0u;
+        if (trainer.frame_has_depth_loss(train_idx)) {
+            const float n_pix = static_cast<float>(std::max<uint32_t>(1u, uniforms.image_height * uniforms.image_width));
+            uniforms.depth_loss_scale = trainer.get_depth_loss_weight() / n_pix;
+            uniforms.depth_huber_delta = trainer.get_depth_huber_delta();
+            uniforms.depth_inv_scale = 1.0f / trainer.get_world_to_normalized_scale();
+            current_train_depth_buf = trainer.get_train_depth_buffer(train_idx);
+        } else {
+            uniforms.depth_loss_scale = 0.0f;
+            uniforms.depth_huber_delta = 0.15f;
+            uniforms.depth_inv_scale = 1.0f;
+            current_train_depth_buf = nullptr;
+        }
     }
 
     // Steps with host-visible work (densify, prune, reset, Morton sort) and calls made inside an open
@@ -2757,6 +2857,23 @@ PYBIND11_MODULE(vksplat, m) {
              "Take an exact byte-identical snapshot of Gaussian parameters, all Adam moments, strategy state, active set, and step for AGO-1 counterfactual probes")
         .def("restore_ago_state", &VkSplat::restore_ago_state,
              "Restore an exact snapshot from snapshot_ago_state() and bump map_generation cleanly", py::arg("snapshot"))
+        .def("set_train_depth", &VkSplat::set_train_depth,
+             "Attach a float32 (H, W) metric physical depth map (meters; <=0 invalid) and optional confidence weight map to training frame `frame_idx`",
+             py::arg("frame_idx"), py::arg("depth_m"), py::arg("weight_map") = py::none())
+        .def("clear_train_depths", &VkSplat::clear_train_depths,
+             "Clear all attached training depth maps")
+        .def("set_depth_loss_weight", &VkSplat::set_depth_loss_weight,
+             "Set opt-in differentiable expected-depth loss weight (0.0 disables) and Huber delta in meters",
+             py::arg("lambda_depth"), py::arg("huber_delta") = 0.15f)
+        .def("get_depth_loss_weight", &VkSplat::get_depth_loss_weight,
+             "Return current differentiable expected-depth loss weight")
+        .def("set_active_set", &VkSplat::set_active_set,
+             "Set explicit optimization active-set Gaussian indices (independent of evidence-based freezing)",
+             py::arg("indices"))
+        .def("clear_active_set", &VkSplat::clear_active_set,
+             "Clear explicit optimization active-set and restore full-map updates")
+        .def("get_active_set", &VkSplat::get_active_set,
+             "Return current optimization active-set uint32 indices (empty if inactive)")
         .def("cleanup", &VkSplat::cleanup, "Cleanup Vulkan resources")
         .DEF_BUFFER_ARRAY(xyz_ws, float, 3, (size_t)-1, "mean")
         .DEF_BUFFER_ARRAY(sh_coeffs, float, 16, 3, "sh")

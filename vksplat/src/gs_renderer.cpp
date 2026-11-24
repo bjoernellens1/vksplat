@@ -27,6 +27,12 @@ void VulkanGSRenderer::cleanup() {
     for (auto* b : {&sparse_residual, &sparse_mask, &sparse_active_tiles, &sparse_args, &sparse_counters})
         destroyBuffer(*b);
     sparse_capacity = 0;
+    destroyBuffer(ago_contrib_step_buf_.deviceBuffer);
+    ago_contrib_step_buf_.clear();
+    ago_contrib_step_buf_.shrink_to_fit();
+    destroyBuffer(ago_abs_grad_step_buf_.deviceBuffer);
+    ago_abs_grad_step_buf_.clear();
+    ago_abs_grad_step_buf_.shrink_to_fit();
     VulkanGSPipeline::cleanup();
 }
 
@@ -374,7 +380,8 @@ void VulkanGSRenderer::initRasterizationBackwardScheduler() {
 
 void VulkanGSRenderer::executeRasterizeBackward(
     const VulkanGSRendererUniforms& uniforms,
-    VulkanGSPipelineBuffers& buffers
+    VulkanGSPipelineBuffers& buffers,
+    const _VulkanBuffer* train_depth_weight_buf
 ) {
     DEVICE_GUARD;
     std::shared_ptr<void> timer = nullptr;
@@ -400,19 +407,40 @@ void VulkanGSRenderer::executeRasterizeBackward(
     }
 
     size_t num_elements = buffers.num_splats;
+    const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
+    const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f && train_depth_weight_buf != nullptr &&
+                                train_depth_weight_buf->buffer != VK_NULL_HANDLE);
 
     clearDeviceBuffer(buffers.v_xy_vs, 2*num_elements);
     clearDeviceBuffer(buffers.v_inv_cov_vs_opacity, 4*num_elements);
     clearDeviceBuffer(buffers.v_rgb, 3*num_elements);
+    if (ago_enabled) {
+        clearDeviceBuffer(ago_contrib_step_buf_, std::max<size_t>(1, num_elements));
+        clearDeviceBuffer(ago_abs_grad_step_buf_, std::max<size_t>(1, num_elements));
+    }
+    if (depth_enabled) {
+        clearDeviceBuffer(buffers.v_depths, std::max<size_t>(1, num_elements));
+    }
     if (!gate_active && buffers.num_indices == 0)
         return;
-    bufferMemoryBarrier({
+
+    std::vector<std::pair<_VulkanBuffer, BarrierMask>> barriers = {
         { buffers.n_contributors.deviceBuffer, COMPUTE_SHADER_WRITE },
         { buffers.v_pixel_state.deviceBuffer, COMPUTE_SHADER_WRITE },
         { buffers.v_xy_vs.deviceBuffer, TRANSFER_WRITE },
         { buffers.v_inv_cov_vs_opacity.deviceBuffer, TRANSFER_WRITE },
         { buffers.v_rgb.deviceBuffer, TRANSFER_WRITE },
-    }, COMPUTE_SHADER_READ_WRITE);
+    };
+    if (ago_enabled) {
+        barriers.push_back({ ago_contrib_step_buf_.deviceBuffer, TRANSFER_WRITE });
+        barriers.push_back({ ago_abs_grad_step_buf_.deviceBuffer, TRANSFER_WRITE });
+    }
+    if (depth_enabled) {
+        barriers.push_back({ buffers.depths.deviceBuffer, COMPUTE_SHADER_WRITE });
+        barriers.push_back({ buffers.pixel_depth.deviceBuffer, COMPUTE_SHADER_WRITE });
+        barriers.push_back({ buffers.v_depths.deviceBuffer, TRANSFER_WRITE });
+    }
+    bufferMemoryBarrier(barriers, COMPUTE_SHADER_READ_WRITE);
 
     std::vector<std::pair<size_t, size_t>> dims;
     if (scheduled_impl == RasterBackwardImpl::PerPixel)
@@ -431,9 +459,14 @@ void VulkanGSRenderer::executeRasterizeBackward(
             w.backward_tiles_dispatched += grid_tiles;  // sparse passes are counted on the GPU
     }
 
+    VulkanGSRendererUniforms effective_uniforms = uniforms;
+    if (!depth_enabled) {
+        effective_uniforms.depth_loss_scale = 0.0f;
+    }
+
     executeCompute(
         dims,
-        &uniforms, sizeof(uniforms),
+        &effective_uniforms, sizeof(effective_uniforms),
         RASTERIZE_BACKWARD_USE_SCHEDULING ? pipeline_rasterize_backward[(size_t)scheduled_impl][buffers.is_unsorted_1] :
             pipeline_rasterize_backward[1][buffers.is_unsorted_1],  // per-splat backward
         {
@@ -455,6 +488,14 @@ void VulkanGSRenderer::executeRasterizeBackward(
             uniforms.freeze_flags ? buffers.group_ids.deviceBuffer : sparse_active_tiles,
             uniforms.freeze_flags ? buffers.group_state.deviceBuffer : sparse_active_tiles,
             uniforms.freeze_flags ? buffers.splat_state.deviceBuffer : sparse_active_tiles,
+            // AGO-0 per-step visibility & AbsGS buffers (written only when ago_telemetry_enabled != 0)
+            ago_enabled ? ago_contrib_step_buf_.deviceBuffer : sparse_active_tiles,
+            ago_enabled ? ago_abs_grad_step_buf_.deviceBuffer : sparse_active_tiles,
+            // D1 physical expected-depth loss buffers (read/written only when depth_loss_scale > 0)
+            depth_enabled ? buffers.depths.deviceBuffer : sparse_active_tiles,
+            depth_enabled ? buffers.pixel_depth.deviceBuffer : sparse_active_tiles,
+            depth_enabled ? *train_depth_weight_buf : sparse_active_tiles,
+            depth_enabled ? buffers.v_depths.deviceBuffer : sparse_active_tiles,
         },
         GATE_RASTER_BWD,
         sparse ? &sparse_args : nullptr

@@ -15,6 +15,8 @@ groupshared float pixel_T[PIXEL_BATCH_SIZE];
 groupshared float3 v_pixel_rgb[PIXEL_BATCH_SIZE];
 groupshared float v_pixel_T[PIXEL_BATCH_SIZE];
 groupshared int n_contrib_fwd[PIXEL_BATCH_SIZE];
+groupshared float pixel_d_exp[PIXEL_BATCH_SIZE];
+groupshared float pixel_g_D_eff[PIXEL_BATCH_SIZE];
 groupshared int sg_max_contrib[MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE];
 
 layout(binding=0) StructuredBuffer<int32_t> sorted_gauss_idx;
@@ -33,6 +35,12 @@ layout(binding=11) StructuredBuffer<uint32_t> active_tiles;  // compacted tile l
 layout(binding=12) StructuredBuffer<int32_t> group_ids;     // read only when uniforms.freeze_flags != 0
 layout(binding=13) StructuredBuffer<uint32_t> group_state;
 layout(binding=14) StructuredBuffer<uint32_t> splat_state;
+layout(binding=15) RWByteAddressBuffer out_ago_contrib;
+layout(binding=16) RWByteAddressBuffer out_ago_abs_grad;
+layout(binding=17) StructuredBuffer<float> depths;
+layout(binding=18) StructuredBuffer<float4> final_depth_state;
+layout(binding=19) StructuredBuffer<float2> train_depth_weight;
+layout(binding=20) RWByteAddressBuffer out_v_depths;
 
 
 [shader("compute")]
@@ -50,6 +58,9 @@ void main(
     uint thread_rank = groupThreadID.x;
     uint tile_idx = uniforms.use_tile_list != 0 ? active_tiles[groupID.x] : groupID.y * grid_width + groupID.x;
     uint2 tbound0 = uint2(tile_idx%grid_width, tile_idx/grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT);
+
+    const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
+    const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f);
 
     int local_max_contrib = 0;
     [ForceUnroll]
@@ -69,9 +80,31 @@ void main(
             int nc = n_contributors[pix_id];
             n_contrib_fwd[pix_rank_batch] = nc;
             local_max_contrib = max(local_max_contrib, nc);
+            if (depth_enabled) {
+                float4 pd = final_depth_state[pix_id];
+                float d_exp_norm = pd.x;
+                float acc_alpha = pd.z;
+                float2 dw = train_depth_weight[pix_id];
+                if (dw.x > 0.0f && dw.y > 0.0f && acc_alpha > 0.1f) {
+                    float d_exp_m = d_exp_norm * uniforms.depth_inv_scale;
+                    float r = d_exp_m - dw.x;
+                    float delta = uniforms.depth_huber_delta;
+                    float d_huber = clamp(r, -delta, delta) / delta;
+                    float g_D_norm = (uniforms.depth_loss_scale * dw.y * d_huber) * uniforms.depth_inv_scale;
+                    pixel_g_D_eff[pix_rank_batch] = g_D_norm / acc_alpha;
+                    pixel_d_exp[pix_rank_batch] = d_exp_norm;
+                } else {
+                    pixel_g_D_eff[pix_rank_batch] = 0.0f;
+                    pixel_d_exp[pix_rank_batch] = 0.0f;
+                }
+            }
         }
         else {
             n_contrib_fwd[pix_rank_batch] = 0;
+            if (depth_enabled) {
+                pixel_g_D_eff[pix_rank_batch] = 0.0f;
+                pixel_d_exp[pix_rank_batch] = 0.0f;
+            }
         }
 
     }
@@ -112,12 +145,16 @@ void main(
         // thread 0 loads last splat, thread 1 loads second last, ...
         int32_t splat_id = -1;
         Splat_2D_AlphaBlend splat = { float4(0, 0, 0, 1), float2(0), float3(0) };
+        float splat_depth = 0.0f;
         int32_t progress = batch_idx * SPLAT_BATCH_SIZE + thread_rank;
         int32_t splat_gid = tile_idx_end - progress - 1;
         int32_t splat_tid = splat_gid - tile_idx_start;
         if (active & (splat_tid >= 0)) {
             splat_id = sorted_gauss_idx[splat_gid];
             splat = load_splat_alphablend(splat_id, xy_vs, inv_cov_vs_opacity, rgb);
+            if (depth_enabled) {
+                splat_depth = depths[splat_id];
+            }
         }
 
         // compute subtile culling masks
@@ -130,6 +167,9 @@ void main(
         float2 v_xy_vs = float2(0.0);
         float4 v_inv_cov_vs_opacity = float4(0.0);
         float3 v_rgb = float3(0.0);
+        float v_depth = 0.0;
+        float ago_contrib = 0.0;
+        float ago_abs_grad = 0.0;
 
         int num_pixels = PIXEL_BATCH_SIZE;
         int num_splats = min(SPLAT_BATCH_SIZE, num_splats_in_tile - batch_idx * SPLAT_BATCH_SIZE);
@@ -173,10 +213,18 @@ void main(
             float v_T = v_pixel_T[pix_rank];
             float aT = a * T;
             float rgbd = dot(v_rgb_pix, splat.rgb);
-            v_pixel_T[pix_rank] = v_T * (1.0f - a) + a * rgbd;
+            float total_d = rgbd;
+            if (depth_enabled) {
+                float g_D_eff = pixel_g_D_eff[pix_rank];
+                if (g_D_eff != 0.0f) {
+                    total_d += g_D_eff * (splat_depth - pixel_d_exp[pix_rank]);
+                    v_depth += aT * g_D_eff;
+                }
+            }
+            v_pixel_T[pix_rank] = v_T * (1.0f - a) + a * total_d;
 
             v_rgb += aT * v_rgb_pix;
-            float v_a = (raw_alpha < ALPHA_BLEND_MAX_OPACITY) ? (T * (rgbd - v_T)) : 0.0f;
+            float v_a = (raw_alpha < ALPHA_BLEND_MAX_OPACITY) ? (T * (total_d - v_T)) : 0.0f;
             float v_power = v_a * a;
             v_inv_cov_vs_opacity += float4(
                 -0.5f * d.x * d.x * v_power,
@@ -184,10 +232,15 @@ void main(
                 -0.5f * d.y * d.y * v_power,
                 v_a * val
             );
-            v_xy_vs += float2(
+            float2 d_xy_pix = float2(
                 (g_inv_cov.x * d.x + g_inv_cov.y * d.y) * v_power,
                 (g_inv_cov.y * d.x + g_inv_cov.z * d.y) * v_power
             );
+            v_xy_vs += d_xy_pix;
+            if (ago_enabled) {
+                ago_contrib += aT;
+                ago_abs_grad += length(d_xy_pix);
+            }
         }
 
       #if USE_EMULATED_F32_ATOMIC
@@ -197,7 +250,7 @@ void main(
         #define _ATOMIC_ADD(buffer, address, value) \
             if (value != 0.0) buffer.InterlockedAddF32((address)*sizeof(float), value);
       #endif
-        if (active) {
+        if (active && splat_id >= 0) {
             const uint freeze = splat_freeze_mode(splat_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state);
             if (freeze == 0) {
                 _ATOMIC_ADD(out_v_xy_vs, 2*splat_id+0, v_xy_vs.x);
@@ -206,11 +259,20 @@ void main(
                 _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+1, v_inv_cov_vs_opacity.y);
                 _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+2, v_inv_cov_vs_opacity.z);
                 _ATOMIC_ADD(out_v_inv_cov_vs_opacity, 4*splat_id+3, v_inv_cov_vs_opacity.w);
+                if (depth_enabled) {
+                    _ATOMIC_ADD(out_v_depths, splat_id, v_depth);
+                }
             }
             if (freeze != 2) {
                 _ATOMIC_ADD(out_v_rgb, 3*splat_id+0, float(v_rgb.x));
                 _ATOMIC_ADD(out_v_rgb, 3*splat_id+1, float(v_rgb.y));
                 _ATOMIC_ADD(out_v_rgb, 3*splat_id+2, float(v_rgb.z));
+            }
+            if (ago_enabled) {
+                _ATOMIC_ADD(out_ago_contrib, splat_id, ago_contrib);
+                if (freeze == 0) {
+                    _ATOMIC_ADD(out_ago_abs_grad, splat_id, ago_abs_grad);
+                }
             }
         }
 
