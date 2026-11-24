@@ -177,6 +177,12 @@ public:
     glm::mat4 get_dataparser_transform() const { return dataparser_transform; }
 
     void camera_to_uniforms(const Camera &cam, VulkanGSRendererUniforms &uniforms) const;
+    void pose_to_uniforms(
+        int h, int w, float fx, float fy, float cx, float cy,
+        const float* c2w_world_row_major,
+        VulkanGSRendererUniforms &uniforms
+    ) const;
+    float get_world_to_normalized_scale() const;
     void get_train_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
     size_t train_tile_count(size_t idx) const;  // raster tiles of training view idx
     void get_val_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const;
@@ -217,20 +223,26 @@ public:
     }
     void set_splat_group_ids(const std::vector<int32_t>& gids) {
         splat_group_ids = gids;
-        invalidateActiveIndexDispatch();
+        bumpMapGeneration();
     }
     void set_splat_entity_ids(const std::vector<int32_t>& eids) {
         splat_entity_ids = eids;
     }
     void set_splat_states_vec(const std::vector<uint32_t>& states) {
         splat_states = states;
-        invalidateActiveIndexDispatch();
+        bumpMapGeneration();
     }
     void set_active_indices_gpu(const std::vector<uint32_t>& active_indices, size_t total_splats);
     void invalidateActiveIndexDispatch() {
         use_active_index_dispatch_ = false;
         active_splat_count_ = 0u;
     }
+    void bumpMapGeneration() {
+        ++map_generation_;
+        invalidateActiveIndexDispatch();
+    }
+    uint64_t get_map_generation() const { return map_generation_; }
+    uint64_t get_active_set_generation() const { return active_set_generation_; }
     uint32_t get_active_splat_count() const { return active_splat_count_; }
     bool get_use_active_index_dispatch() const { return use_active_index_dispatch_; }
 
@@ -438,8 +450,8 @@ private:
 
     std::vector<DatasetImage> dataset_train;
     std::vector<DatasetImage> dataset_val;
-    glm::mat4 dataparser_transform;
-    float scene_scale;
+    glm::mat4 dataparser_transform = glm::mat4(1.0f);
+    float scene_scale = 1.0f;
 
     size_t num_anchored_splats = 0;
     bool anchored_xyz_snapshot_valid = false;
@@ -508,6 +520,8 @@ private:
     Buffer<uint32_t> active_indices_buf_;
     uint32_t active_splat_count_ = 0u;
     bool use_active_index_dispatch_ = false;
+    uint64_t map_generation_ = 1u;
+    uint64_t active_set_generation_ = 0u;
 
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;

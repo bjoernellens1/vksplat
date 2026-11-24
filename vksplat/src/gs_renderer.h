@@ -40,6 +40,7 @@ public:
     void executeGenerateKeys(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeComputeTileRanges(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeForward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
+    void executeRasterizeForwardDepth(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     void executeRasterizeBackward(const VulkanGSRendererUniforms& uniforms, VulkanGSPipelineBuffers& buffers);
     // true when the backward pass of the scheduler pick `impl` is dispatched per pixel (2D) rather than per tile
     static bool backwardImplIsPerPixel(int impl) { return impl == 0; }
@@ -138,6 +139,7 @@ protected:
         _ComputePipeline(3)
     };
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
+    _ComputePipelinePair pipeline_rasterize_forward_depth = _ComputePipelinePair(9);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
         _ComputePipelinePair(15),  // per pixel
         _ComputePipelinePair(15),  // per splat

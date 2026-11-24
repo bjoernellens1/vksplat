@@ -126,6 +126,8 @@ void VulkanGSTrainer::cleanup() {
     destroyBuffer(active_indices_buf_.deviceBuffer);
     active_splat_count_ = 0u;
     use_active_index_dispatch_ = false;
+    map_generation_ = 1u;
+    active_set_generation_ = 0u;
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -590,7 +592,7 @@ void VulkanGSTrainer::load_colmap_dataset(
 
     /* Load point cloud */
 
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     buffers.num_splats = numPoints;
     const int kNumSH = 16;
     const float kSHC0 = 0.28209479177387814f;
@@ -921,6 +923,47 @@ void VulkanGSTrainer::camera_to_uniforms(const Camera &cam, VulkanGSRendererUnif
             uniforms.world_view_transform[4*i+j] = cam.world_view_transform[i][j];
 }
 
+float VulkanGSTrainer::get_world_to_normalized_scale() const {
+    const float scale = glm::length(glm::vec3(dataparser_transform[0]));
+    return (std::isfinite(scale) && scale > 1e-8f) ? scale : 1.0f;
+}
+
+void VulkanGSTrainer::pose_to_uniforms(
+    int h, int w, float fx, float fy, float cx, float cy,
+    const float* c2w_world_row_major,
+    VulkanGSRendererUniforms &uniforms
+) const {
+    Camera camera{};
+    camera.model = Camera::PINHOLE;
+    camera.h = h;
+    camera.w = w;
+    camera.fx = fx;
+    camera.fy = fy;
+    camera.cx = cx;
+    camera.cy = cy;
+
+    // Match append_train_image_from_memory / append_val_image_from_memory exactly:
+    // row-major 4x4 c2w_world -> column-major glm::mat4 -> dataparser_transform -> world_view_transform.
+    glm::mat4 c2w_world(1.0f);
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            c2w_world[c][r] = c2w_world_row_major[4 * r + c];
+
+    const float scale = get_world_to_normalized_scale();
+    const glm::mat3 rot_dp = glm::mat3(dataparser_transform) / scale;
+    const glm::vec3 trans_dp = glm::vec3(dataparser_transform[3]);
+    glm::mat4 c2w_norm(1.0f);
+    glm::mat3 R_norm = rot_dp * glm::mat3(c2w_world);
+    glm::vec3 t_norm = glm::mat3(dataparser_transform) * glm::vec3(c2w_world[3]) + trans_dp;
+    c2w_norm[0] = glm::vec4(R_norm[0], 0.0f);
+    c2w_norm[1] = glm::vec4(R_norm[1], 0.0f);
+    c2w_norm[2] = glm::vec4(R_norm[2], 0.0f);
+    c2w_norm[3] = glm::vec4(t_norm, 1.0f);
+    camera.world_view_transform = glm::inverse(c2w_norm);
+
+    camera_to_uniforms(camera, uniforms);
+}
+
 void VulkanGSTrainer::get_train_camera(size_t idx, VulkanGSRendererUniforms &uniforms) const {
     camera_to_uniforms(dataset_train[idx].camera, uniforms);
 }
@@ -971,7 +1014,8 @@ VulkanGSTrainer::GatePlan VulkanGSTrainer::buildGatePlan(
     set(plan, GATE_RASTER_FWD, image_tiles);
     set(plan, GATE_RASTER_BWD, backwardImplIsPerPixel(backward_impl) ? image_tiles :
         std::vector<std::pair<size_t, size_t>>{{uniforms.grid_width*uniforms.grid_height, 1}});
-    const size_t opt_n = (use_active_index_dispatch_ && active_splat_count_ > 0u && active_splat_count_ < n)
+    const bool dispatch_active = use_active_index_dispatch_ && (active_set_generation_ == map_generation_);
+    const size_t opt_n = (dispatch_active && active_splat_count_ > 0u && active_splat_count_ < n)
         ? static_cast<size_t>(active_splat_count_) : n;
     set(plan, GATE_OPTIMIZER, {{opt_n, SUBGROUP_SIZE}});
     set(plan, GATE_POST, {{n, 256}});
@@ -1064,6 +1108,7 @@ void VulkanGSTrainer::set_active_indices_gpu(const std::vector<uint32_t>& active
     HOST_GUARD;
     active_splat_count_ = static_cast<uint32_t>(active_indices.size());
     use_active_index_dispatch_ = (total_splats > 0 && active_indices.size() < total_splats);
+    active_set_generation_ = map_generation_;
     if (use_active_index_dispatch_ && !active_indices.empty()) {
         resizeDeviceBuffer(active_indices_buf_, active_indices.size());
         uploadDeviceSlice(active_indices_buf_.deviceBuffer, 0, active_indices.data(),
@@ -1082,7 +1127,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     int step
 ) {
     const size_t num_splats = buffers.num_splats;
-    if (num_splats == 0 || (use_active_index_dispatch_ && active_splat_count_ == 0u)) {
+    const bool dispatch_active = use_active_index_dispatch_ && (active_set_generation_ == map_generation_);
+    if (num_splats == 0 || (dispatch_active && active_splat_count_ == 0u)) {
         return;
     }
 
@@ -1090,7 +1136,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     DEVICE_GUARD;
 
     const bool use_active_dispatch =
-        use_active_index_dispatch_ && active_splat_count_ > 0u && active_splat_count_ < num_splats;
+        dispatch_active && active_splat_count_ > 0u && active_splat_count_ < num_splats;
     const size_t dispatch_count = use_active_dispatch ? static_cast<size_t>(active_splat_count_) : num_splats;
 
     bufferMemoryBarrier({
@@ -1505,7 +1551,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             resizeAndCopyDeviceBuffer(buffers.default_grad, 2*new_num_splats, false);
             resizeAndCopyDeviceBuffer(buffers.default_radii, new_num_splats, false);
             buffers.num_splats = new_num_splats;
-            invalidateActiveIndexDispatch();
+            bumpMapGeneration();
             barrierAllGaussParams(buffers);
             syncHostMetadataSize(num_splats);
         }
@@ -1783,7 +1829,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             barrierAllGaussParams(buffers);
 
             buffers.num_splats = num_keep;
-            invalidateActiveIndexDispatch();
+            bumpMapGeneration();
         }
         if (num_dupli + num_split > 0 || num_prune > 0) {
             if (!splat_group_ids.empty()) {
@@ -2064,7 +2110,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             );
 
             // MC-1: Update splat_group_ids, splat_entity_ids, splat_uids, splat_states, splat_anchors_host, splat_cell_ids for relocated dead splats
-            invalidateActiveIndexDispatch();
+            bumpMapGeneration();
             if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_ || !splat_uids.empty()) {
                 copyFromDevice(buffers.mcmc_index_map);
                 if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
@@ -2407,7 +2453,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     );
                 }
                 buffers.num_splats = new_num_splats;
-                invalidateActiveIndexDispatch();
+                bumpMapGeneration();
                 mcmc_added_count += num_add;
             } else {
                 num_add = 0;
@@ -2467,7 +2513,7 @@ void VulkanGSTrainer::executeMortonSorting(
     // PerfTimer::Timer<PerfTimer::MortonSorting> timer(this);
     DEVICE_GUARD;
 
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     uint32_t num_splats = (uint32_t)buffers.num_splats;
 
     barrierAllGaussParams(buffers);
@@ -3105,7 +3151,7 @@ void VulkanGSTrainer::set_group_states(
     if (count == 0)
         return;
     HOST_GUARD;
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     int32_t lo = gids[0], hi = gids[0];
     for (size_t i = 1; i < count; ++i) {
         lo = std::min(lo, gids[i]);
@@ -3156,7 +3202,7 @@ void VulkanGSTrainer::set_splat_states_sparse(
     if (count == 0 || buffers.num_splats == 0)
         return;
     HOST_GUARD;
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     if (splat_states.size() < buffers.num_splats)
         splat_states.resize(buffers.num_splats, 0xFFFFFFFFu);
     ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
@@ -3271,7 +3317,7 @@ void VulkanGSTrainer::reanchor_splats_sparse(
 ) {
     if (count == 0 || buffers.num_splats == 0)
         return;
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     std::vector<uint32_t> valid_rows;
     std::vector<float> values;
     valid_rows.reserve(count);
@@ -4000,7 +4046,7 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
         splat_anchors_host = std::move(out_anc);
     }
     buffers.num_splats = new_n;
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
     return index_map;
 }
 
@@ -4228,7 +4274,7 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         splat_cell_ids_dirty_ = false;
     }
     buffers.num_splats = new_n;
-    invalidateActiveIndexDispatch();
+    bumpMapGeneration();
 
     if (reallocated)
         counters.append_reallocs++;
