@@ -1645,6 +1645,8 @@ public:
         const auto& gstate = buffers.group_state;
         const bool protect_locked = config.mcmc_protect_structural_groups;
 
+        std::vector<uint32_t> active_indices;
+        active_indices.reserve(n_total);
         size_t n_frozen_mode0 = 0;
         for (size_t i = 0; i < n_total; ++i) {
             const uint32_t raw_st = (i < splat_sts.size()) ? splat_sts[i] : 0xFFFFFFFFu;
@@ -1659,24 +1661,78 @@ public:
             } else if (base_st == 0xFFFFFFFFu && gs == 2u && protect_locked) {
                 frozen = true;
             }
-            if (frozen)
+            if (frozen) {
                 ++n_frozen_mode0;
+            } else {
+                active_indices.push_back(static_cast<uint32_t>(i));
+            }
         }
-        const size_t n_active_trainable = n_total - n_frozen_mode0;
+        const size_t n_active_trainable = active_indices.size();
         const double active_fraction = (n_total > 0)
             ? (static_cast<double>(n_active_trainable) / static_cast<double>(n_total))
             : 0.0;
 
+        trainer.set_active_indices_gpu(active_indices, n_total);
         if (n_total > 0) {
             set_freeze_flags();
         }
+        const bool gpu_active_buffer_bound = trainer.get_use_active_index_dispatch();
+        const size_t active_dispatch_splats = gpu_active_buffer_bound
+            ? static_cast<size_t>(trainer.get_active_splat_count())
+            : n_total;
 
         py::dict d;
         d["n_total"] = n_total;
         d["n_frozen_mode0"] = n_frozen_mode0;
         d["n_active_trainable"] = n_active_trainable;
+        d["total_splats"] = n_total;
+        d["frozen_splats"] = n_frozen_mode0;
+        d["active_splats"] = n_active_trainable;
+        d["active_dispatch_splats"] = active_dispatch_splats;
         d["active_fraction"] = active_fraction;
+        d["gpu_active_buffer_bound"] = gpu_active_buffer_bound;
         return d;
+    }
+
+    static void extract_k_params(const py::buffer_info& b, size_t v, float out[4], const char* name) {
+        const float* p = static_cast<const float*>(b.ptr);
+        if (b.ndim == 3 && b.shape[1] == 3 && b.shape[2] == 3) {
+            const float* kv = p + 9 * v;
+            out[0] = kv[0];  // fx
+            out[1] = kv[4];  // fy
+            out[2] = kv[2];  // cx
+            out[3] = kv[5];  // cy
+        } else if (b.ndim == 2 && b.shape[1] == 4) {
+            const float* kv = p + 4 * v;
+            out[0] = kv[0];
+            out[1] = kv[1];
+            out[2] = kv[2];
+            out[3] = kv[3];
+        } else {
+            throw std::invalid_argument(std::string(name) + " must have shape (V, 3, 3) or (V, 4)");
+        }
+    }
+
+    static std::vector<float> parse_fallback_rgb(const py::object& fallback_rgb_obj, size_t n_points) {
+        std::vector<float> fallback_vec(3 * n_points, 0.5f);
+        if (!fallback_rgb_obj.is_none()) {
+            auto fb_arr = fallback_rgb_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto fbuf = fb_arr.request();
+            const float* fptr = static_cast<const float*>(fbuf.ptr);
+            if (fbuf.ndim == 1 && fbuf.shape[0] == 3) {
+                for (size_t i = 0; i < n_points; ++i) {
+                    fallback_vec[3 * i + 0] = std::clamp(fptr[0], 0.0f, 1.0f);
+                    fallback_vec[3 * i + 1] = std::clamp(fptr[1], 0.0f, 1.0f);
+                    fallback_vec[3 * i + 2] = std::clamp(fptr[2], 0.0f, 1.0f);
+                }
+            } else if (fbuf.ndim == 2 && static_cast<size_t>(fbuf.shape[0]) == n_points && fbuf.shape[1] == 3) {
+                for (size_t i = 0; i < 3 * n_points; ++i)
+                    fallback_vec[i] = std::clamp(fptr[i], 0.0f, 1.0f);
+            } else {
+                throw std::invalid_argument("fallback_rgb must have shape (3,) or (N, 3)");
+            }
+        }
+        return fallback_vec;
     }
 
     py::dict project_and_fit_sh_vulkan(
@@ -1709,24 +1765,7 @@ public:
             normals_ptr = static_cast<const float*>(nbuf.ptr);
         }
 
-        std::vector<float> fallback_vec(3 * n_points, 0.5f);
-        if (!fallback_rgb_obj.is_none()) {
-            auto fb_arr = fallback_rgb_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
-            auto fbuf = fb_arr.request();
-            const float* fptr = static_cast<const float*>(fbuf.ptr);
-            if (fbuf.ndim == 1 && fbuf.shape[0] == 3) {
-                for (size_t i = 0; i < n_points; ++i) {
-                    fallback_vec[3 * i + 0] = std::clamp(fptr[0], 0.0f, 1.0f);
-                    fallback_vec[3 * i + 1] = std::clamp(fptr[1], 0.0f, 1.0f);
-                    fallback_vec[3 * i + 2] = std::clamp(fptr[2], 0.0f, 1.0f);
-                }
-            } else if (fbuf.ndim == 2 && static_cast<size_t>(fbuf.shape[0]) == n_points && fbuf.shape[1] == 3) {
-                for (size_t i = 0; i < 3 * n_points; ++i)
-                    fallback_vec[i] = std::clamp(fptr[i], 0.0f, 1.0f);
-            } else {
-                throw std::invalid_argument("fallback_rgb_f32 must have shape (3,) or (N, 3)");
-            }
-        }
+        std::vector<float> fallback_vec = parse_fallback_rgb(fallback_rgb_obj, n_points);
 
         auto rbuf = rgb_views_u8.request();
         auto dbuf = depth_views_f32.request();
@@ -1752,25 +1791,6 @@ public:
         if (obuf.ndim != 2 || obuf.shape[1] != 3)
             throw std::invalid_argument("cam_o_f32 must have shape (V, 3)");
 
-        auto extract_k = [](const py::buffer_info& b, size_t v, float out[4], const char* name) {
-            const float* p = static_cast<const float*>(b.ptr);
-            if (b.ndim == 3 && b.shape[1] == 3 && b.shape[2] == 3) {
-                const float* kv = p + 9 * v;
-                out[0] = kv[0];  // fx
-                out[1] = kv[4];  // fy
-                out[2] = kv[2];  // cx
-                out[3] = kv[5];  // cy
-            } else if (b.ndim == 2 && b.shape[1] == 4) {
-                const float* kv = p + 4 * v;
-                out[0] = kv[0];
-                out[1] = kv[1];
-                out[2] = kv[2];
-                out[3] = kv[3];
-            } else {
-                throw std::invalid_argument(std::string(name) + " must have shape (V, 3, 3) or (V, 4)");
-            }
-        };
-
         std::vector<float> view_params(24 * n_views, 0.0f);
         const float* w2c_ptr = static_cast<const float*>(w2cbuf.ptr);
         const float* o_ptr = static_cast<const float*>(obuf.ptr);
@@ -1790,8 +1810,8 @@ public:
             dst[13] = o_ptr[3 * v + 1];
             dst[14] = o_ptr[3 * v + 2];
             dst[15] = 0.0f;
-            extract_k(krbuf, v, dst + 16, "k_rgb_f32");
-            extract_k(kdbuf, v, dst + 20, "k_depth_f32");
+            extract_k_params(krbuf, v, dst + 16, "k_rgb_f32");
+            extract_k_params(kdbuf, v, dst + 20, "k_depth_f32");
         }
 
         auto res = trainer.project_and_fit_sh_vulkan(
@@ -1839,6 +1859,186 @@ public:
         d["kernel_wall_ms"] = res.kernel_wall_ms;
         d["total_wall_ms"] = res.total_wall_ms;
         d["backend"] = "vulkan_slang";
+        return d;
+    }
+
+    py::dict append_and_init_surfels_vulkan(
+        py::array_t<float, py::array::c_style | py::array::forcecast> means_world,
+        py::object normals_world_obj,
+        py::array_t<float, py::array::c_style | py::array::forcecast> scales_norm,
+        py::array_t<float, py::array::c_style | py::array::forcecast> quats_norm,
+        py::array_t<float, py::array::c_style | py::array::forcecast> opacities,
+        py::object group_ids_obj,
+        py::object splat_states_obj,
+        py::object fallback_rgb_obj,
+        py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgb_views_u8,
+        py::array_t<float, py::array::c_style | py::array::forcecast> depth_views_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> k_rgbs_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> k_depths_f32,
+        py::array_t<float, py::array::c_style | py::array::forcecast> poses_c2w_f32,
+        py::object dp_transform_obj = py::none(),
+        float sh_reg = 1e-2f,
+        float depth_tol = 0.12f,
+        int sh_degree = 1,
+        float min_cos_angle = 0.15f
+    ) {
+        auto mbuf = means_world.request();
+        if (mbuf.ndim != 2 || mbuf.shape[1] != 3)
+            throw std::invalid_argument("means_world must have shape (M, 3)");
+        const size_t n_add = static_cast<size_t>(mbuf.shape[0]);
+
+        auto sbuf = scales_norm.request();
+        auto qbuf = quats_norm.request();
+        auto obuf = opacities.request();
+        if (sbuf.ndim != 2 || static_cast<size_t>(sbuf.shape[0]) != n_add || sbuf.shape[1] != 3)
+            throw std::invalid_argument("scales_norm must have shape (M, 3)");
+        if (qbuf.ndim != 2 || static_cast<size_t>(qbuf.shape[0]) != n_add || qbuf.shape[1] != 4)
+            throw std::invalid_argument("quats_norm must have shape (M, 4)");
+        if (static_cast<size_t>(obuf.size) != n_add)
+            throw std::invalid_argument("opacities must have M elements");
+
+        py::array_t<float, py::array::c_style | py::array::forcecast> normals_arr;
+        const float* normals_ptr = nullptr;
+        if (!normals_world_obj.is_none()) {
+            normals_arr = normals_world_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto nbuf = normals_arr.request();
+            if (nbuf.ndim != 2 || static_cast<size_t>(nbuf.shape[0]) != n_add || nbuf.shape[1] != 3)
+                throw std::invalid_argument("normals_world must have shape (M, 3)");
+            normals_ptr = static_cast<const float*>(nbuf.ptr);
+        }
+
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> gid_arr;
+        const int32_t* gid_ptr = nullptr;
+        if (!group_ids_obj.is_none()) {
+            gid_arr = group_ids_obj.cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+            if (static_cast<size_t>(gid_arr.size()) == n_add)
+                gid_ptr = gid_arr.data();
+        }
+
+        py::array_t<uint32_t, py::array::c_style | py::array::forcecast> st_arr;
+        const uint32_t* st_ptr = nullptr;
+        if (!splat_states_obj.is_none()) {
+            st_arr = splat_states_obj.cast<py::array_t<uint32_t, py::array::c_style | py::array::forcecast>>();
+            if (static_cast<size_t>(st_arr.size()) == n_add)
+                st_ptr = st_arr.data();
+        }
+
+        std::vector<float> fallback_vec = parse_fallback_rgb(fallback_rgb_obj, n_add);
+
+        // Compute normalized coordinates xyz_norm = dp_transform @ [means_world, 1]
+        float dp_rm[12];
+        if (dp_transform_obj.is_none()) {
+            glm::mat4 dp = trainer.get_dataparser_transform();
+            for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 4; ++c)
+                    dp_rm[4 * r + c] = dp[c][r];
+        } else {
+            auto dp_arr = dp_transform_obj.cast<py::array_t<float, py::array::c_style | py::array::forcecast>>();
+            auto dpbuf = dp_arr.request();
+            const bool is_4x4 = (dpbuf.ndim == 2 && dpbuf.shape[0] == 4 && dpbuf.shape[1] == 4);
+            const bool is_3x4 = (dpbuf.ndim == 2 && dpbuf.shape[0] == 3 && dpbuf.shape[1] == 4);
+            if (!is_4x4 && !is_3x4)
+                throw std::invalid_argument("dp_transform must have shape (4, 4) or (3, 4)");
+            std::memcpy(dp_rm, dpbuf.ptr, 12 * sizeof(float));
+        }
+        const float* mptr = static_cast<const float*>(mbuf.ptr);
+        std::vector<float> xyz_norm(3 * n_add, 0.0f);
+        for (size_t i = 0; i < n_add; ++i) {
+            const float x = mptr[3 * i + 0];
+            const float y = mptr[3 * i + 1];
+            const float z = mptr[3 * i + 2];
+            xyz_norm[3 * i + 0] = dp_rm[0] * x + dp_rm[1] * y + dp_rm[2] * z + dp_rm[3];
+            xyz_norm[3 * i + 1] = dp_rm[4] * x + dp_rm[5] * y + dp_rm[6] * z + dp_rm[7];
+            xyz_norm[3 * i + 2] = dp_rm[8] * x + dp_rm[9] * y + dp_rm[10] * z + dp_rm[11];
+        }
+
+        // Parse RGB-D views and c2w poses -> view_params (w2c + cam_o + K_rgb + K_depth)
+        auto rbuf = rgb_views_u8.request();
+        auto dbuf = depth_views_f32.request();
+        const size_t n_views = (rbuf.ndim > 0) ? static_cast<size_t>(rbuf.shape[0]) : 0;
+        int h_rgb = 0, w_rgb = 0, rgb_ch = 3, h_d = 0, w_d = 0;
+        std::vector<float> view_params;
+        if (n_views > 0) {
+            if (rbuf.ndim != 4 || (rbuf.shape[3] != 3 && rbuf.shape[3] != 4))
+                throw std::invalid_argument("rgb_views must have shape (V, H_rgb, W_rgb, 3 or 4)");
+            if (dbuf.ndim != 3 || static_cast<size_t>(dbuf.shape[0]) != n_views)
+                throw std::invalid_argument("depth_views must have shape (V, H_d, W_d)");
+            h_rgb = static_cast<int>(rbuf.shape[1]);
+            w_rgb = static_cast<int>(rbuf.shape[2]);
+            rgb_ch = static_cast<int>(rbuf.shape[3]);
+            h_d = static_cast<int>(dbuf.shape[1]);
+            w_d = static_cast<int>(dbuf.shape[2]);
+
+            auto krbuf = k_rgbs_f32.request();
+            auto kdbuf = k_depths_f32.request();
+            auto c2wbuf = poses_c2w_f32.request();
+            if (static_cast<size_t>(krbuf.shape[0]) != n_views ||
+                static_cast<size_t>(kdbuf.shape[0]) != n_views ||
+                static_cast<size_t>(c2wbuf.shape[0]) != n_views) {
+                throw std::invalid_argument("K_rgbs, K_depths, and poses_c2w must all have leading dimension V");
+            }
+            const bool c2w_4x4 = (c2wbuf.ndim == 3 && c2wbuf.shape[1] == 4 && c2wbuf.shape[2] == 4);
+            const bool c2w_3x4 = (c2wbuf.ndim == 3 && c2wbuf.shape[1] == 3 && c2wbuf.shape[2] == 4);
+            if (!c2w_4x4 && !c2w_3x4)
+                throw std::invalid_argument("poses_c2w must have shape (V, 4, 4) or (V, 3, 4)");
+            const size_t c2w_stride = c2w_4x4 ? 16 : 12;
+            const float* c2w_ptr = static_cast<const float*>(c2wbuf.ptr);
+
+            view_params.assign(24 * n_views, 0.0f);
+            for (size_t v = 0; v < n_views; ++v) {
+                float* dst = &view_params[24 * v];
+                const float* cv = c2w_ptr + c2w_stride * v;
+                glm::mat4 c2w_m(1.0f);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        c2w_m[c][r] = cv[4 * r + c];
+                glm::mat4 w2c_m = glm::inverse(c2w_m);
+                for (int r = 0; r < 3; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        dst[4 * r + c] = w2c_m[c][r];
+                dst[12] = cv[3];
+                dst[13] = cv[7];
+                dst[14] = cv[11];
+                dst[15] = 0.0f;
+                extract_k_params(krbuf, v, dst + 16, "K_rgbs");
+                extract_k_params(kdbuf, v, dst + 20, "K_depths");
+            }
+        }
+
+        auto res = trainer.append_and_init_surfels_vulkan(
+            buffers,
+            mptr,
+            normals_ptr,
+            xyz_norm.data(),
+            static_cast<const float*>(sbuf.ptr),
+            static_cast<const float*>(qbuf.ptr),
+            static_cast<const float*>(obuf.ptr),
+            gid_ptr,
+            st_ptr,
+            fallback_vec.data(),
+            n_add,
+            n_views > 0 ? static_cast<const uint8_t*>(rbuf.ptr) : nullptr,
+            n_views,
+            h_rgb,
+            w_rgb,
+            rgb_ch,
+            n_views > 0 ? static_cast<const float*>(dbuf.ptr) : nullptr,
+            h_d,
+            w_d,
+            n_views > 0 ? view_params.data() : nullptr,
+            sh_degree,
+            sh_reg,
+            depth_tol,
+            min_cos_angle
+        );
+
+        py::dict d;
+        d["n_appended"] = res.n_appended;
+        d["kernel_ms"] = res.kernel_ms;
+        d["total_ms"] = res.total_ms;
+        d["mean_wls_rmse"] = res.mean_wls_rmse;
+        d["n_valid_sh"] = res.n_valid_sh;
+        d["gpu_resident"] = true;
         return d;
     }
 
@@ -2007,6 +2207,18 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("sh_degree") = 1,
              py::arg("reg_lambda") = 0.25f,
              py::arg("depth_tol_m") = 0.12f,
+             py::arg("min_cos_angle") = 0.15f)
+        .def("append_and_init_surfels_vulkan", &VkSplat::append_and_init_surfels_vulkan,
+             "Fused GPU-resident multi-view RGB-D SH initialization and optimizer-preserving surfel append",
+             py::arg("means_world"), py::arg("normals_world"),
+             py::arg("scales_norm"), py::arg("quats_norm"), py::arg("opacities"),
+             py::arg("group_ids"), py::arg("splat_states"), py::arg("fallback_rgb"),
+             py::arg("rgb_views"), py::arg("depth_views"),
+             py::arg("K_rgbs"), py::arg("K_depths"), py::arg("poses_c2w"),
+             py::arg("dp_transform") = py::none(),
+             py::arg("sh_reg") = 1e-2f,
+             py::arg("depth_tol") = 0.12f,
+             py::arg("sh_degree") = 1,
              py::arg("min_cos_angle") = 0.15f)
         .def("get_work_counters", &VkSplat::get_work_counters,
              "Cumulative tile-intersection (num_indices) and backward-dispatch counters since initialize; no extra readback")

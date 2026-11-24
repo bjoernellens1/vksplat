@@ -27,6 +27,7 @@ layout(binding=13) StructuredBuffer<int32_t> group_ids;
 layout(binding=14) StructuredBuffer<uint32_t> group_state;
 layout(binding=15) StructuredBuffer<uint32_t> splat_state;
 layout(binding=16) StructuredBuffer<float4> splat_anchor;  // (N, 2): [0]=(p_meas_xyz, w_depth), [1]=(normal_xyz, w_plane)
+layout(binding=17) StructuredBuffer<uint32_t> active_indices;  // (active_splat_count,) compact non-frozen splat indices
 
 
 // Adam optimizer
@@ -75,6 +76,8 @@ struct ShaderUniforms {
     uint32_t protect_locked_groups;
     uint32_t num_anchors;
     float normal_scale_cap;
+    uint32_t active_splat_count;
+    uint32_t use_active_index_dispatch;
 };
 
 
@@ -93,8 +96,14 @@ void main(
     const uint image_width = uniforms.image_size & ((1 << 16) - 1);
     const float4x4 world_view_transform = (uniforms.world_view_transform);
 
-    uint g_idx = dispatchThreadID.x;
-    
+    const uint tid = dispatchThreadID.x;
+    uint g_idx = tid;
+    if (uniforms.use_active_index_dispatch != 0u) {
+        if (tid >= uniforms.active_splat_count)
+            return;
+        g_idx = active_indices[tid];
+    }
+
     if (g_idx >= uniforms.num_splats)
         return;
     // Per-splat evidence policy (Sub-Plan V17.7):

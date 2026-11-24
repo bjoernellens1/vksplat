@@ -44,6 +44,8 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     uint32_t protect_locked_groups;
     uint32_t num_anchors;
     float normal_scale_cap;
+    uint32_t active_splat_count;
+    uint32_t use_active_index_dispatch;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -121,6 +123,9 @@ void VulkanGSTrainer::cleanup() {
     destroyBuffer(appear_out_obs_.deviceBuffer);
     destroyBuffer(appear_out_wsum_.deviceBuffer);
     destroyBuffer(appear_out_se_.deviceBuffer);
+    destroyBuffer(active_indices_buf_.deviceBuffer);
+    active_splat_count_ = 0u;
+    use_active_index_dispatch_ = false;
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -585,6 +590,7 @@ void VulkanGSTrainer::load_colmap_dataset(
 
     /* Load point cloud */
 
+    invalidateActiveIndexDispatch();
     buffers.num_splats = numPoints;
     const int kNumSH = 16;
     const float kSHC0 = 0.28209479177387814f;
@@ -965,7 +971,9 @@ VulkanGSTrainer::GatePlan VulkanGSTrainer::buildGatePlan(
     set(plan, GATE_RASTER_FWD, image_tiles);
     set(plan, GATE_RASTER_BWD, backwardImplIsPerPixel(backward_impl) ? image_tiles :
         std::vector<std::pair<size_t, size_t>>{{uniforms.grid_width*uniforms.grid_height, 1}});
-    set(plan, GATE_OPTIMIZER, {{n, SUBGROUP_SIZE}});
+    const size_t opt_n = (use_active_index_dispatch_ && active_splat_count_ > 0u && active_splat_count_ < n)
+        ? static_cast<size_t>(active_splat_count_) : n;
+    set(plan, GATE_OPTIMIZER, {{opt_n, SUBGROUP_SIZE}});
     set(plan, GATE_POST, {{n, 256}});
     return plan;
 }
@@ -1052,16 +1060,38 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
 }
 
 
+void VulkanGSTrainer::set_active_indices_gpu(const std::vector<uint32_t>& active_indices, size_t total_splats) {
+    HOST_GUARD;
+    active_splat_count_ = static_cast<uint32_t>(active_indices.size());
+    use_active_index_dispatch_ = (total_splats > 0 && active_indices.size() < total_splats);
+    if (use_active_index_dispatch_ && !active_indices.empty()) {
+        resizeDeviceBuffer(active_indices_buf_, active_indices.size());
+        uploadDeviceSlice(active_indices_buf_.deviceBuffer, 0, active_indices.data(),
+                          active_indices.size() * sizeof(uint32_t));
+    } else if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() == 0) {
+        uint32_t dummy = 0u;
+        resizeDeviceBuffer(active_indices_buf_, 1);
+        uploadDeviceSlice(active_indices_buf_.deviceBuffer, 0, &dummy, sizeof(uint32_t));
+    }
+}
+
 void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     const TrainerConfig &config,
     const VulkanGSRendererUniforms& uniforms,
     VulkanGSPipelineBuffers& buffers,
     int step
 ) {
+    const size_t num_splats = buffers.num_splats;
+    if (num_splats == 0 || (use_active_index_dispatch_ && active_splat_count_ == 0u)) {
+        return;
+    }
+
     PerfTimer::Timer<PerfTimer::FusedProjectionBackwardOptimizerStep> timer(this);
     DEVICE_GUARD;
 
-    size_t num_splats = buffers.num_splats;
+    const bool use_active_dispatch =
+        use_active_index_dispatch_ && active_splat_count_ > 0u && active_splat_count_ < num_splats;
+    const size_t dispatch_count = use_active_dispatch ? static_cast<size_t>(active_splat_count_) : num_splats;
 
     bufferMemoryBarrier({
         { buffers.tiles_touched.deviceBuffer, COMPUTE_SHADER_WRITE },
@@ -1130,13 +1160,18 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.protect_locked_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
     shaderUniforms.num_anchors = static_cast<uint32_t>(buffers.splat_anchor.deviceSize() / 8);
     shaderUniforms.normal_scale_cap = config.surfel_normal_cap_m * scene_scale;
+    shaderUniforms.active_splat_count = use_active_dispatch ? active_splat_count_ : static_cast<uint32_t>(num_splats);
+    shaderUniforms.use_active_index_dispatch = use_active_dispatch ? 1u : 0u;
+    if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() == 0) {
+        resizeDeviceBuffer(active_indices_buf_, 1);
+    }
 
     // execute compute
     size_t alloc_size = num_splats;
     if (config.strategy == TrainerConfig::Strategy::MCMC)
         alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
     executeCompute(
-        {{num_splats, SUBGROUP_SIZE}},
+        {{dispatch_count, SUBGROUP_SIZE}},
         &shaderUniforms, sizeof(shaderUniforms),
         pipeline_fused_projection_backward_optimizer,
         {
@@ -1157,6 +1192,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             buffers.group_state.deviceBuffer,
             buffers.splat_state.deviceBuffer,
             buffers.splat_anchor.deviceBuffer,
+            active_indices_buf_.deviceBuffer,
         },
         GATE_OPTIMIZER
     );
@@ -1469,6 +1505,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             resizeAndCopyDeviceBuffer(buffers.default_grad, 2*new_num_splats, false);
             resizeAndCopyDeviceBuffer(buffers.default_radii, new_num_splats, false);
             buffers.num_splats = new_num_splats;
+            invalidateActiveIndexDispatch();
             barrierAllGaussParams(buffers);
             syncHostMetadataSize(num_splats);
         }
@@ -1746,6 +1783,7 @@ void VulkanGSTrainer::executeDefaultPostBackward(
             barrierAllGaussParams(buffers);
 
             buffers.num_splats = num_keep;
+            invalidateActiveIndexDispatch();
         }
         if (num_dupli + num_split > 0 || num_prune > 0) {
             if (!splat_group_ids.empty()) {
@@ -2026,6 +2064,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
             );
 
             // MC-1: Update splat_group_ids, splat_entity_ids, splat_uids, splat_states, splat_anchors_host, splat_cell_ids for relocated dead splats
+            invalidateActiveIndexDispatch();
             if (!splat_group_ids.empty() || !splat_states.empty() || use_local_cell_credits_ || !splat_uids.empty()) {
                 copyFromDevice(buffers.mcmc_index_map);
                 if (!splat_group_ids.empty() && splat_group_ids.size() < num_splats)
@@ -2368,6 +2407,7 @@ void VulkanGSTrainer::executeMCMCPostBackward(
                     );
                 }
                 buffers.num_splats = new_num_splats;
+                invalidateActiveIndexDispatch();
                 mcmc_added_count += num_add;
             } else {
                 num_add = 0;
@@ -2427,6 +2467,7 @@ void VulkanGSTrainer::executeMortonSorting(
     // PerfTimer::Timer<PerfTimer::MortonSorting> timer(this);
     DEVICE_GUARD;
 
+    invalidateActiveIndexDispatch();
     uint32_t num_splats = (uint32_t)buffers.num_splats;
 
     barrierAllGaussParams(buffers);
@@ -3064,6 +3105,7 @@ void VulkanGSTrainer::set_group_states(
     if (count == 0)
         return;
     HOST_GUARD;
+    invalidateActiveIndexDispatch();
     int32_t lo = gids[0], hi = gids[0];
     for (size_t i = 1; i < count; ++i) {
         lo = std::min(lo, gids[i]);
@@ -3114,6 +3156,7 @@ void VulkanGSTrainer::set_splat_states_sparse(
     if (count == 0 || buffers.num_splats == 0)
         return;
     HOST_GUARD;
+    invalidateActiveIndexDispatch();
     if (splat_states.size() < buffers.num_splats)
         splat_states.resize(buffers.num_splats, 0xFFFFFFFFu);
     ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
@@ -3228,6 +3271,7 @@ void VulkanGSTrainer::reanchor_splats_sparse(
 ) {
     if (count == 0 || buffers.num_splats == 0)
         return;
+    invalidateActiveIndexDispatch();
     std::vector<uint32_t> valid_rows;
     std::vector<float> values;
     valid_rows.reserve(count);
@@ -3956,6 +4000,7 @@ std::vector<int32_t> VulkanGSTrainer::compact_retracted(VulkanGSPipelineBuffers&
         splat_anchors_host = std::move(out_anc);
     }
     buffers.num_splats = new_n;
+    invalidateActiveIndexDispatch();
     return index_map;
 }
 
@@ -4013,7 +4058,8 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
     const size_t off_cid = off_sst + n_add * sizeof(uint32_t);
     const size_t cid_bytes = use_local_cell_credits_ ? n_add * sizeof(int32_t) : 0;
     const size_t off_sh = off_cid + cid_bytes;
-    const size_t staging_bytes = off_sh + sh_vec4 * 4 * sizeof(float);
+    const size_t sh_bytes = (new_sh_coeffs != nullptr) ? (sh_vec4 * 4 * sizeof(float)) : 0;
+    const size_t staging_bytes = off_sh + sh_bytes;
 
     std::vector<uint32_t> add_sst(n_add, 0xFFFFFFFFu);
     if (new_splat_states != nullptr) {
@@ -4044,29 +4090,31 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         std::fill_n(reinterpret_cast<int32_t*>(stage + off_cid), n_add, -1);
 
     struct Vec4 { float v[4]; };
-    Vec4* st_sh = reinterpret_cast<Vec4*>(stage + off_sh);
-    const Vec4* in_sh = reinterpret_cast<const Vec4*>(new_sh_coeffs);
     std::vector<VkBufferCopy> sh_regions;
-    if (R <= 1) {
-        std::memcpy(st_sh, in_sh, n_add * kShVec4 * sizeof(Vec4));
-        sh_regions.push_back({off_sh, old_n * kShVec4 * sizeof(Vec4), n_add * kShVec4 * sizeof(Vec4)});
-    } else {
-        size_t cursor = 0;  // float4 units inside the SH staging area
-        for (size_t g = g_first; g <= g_last; ++g) {
-            const size_t j_lo = (g == g_first) ? old_n % R : 0;
-            for (size_t k = 0; k < kShVec4; ++k) {
-                for (size_t j = j_lo; j < R; ++j) {
-                    const size_t gi = g * R + j;
-                    if (gi < new_n)
-                        st_sh[cursor + (j - j_lo)] = in_sh[(gi - old_n) * kShVec4 + k];
-                    else
-                        st_sh[cursor + (j - j_lo)] = Vec4{{0.f, 0.f, 0.f, 0.f}};
+    if (new_sh_coeffs != nullptr) {
+        Vec4* st_sh = reinterpret_cast<Vec4*>(stage + off_sh);
+        const Vec4* in_sh = reinterpret_cast<const Vec4*>(new_sh_coeffs);
+        if (R <= 1) {
+            std::memcpy(st_sh, in_sh, n_add * kShVec4 * sizeof(Vec4));
+            sh_regions.push_back({off_sh, old_n * kShVec4 * sizeof(Vec4), n_add * kShVec4 * sizeof(Vec4)});
+        } else {
+            size_t cursor = 0;  // float4 units inside the SH staging area
+            for (size_t g = g_first; g <= g_last; ++g) {
+                const size_t j_lo = (g == g_first) ? old_n % R : 0;
+                for (size_t k = 0; k < kShVec4; ++k) {
+                    for (size_t j = j_lo; j < R; ++j) {
+                        const size_t gi = g * R + j;
+                        if (gi < new_n)
+                            st_sh[cursor + (j - j_lo)] = in_sh[(gi - old_n) * kShVec4 + k];
+                        else
+                            st_sh[cursor + (j - j_lo)] = Vec4{{0.f, 0.f, 0.f, 0.f}};
+                    }
+                    sh_regions.push_back({
+                        off_sh + cursor * sizeof(Vec4),
+                        ((g * kShVec4 + k) * R + j_lo) * sizeof(Vec4),
+                        (R - j_lo) * sizeof(Vec4)});
+                    cursor += R - j_lo;
                 }
-                sh_regions.push_back({
-                    off_sh + cursor * sizeof(Vec4),
-                    ((g * kShVec4 + k) * R + j_lo) * sizeof(Vec4),
-                    (R - j_lo) * sizeof(Vec4)});
-                cursor += R - j_lo;
             }
         }
     }
@@ -4100,9 +4148,9 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         vkCmdCopyBuffer(cb, src, buf.deviceBuffer.buffer, 1, &region);
     };
 
-    // parameters (new region fully overwritten below)
+    // parameters (new region fully overwritten below; zero SH tail when filled on GPU)
     grow(buffers.xyz_ws, 3 * new_n, false);
-    grow(buffers.sh_coeffs, kShVec4 * 4 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), false);
+    grow(buffers.sh_coeffs, kShVec4 * 4 * _CEIL_ROUND(new_n, SH_REORDER_SIZE), new_sh_coeffs == nullptr);
     grow(buffers.rotations, 4 * new_n, false);
     grow(buffers.scales_opacs, 4 * new_n, false);
     grow(buffers.group_ids, new_n, false);
@@ -4145,7 +4193,9 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         VkBufferCopy region{off_cid, old_n * sizeof(int32_t), n_add * sizeof(int32_t)};
         vkCmdCopyBuffer(cb, src, buffers.splat_cell_ids.deviceBuffer.buffer, 1, &region);
     }
-    vkCmdCopyBuffer(cb, src, buffers.sh_coeffs.deviceBuffer.buffer, (uint32_t)sh_regions.size(), sh_regions.data());
+    if (!sh_regions.empty()) {
+        vkCmdCopyBuffer(cb, src, buffers.sh_coeffs.deviceBuffer.buffer, (uint32_t)sh_regions.size(), sh_regions.data());
+    }
 
     submitAppendRecording();
 
@@ -4178,11 +4228,195 @@ size_t VulkanGSTrainer::append_splats_preserving_optimizer(
         splat_cell_ids_dirty_ = false;
     }
     buffers.num_splats = new_n;
+    invalidateActiveIndexDispatch();
 
     if (reallocated)
         counters.append_reallocs++;
     counters.append_fence_waits += counters.fence_waits_total - fence_waits_before;
     return buffers.num_splats;
+}
+
+static double computeAppearanceWlsRmse(
+    const std::vector<int32_t>& obs_count,
+    const std::vector<float>& weight_sum,
+    const std::vector<float>& se_num_vec,
+    size_t* n_valid_out = nullptr
+) {
+    const size_t n_points = obs_count.size();
+    bool any_multi = false;
+    size_t n_valid = 0;
+    for (size_t i = 0; i < n_points; ++i) {
+        if (obs_count[i] > 0)
+            ++n_valid;
+        if (obs_count[i] >= 2)
+            any_multi = true;
+    }
+    if (n_valid_out != nullptr)
+        *n_valid_out = n_valid;
+
+    double se_num_total = 0.0;
+    double se_den_total = 0.0;
+    for (size_t i = 0; i < n_points; ++i) {
+        const bool use = any_multi ? (obs_count[i] >= 2) : (obs_count[i] > 0);
+        if (use) {
+            se_num_total += static_cast<double>(se_num_vec[i]);
+            se_den_total += static_cast<double>(weight_sum[i]);
+        }
+    }
+    return (se_den_total > 0.0) ? std::sqrt(std::max(se_num_total, 0.0) / se_den_total) : 0.0;
+}
+
+double VulkanGSTrainer::runAppearanceInitKernel(
+    const float* means_world,
+    const float* normals_world,
+    size_t n_points,
+    const uint8_t* rgb_views_u8,
+    size_t n_views,
+    int h_rgb,
+    int w_rgb,
+    int rgb_channels,
+    const float* depth_views_f32,
+    int h_d,
+    int w_d,
+    const float* view_params_24,
+    const float* fallback_rgb_f32,
+    int sh_degree,
+    float reg_lambda,
+    float depth_tol_m,
+    float min_cos_angle,
+    const _VulkanBuffer& target_sh_buf,
+    bool write_reordered_sh,
+    uint32_t sh_dst_offset
+) {
+    // Upload inputs to reusable device buffers
+    resizeDeviceBuffer(appear_means_, 3 * n_points);
+    uploadDeviceSlice(appear_means_.deviceBuffer, 0, means_world, 3 * n_points * sizeof(float));
+
+    const bool has_normals = (normals_world != nullptr);
+    if (has_normals) {
+        resizeDeviceBuffer(appear_normals_, 3 * n_points);
+        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, normals_world, 3 * n_points * sizeof(float));
+    } else {
+        float dummy_n[3] = {0.0f, 0.0f, 0.0f};
+        resizeDeviceBuffer(appear_normals_, 3);
+        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, dummy_n, sizeof(dummy_n));
+    }
+
+    resizeDeviceBuffer(appear_fallback_, 3 * n_points);
+    uploadDeviceSlice(appear_fallback_.deviceBuffer, 0, fallback_rgb_f32, 3 * n_points * sizeof(float));
+
+    if (n_views > 0) {
+        resizeDeviceBuffer(appear_view_params_, 24 * n_views);
+        uploadDeviceSlice(appear_view_params_.deviceBuffer, 0, view_params_24, 24 * n_views * sizeof(float));
+
+        const size_t rgb_bytes = n_views * static_cast<size_t>(h_rgb) * static_cast<size_t>(w_rgb) * static_cast<size_t>(rgb_channels);
+        const size_t rgb_padded = ((rgb_bytes + 7u) & ~size_t(3u)) + 4u;
+        resizeDeviceBuffer(appear_rgb_u8_, rgb_padded);
+        uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, 0, rgb_views_u8, rgb_bytes);
+        if (rgb_padded > rgb_bytes) {
+            uint8_t zeros[12] = {};
+            uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, rgb_bytes, zeros, rgb_padded - rgb_bytes);
+        }
+
+        const size_t depth_elems = n_views * static_cast<size_t>(h_d) * static_cast<size_t>(w_d);
+        resizeDeviceBuffer(appear_depth_f32_, depth_elems);
+        uploadDeviceSlice(appear_depth_f32_.deviceBuffer, 0, depth_views_f32, depth_elems * sizeof(float));
+    } else {
+        float dummy_vp[24] = {};
+        uint8_t dummy_rgb[16] = {};
+        float dummy_d = 0.0f;
+        resizeDeviceBuffer(appear_view_params_, 24);
+        uploadDeviceSlice(appear_view_params_.deviceBuffer, 0, dummy_vp, sizeof(dummy_vp));
+        resizeDeviceBuffer(appear_rgb_u8_, 16);
+        uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, 0, dummy_rgb, sizeof(dummy_rgb));
+        resizeDeviceBuffer(appear_depth_f32_, 1);
+        uploadDeviceSlice(appear_depth_f32_.deviceBuffer, 0, &dummy_d, sizeof(dummy_d));
+    }
+
+    // Allocate auxiliary output buffers
+    resizeDeviceBuffer(appear_out_rgb_, 3 * n_points);
+    resizeDeviceBuffer(appear_out_obs_, n_points);
+    resizeDeviceBuffer(appear_out_wsum_, n_points);
+    resizeDeviceBuffer(appear_out_se_, n_points);
+
+    const double gpu_t0_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
+    auto t_kern_0 = std::chrono::steady_clock::now();
+    {
+        DEVICE_GUARD;
+        PerfTimer::Timer<PerfTimer::AppearanceInit> timer(this);
+
+        Uniform32_t u[14];
+        u[0].u = static_cast<uint32_t>(n_points);
+        u[1].u = static_cast<uint32_t>(n_views);
+        u[2].u = static_cast<uint32_t>(std::max(h_rgb, 1));
+        u[3].u = static_cast<uint32_t>(std::max(w_rgb, 1));
+        u[4].u = static_cast<uint32_t>(std::max(h_d, 1));
+        u[5].u = static_cast<uint32_t>(std::max(w_d, 1));
+        u[6].u = static_cast<uint32_t>(rgb_channels > 0 ? rgb_channels : 3);
+        u[7].u = has_normals ? 1u : 0u;
+        u[8].u = static_cast<uint32_t>(sh_degree);
+        u[9].f = reg_lambda;
+        u[10].f = depth_tol_m;
+        u[11].f = min_cos_angle;
+        u[12].u = write_reordered_sh ? 1u : 0u;
+        u[13].u = sh_dst_offset;
+
+        bufferMemoryBarrier({
+            { appear_means_.deviceBuffer, TRANSFER_WRITE },
+            { appear_normals_.deviceBuffer, TRANSFER_WRITE },
+            { appear_fallback_.deviceBuffer, TRANSFER_WRITE },
+            { appear_view_params_.deviceBuffer, TRANSFER_WRITE },
+            { appear_rgb_u8_.deviceBuffer, TRANSFER_WRITE },
+            { appear_depth_f32_.deviceBuffer, TRANSFER_WRITE },
+        }, COMPUTE_SHADER_READ);
+        if (write_reordered_sh) {
+            bufferMemoryBarrier({
+                { target_sh_buf, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+        }
+
+        executeCompute(
+            {{n_points, 256}},
+            &u, sizeof(u),
+            pipeline_appearance_init,
+            {
+                appear_means_.deviceBuffer,
+                appear_normals_.deviceBuffer,
+                appear_fallback_.deviceBuffer,
+                appear_view_params_.deviceBuffer,
+                appear_rgb_u8_.deviceBuffer,
+                appear_depth_f32_.deviceBuffer,
+                target_sh_buf,
+                appear_out_rgb_.deviceBuffer,
+                appear_out_obs_.deviceBuffer,
+                appear_out_wsum_.deviceBuffer,
+                appear_out_se_.deviceBuffer,
+            }
+        );
+
+        if (write_reordered_sh) {
+            bufferMemoryBarrier({
+                { target_sh_buf, COMPUTE_SHADER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+            bufferMemoryBarrier({
+                { appear_out_obs_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { appear_out_wsum_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { appear_out_se_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_READ);
+        } else {
+            bufferMemoryBarrier({
+                { target_sh_buf, COMPUTE_SHADER_WRITE },
+                { appear_out_rgb_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { appear_out_obs_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { appear_out_wsum_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { appear_out_se_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_READ);
+        }
+    }
+    auto t_kern_1 = std::chrono::steady_clock::now();
+    const double gpu_t1_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
+    const double host_kern_ms = std::chrono::duration<double, std::milli>(t_kern_1 - t_kern_0).count();
+    return (gpu_t1_s > gpu_t0_s) ? ((gpu_t1_s - gpu_t0_s) * 1000.0) : host_kern_ms;
 }
 
 VulkanGSTrainer::AppearanceInitResult VulkanGSTrainer::project_and_fit_sh_vulkan(
@@ -4244,106 +4478,15 @@ VulkanGSTrainer::AppearanceInitResult VulkanGSTrainer::project_and_fit_sh_vulkan
         throw std::invalid_argument("project_and_fit_sh_vulkan: invalid image/depth dimensions or rgb_channels");
     }
 
-    // Upload inputs to reusable device buffers
-    resizeDeviceBuffer(appear_means_, 3 * n_points);
-    uploadDeviceSlice(appear_means_.deviceBuffer, 0, means_world, 3 * n_points * sizeof(float));
-
-    const bool has_normals = (normals_world != nullptr);
-    if (has_normals) {
-        resizeDeviceBuffer(appear_normals_, 3 * n_points);
-        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, normals_world, 3 * n_points * sizeof(float));
-    } else {
-        float dummy_n[3] = {0.0f, 0.0f, 0.0f};
-        resizeDeviceBuffer(appear_normals_, 3);
-        uploadDeviceSlice(appear_normals_.deviceBuffer, 0, dummy_n, sizeof(dummy_n));
-    }
-
-    resizeDeviceBuffer(appear_fallback_, 3 * n_points);
-    uploadDeviceSlice(appear_fallback_.deviceBuffer, 0, fallback_rgb_f32, 3 * n_points * sizeof(float));
-
-    resizeDeviceBuffer(appear_view_params_, 24 * n_views);
-    uploadDeviceSlice(appear_view_params_.deviceBuffer, 0, view_params_24, 24 * n_views * sizeof(float));
-
-    const size_t rgb_bytes = n_views * static_cast<size_t>(h_rgb) * static_cast<size_t>(w_rgb) * static_cast<size_t>(rgb_channels);
-    const size_t rgb_padded = ((rgb_bytes + 7u) & ~size_t(3u)) + 4u;
-    resizeDeviceBuffer(appear_rgb_u8_, rgb_padded);
-    uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, 0, rgb_views_u8, rgb_bytes);
-    if (rgb_padded > rgb_bytes) {
-        uint8_t zeros[12] = {};
-        uploadDeviceSlice(appear_rgb_u8_.deviceBuffer, rgb_bytes, zeros, rgb_padded - rgb_bytes);
-    }
-
-    const size_t depth_elems = n_views * static_cast<size_t>(h_d) * static_cast<size_t>(w_d);
-    resizeDeviceBuffer(appear_depth_f32_, depth_elems);
-    uploadDeviceSlice(appear_depth_f32_.deviceBuffer, 0, depth_views_f32, depth_elems * sizeof(float));
-
-    // Allocate output buffers
     resizeDeviceBuffer(appear_out_sh_, 48 * n_points);
-    resizeDeviceBuffer(appear_out_rgb_, 3 * n_points);
-    resizeDeviceBuffer(appear_out_obs_, n_points);
-    resizeDeviceBuffer(appear_out_wsum_, n_points);
-    resizeDeviceBuffer(appear_out_se_, n_points);
-
-    const double gpu_t0_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
-    auto t_kern_0 = std::chrono::steady_clock::now();
-    {
-        DEVICE_GUARD;
-        PerfTimer::Timer<PerfTimer::AppearanceInit> timer(this);
-
-        Uniform32_t u[12];
-        u[0].u = static_cast<uint32_t>(n_points);
-        u[1].u = static_cast<uint32_t>(n_views);
-        u[2].u = static_cast<uint32_t>(h_rgb);
-        u[3].u = static_cast<uint32_t>(w_rgb);
-        u[4].u = static_cast<uint32_t>(h_d);
-        u[5].u = static_cast<uint32_t>(w_d);
-        u[6].u = static_cast<uint32_t>(rgb_channels);
-        u[7].u = has_normals ? 1u : 0u;
-        u[8].u = static_cast<uint32_t>(sh_degree);
-        u[9].f = reg_lambda;
-        u[10].f = depth_tol_m;
-        u[11].f = min_cos_angle;
-
-        bufferMemoryBarrier({
-            { appear_means_.deviceBuffer, TRANSFER_WRITE },
-            { appear_normals_.deviceBuffer, TRANSFER_WRITE },
-            { appear_fallback_.deviceBuffer, TRANSFER_WRITE },
-            { appear_view_params_.deviceBuffer, TRANSFER_WRITE },
-            { appear_rgb_u8_.deviceBuffer, TRANSFER_WRITE },
-            { appear_depth_f32_.deviceBuffer, TRANSFER_WRITE },
-        }, COMPUTE_SHADER_READ);
-
-        executeCompute(
-            {{n_points, 256}},
-            &u, sizeof(u),
-            pipeline_appearance_init,
-            {
-                appear_means_.deviceBuffer,
-                appear_normals_.deviceBuffer,
-                appear_fallback_.deviceBuffer,
-                appear_view_params_.deviceBuffer,
-                appear_rgb_u8_.deviceBuffer,
-                appear_depth_f32_.deviceBuffer,
-                appear_out_sh_.deviceBuffer,
-                appear_out_rgb_.deviceBuffer,
-                appear_out_obs_.deviceBuffer,
-                appear_out_wsum_.deviceBuffer,
-                appear_out_se_.deviceBuffer,
-            }
-        );
-
-        bufferMemoryBarrier({
-            { appear_out_sh_.deviceBuffer, COMPUTE_SHADER_WRITE },
-            { appear_out_rgb_.deviceBuffer, COMPUTE_SHADER_WRITE },
-            { appear_out_obs_.deviceBuffer, COMPUTE_SHADER_WRITE },
-            { appear_out_wsum_.deviceBuffer, COMPUTE_SHADER_WRITE },
-            { appear_out_se_.deviceBuffer, COMPUTE_SHADER_WRITE },
-        }, TRANSFER_READ);
-    }
-    auto t_kern_1 = std::chrono::steady_clock::now();
-    const double gpu_t1_s = PerfTimer::get_stage_total_time_s(PerfTimer::AppearanceInit);
-    const double host_kern_ms = std::chrono::duration<double, std::milli>(t_kern_1 - t_kern_0).count();
-    res.kernel_wall_ms = (gpu_t1_s > gpu_t0_s) ? ((gpu_t1_s - gpu_t0_s) * 1000.0) : host_kern_ms;
+    res.kernel_wall_ms = runAppearanceInitKernel(
+        means_world, normals_world, n_points,
+        rgb_views_u8, n_views, h_rgb, w_rgb, rgb_channels,
+        depth_views_f32, h_d, w_d,
+        view_params_24, fallback_rgb_f32,
+        sh_degree, reg_lambda, depth_tol_m, min_cos_angle,
+        appear_out_sh_.deviceBuffer, false, 0u
+    );
 
     std::vector<float> se_num_vec(n_points, 0.0f);
     downloadDeviceSlice(appear_out_sh_.deviceBuffer, 0, res.sh_coeffs.data(), 48 * n_points * sizeof(float));
@@ -4352,28 +4495,105 @@ VulkanGSTrainer::AppearanceInitResult VulkanGSTrainer::project_and_fit_sh_vulkan
     downloadDeviceSlice(appear_out_wsum_.deviceBuffer, 0, res.weight_sum.data(), n_points * sizeof(float));
     downloadDeviceSlice(appear_out_se_.deviceBuffer, 0, se_num_vec.data(), n_points * sizeof(float));
 
-    bool any_multi = false;
-    for (size_t i = 0; i < n_points; ++i) {
-        if (res.obs_count[i] >= 2) {
-            any_multi = true;
-            break;
-        }
-    }
-    double se_num_total = 0.0;
-    double se_den_total = 0.0;
-    for (size_t i = 0; i < n_points; ++i) {
-        bool use = any_multi ? (res.obs_count[i] >= 2) : (res.obs_count[i] > 0);
-        if (use) {
-            se_num_total += static_cast<double>(se_num_vec[i]);
-            se_den_total += static_cast<double>(res.weight_sum[i]);
-        }
-    }
-    res.wls_sh_fit_rmse = (se_den_total > 0.0) ? std::sqrt(std::max(se_num_total, 0.0) / se_den_total) : 0.0;
+    res.wls_sh_fit_rmse = computeAppearanceWlsRmse(res.obs_count, res.weight_sum, se_num_vec);
 
     auto t_total_1 = std::chrono::steady_clock::now();
     res.total_wall_ms = std::max(
         std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count(),
         res.kernel_wall_ms
+    );
+    return res;
+}
+
+VulkanGSTrainer::AppendAndInitSurfelsResult VulkanGSTrainer::append_and_init_surfels_vulkan(
+    VulkanGSPipelineBuffers& buffers,
+    const float* means_world,
+    const float* normals_world,
+    const float* xyz_norm,
+    const float* scales_norm,
+    const float* quats_norm,
+    const float* opacities,
+    const int32_t* group_ids,
+    const uint32_t* new_splat_states,
+    const float* fallback_rgb_f32,
+    size_t n_add,
+    const uint8_t* rgb_views_u8,
+    size_t n_views,
+    int h_rgb,
+    int w_rgb,
+    int rgb_channels,
+    const float* depth_views_f32,
+    int h_d,
+    int w_d,
+    const float* view_params_24,
+    int sh_degree,
+    float reg_lambda,
+    float depth_tol_m,
+    float min_cos_angle
+) {
+    if (sh_degree < 0 || sh_degree > 1) {
+        throw std::invalid_argument("append_and_init_surfels_vulkan: sh_degree must be 0 or 1");
+    }
+    if (!std::isfinite(reg_lambda) || reg_lambda < 0.0f) {
+        throw std::invalid_argument("append_and_init_surfels_vulkan: sh_reg must be finite and >= 0");
+    }
+    if (!std::isfinite(depth_tol_m) || depth_tol_m < 0.0f) {
+        throw std::invalid_argument("append_and_init_surfels_vulkan: depth_tol must be finite and >= 0");
+    }
+    if (!std::isfinite(min_cos_angle)) {
+        throw std::invalid_argument("append_and_init_surfels_vulkan: min_cos_angle must be finite");
+    }
+    if (n_views > 0 && (h_rgb <= 0 || w_rgb <= 0 || h_d <= 0 || w_d <= 0 || (rgb_channels != 3 && rgb_channels != 4))) {
+        throw std::invalid_argument("append_and_init_surfels_vulkan: invalid image/depth dimensions or rgb_channels");
+    }
+
+    auto t_total_0 = std::chrono::steady_clock::now();
+    AppendAndInitSurfelsResult res;
+    if (n_add == 0) {
+        auto t_total_1 = std::chrono::steady_clock::now();
+        res.total_ms = std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count();
+        return res;
+    }
+
+    const size_t old_n = buffers.num_splats;
+    // Grow all buffers (preserving existing optimizer state) and upload non-SH attributes;
+    // buffers.sh_coeffs is grown on GPU and populated directly by appearance_init.slang below.
+    append_splats_preserving_optimizer(
+        buffers,
+        xyz_norm,
+        nullptr,
+        quats_norm,
+        scales_norm,
+        opacities,
+        group_ids,
+        n_add,
+        new_splat_states
+    );
+
+    res.kernel_ms = runAppearanceInitKernel(
+        means_world, normals_world, n_add,
+        rgb_views_u8, n_views, h_rgb, w_rgb, rgb_channels,
+        depth_views_f32, h_d, w_d,
+        view_params_24, fallback_rgb_f32,
+        sh_degree, reg_lambda, depth_tol_m, min_cos_angle,
+        buffers.sh_coeffs.deviceBuffer, true, static_cast<uint32_t>(old_n)
+    );
+
+    // Download only lightweight scalar diagnostics (no SH / RGB host readback!)
+    std::vector<int32_t> obs_count(n_add, 0);
+    std::vector<float> weight_sum(n_add, 0.0f);
+    std::vector<float> se_num_vec(n_add, 0.0f);
+    downloadDeviceSlice(appear_out_obs_.deviceBuffer, 0, obs_count.data(), n_add * sizeof(int32_t));
+    downloadDeviceSlice(appear_out_wsum_.deviceBuffer, 0, weight_sum.data(), n_add * sizeof(float));
+    downloadDeviceSlice(appear_out_se_.deviceBuffer, 0, se_num_vec.data(), n_add * sizeof(float));
+
+    res.n_appended = n_add;
+    res.mean_wls_rmse = computeAppearanceWlsRmse(obs_count, weight_sum, se_num_vec, &res.n_valid_sh);
+
+    auto t_total_1 = std::chrono::steady_clock::now();
+    res.total_ms = std::max(
+        std::chrono::duration<double, std::milli>(t_total_1 - t_total_0).count(),
+        res.kernel_ms
     );
     return res;
 }
