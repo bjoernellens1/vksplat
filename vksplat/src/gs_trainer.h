@@ -217,13 +217,22 @@ public:
     }
     void set_splat_group_ids(const std::vector<int32_t>& gids) {
         splat_group_ids = gids;
+        invalidateActiveIndexDispatch();
     }
     void set_splat_entity_ids(const std::vector<int32_t>& eids) {
         splat_entity_ids = eids;
     }
     void set_splat_states_vec(const std::vector<uint32_t>& states) {
         splat_states = states;
+        invalidateActiveIndexDispatch();
     }
+    void set_active_indices_gpu(const std::vector<uint32_t>& active_indices, size_t total_splats);
+    void invalidateActiveIndexDispatch() {
+        use_active_index_dispatch_ = false;
+        active_splat_count_ = 0u;
+    }
+    uint32_t get_active_splat_count() const { return active_splat_count_; }
+    bool get_use_active_index_dispatch() const { return use_active_index_dispatch_; }
 
     // CSE-0: Streaming frame and optimizer-preserving splat append APIs
     void uploadFrameImage(Buffer<uint8_t>& image, const uint8_t* rgba_pixels, size_t n_bytes);
@@ -388,6 +397,42 @@ public:
         float min_cos_angle = 0.15f
     );
 
+    struct AppendAndInitSurfelsResult {
+        size_t n_appended = 0;
+        double kernel_ms = 0.0;
+        double total_ms = 0.0;
+        double mean_wls_rmse = 0.0;
+        size_t n_valid_sh = 0;
+    };
+
+    // Fused GPU-resident appearance init + optimizer-preserving surfel append (no SH host readback).
+    AppendAndInitSurfelsResult append_and_init_surfels_vulkan(
+        VulkanGSPipelineBuffers& buffers,
+        const float* means_world,      // (M, 3)
+        const float* normals_world,    // (M, 3) or nullptr
+        const float* xyz_norm,         // (M, 3)
+        const float* scales_norm,      // (M, 3)
+        const float* quats_norm,       // (M, 4)
+        const float* opacities,        // (M,)
+        const int32_t* group_ids,      // (M,) or nullptr
+        const uint32_t* new_splat_states, // (M,) or nullptr
+        const float* fallback_rgb_f32, // (M, 3)
+        size_t n_add,
+        const uint8_t* rgb_views_u8,   // (V, H_rgb, W_rgb, rgb_channels) or nullptr when V==0
+        size_t n_views,
+        int h_rgb,
+        int w_rgb,
+        int rgb_channels,
+        const float* depth_views_f32,  // (V, H_d, W_d) or nullptr when V==0
+        int h_d,
+        int w_d,
+        const float* view_params_24,   // (V, 24) or nullptr when V==0
+        int sh_degree = 1,
+        float reg_lambda = 1e-2f,
+        float depth_tol_m = 0.12f,
+        float min_cos_angle = 0.15f
+    );
+
 private:
     std::default_random_engine rng;
 
@@ -436,6 +481,34 @@ private:
     Buffer<float> appear_out_wsum_;
     Buffer<float> appear_out_se_;
     _ComputePipeline pipeline_appearance_init = _ComputePipeline(11);
+    double runAppearanceInitKernel(
+        const float* means_world,
+        const float* normals_world,
+        size_t n_points,
+        const uint8_t* rgb_views_u8,
+        size_t n_views,
+        int h_rgb,
+        int w_rgb,
+        int rgb_channels,
+        const float* depth_views_f32,
+        int h_d,
+        int w_d,
+        const float* view_params_24,
+        const float* fallback_rgb_f32,
+        int sh_degree,
+        float reg_lambda,
+        float depth_tol_m,
+        float min_cos_angle,
+        const _VulkanBuffer& target_sh_buf,
+        bool write_reordered_sh,
+        uint32_t sh_dst_offset
+    );
+
+    // GPU active-set compaction for Adam optimizer dispatch
+    Buffer<uint32_t> active_indices_buf_;
+    uint32_t active_splat_count_ = 0u;
+    bool use_active_index_dispatch_ = false;
+
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};
@@ -445,7 +518,7 @@ private:
     _ComputePipeline pipeline_ssim_grad = _ComputePipeline(5);
     _ComputePipeline pipeline_ssim_stats_ds2 = _ComputePipeline(3);  // SSIM on the 2x2 box-averaged images
     _ComputePipeline pipeline_ssim_grad_ds2 = _ComputePipeline(5);
-    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(17);
+    _ComputePipeline pipeline_fused_projection_backward_optimizer = _ComputePipeline(18);
     struct _DefaultComputePipeline {
         _ComputePipeline update_state = _ComputePipeline(4);
         _ComputePipeline compute_grow_mask = _ComputePipeline(10);

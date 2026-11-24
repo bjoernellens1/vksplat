@@ -33,6 +33,8 @@ struct AppearanceInitUniforms {
     float reg_lambda;
     float depth_tol_m;
     float min_cos_angle;
+    uint32_t write_reordered_sh;
+    uint32_t sh_dst_offset;
 };
 
 [ForceInline]
@@ -349,20 +351,52 @@ void main(
     out_weight_sum[i] = weight_sum;
     out_se_num[i] = se_num;
 
-    uint32_t sh_base = 48u * i;
-    out_sh_coeffs[sh_base + 0u] = x0.x;
-    out_sh_coeffs[sh_base + 1u] = x0.y;
-    out_sh_coeffs[sh_base + 2u] = x0.z;
-    out_sh_coeffs[sh_base + 3u] = x1.x;
-    out_sh_coeffs[sh_base + 4u] = x1.y;
-    out_sh_coeffs[sh_base + 5u] = x1.z;
-    out_sh_coeffs[sh_base + 6u] = x2.x;
-    out_sh_coeffs[sh_base + 7u] = x2.y;
-    out_sh_coeffs[sh_base + 8u] = x2.z;
-    out_sh_coeffs[sh_base + 9u] = x3.x;
-    out_sh_coeffs[sh_base + 10u] = x3.y;
-    out_sh_coeffs[sh_base + 11u] = x3.z;
-    for (uint32_t k = 12u; k < 48u; ++k) {
-        out_sh_coeffs[sh_base + k] = 0.0f;
+    if (uniforms.write_reordered_sh != 0u) {
+        uint32_t g_idx = uniforms.sh_dst_offset + i;
+        uint32_t reorder_offset = g_idx % SH_REORDER_SIZE;
+        uint32_t reorder_base = g_idx - reorder_offset;
+
+        uint32_t b0 = 4u * (12u * reorder_base + 0u * SH_REORDER_SIZE + reorder_offset);
+        out_sh_coeffs[b0 + 0u] = x0.x;
+        out_sh_coeffs[b0 + 1u] = x0.y;
+        out_sh_coeffs[b0 + 2u] = x0.z;
+        out_sh_coeffs[b0 + 3u] = x1.x;
+
+        uint32_t b1 = 4u * (12u * reorder_base + 1u * SH_REORDER_SIZE + reorder_offset);
+        out_sh_coeffs[b1 + 0u] = x1.y;
+        out_sh_coeffs[b1 + 1u] = x1.z;
+        out_sh_coeffs[b1 + 2u] = x2.x;
+        out_sh_coeffs[b1 + 3u] = x2.y;
+
+        uint32_t b2 = 4u * (12u * reorder_base + 2u * SH_REORDER_SIZE + reorder_offset);
+        out_sh_coeffs[b2 + 0u] = x2.z;
+        out_sh_coeffs[b2 + 1u] = x3.x;
+        out_sh_coeffs[b2 + 2u] = x3.y;
+        out_sh_coeffs[b2 + 3u] = x3.z;
+
+        for (uint32_t di = 3u; di < 12u; ++di) {
+            uint32_t bd = 4u * (12u * reorder_base + di * SH_REORDER_SIZE + reorder_offset);
+            out_sh_coeffs[bd + 0u] = 0.0f;
+            out_sh_coeffs[bd + 1u] = 0.0f;
+            out_sh_coeffs[bd + 2u] = 0.0f;
+            out_sh_coeffs[bd + 3u] = 0.0f;
+        }
+    } else {
+        uint32_t sh_base = 48u * i;
+        out_sh_coeffs[sh_base + 0u] = x0.x;
+        out_sh_coeffs[sh_base + 1u] = x0.y;
+        out_sh_coeffs[sh_base + 2u] = x0.z;
+        out_sh_coeffs[sh_base + 3u] = x1.x;
+        out_sh_coeffs[sh_base + 4u] = x1.y;
+        out_sh_coeffs[sh_base + 5u] = x1.z;
+        out_sh_coeffs[sh_base + 6u] = x2.x;
+        out_sh_coeffs[sh_base + 7u] = x2.y;
+        out_sh_coeffs[sh_base + 8u] = x2.z;
+        out_sh_coeffs[sh_base + 9u] = x3.x;
+        out_sh_coeffs[sh_base + 10u] = x3.y;
+        out_sh_coeffs[sh_base + 11u] = x3.z;
+        for (uint32_t k = 12u; k < 48u; ++k) {
+            out_sh_coeffs[sh_base + k] = 0.0f;
+        }
     }
 }
