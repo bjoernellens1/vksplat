@@ -316,6 +316,7 @@ class ShaderCompiler:
         tensor_bwd_configs = [(0, 8, 0), (0, 8, 8), (1, 8, 8)]
         jobs.append(("alphablend_shader.slang", [
             ShaderJob(f"rasterize_forward", {"EXPORT_MODE": forward}),
+            ShaderJob(f"rasterize_forward_depth", {"EXPORT_MODE": forward, "OUTPUT_DEPTH": 1}),
         ] + [
             ShaderJob(f"rasterize_backward_{i}", {
                 "EXPORT_MODE": backward, "BACKWARD_MODE": min(i, 2),

@@ -75,6 +75,7 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
     for (int i = 0; i < 2; ++i) {
         createComputePipeline(pipeline_compute_tile_ranges[i], spirv_paths.at("compute_tile_ranges"));
         createComputePipeline(pipeline_rasterize_forward[i], spirv_paths.at("rasterize_forward"));
+        createComputePipeline(pipeline_rasterize_forward_depth[i], spirv_paths.at("rasterize_forward_depth"));
         createComputePipeline(pipeline_rasterize_backward[0][i], spirv_paths.at("rasterize_backward_0"));
         createComputePipeline(pipeline_rasterize_backward[1][i], spirv_paths.at("rasterize_backward_1"));
         createComputePipeline(pipeline_rasterize_backward[2][i], spirv_paths.at("rasterize_backward_2"), 35840);
@@ -265,6 +266,51 @@ void VulkanGSRenderer::executeRasterizeForward(
 
     // _displayImage(buffers.pixel_state, uniforms.image_width, true);
     // exit(0);
+}
+
+void VulkanGSRenderer::executeRasterizeForwardDepth(
+    const VulkanGSRendererUniforms& uniforms,
+    VulkanGSPipelineBuffers& buffers
+) {
+    PerfTimer::Timer<PerfTimer::RasterizeForward> timer(this);
+    DEVICE_GUARD;
+
+    size_t num_pixels = uniforms.image_height * uniforms.image_width;
+
+    if (!gate_active && buffers.num_indices == 0) {
+        clearDeviceBuffer(buffers.pixel_state, 4 * num_pixels);
+        clearDeviceBuffer(buffers.n_contributors, num_pixels);
+        clearDeviceBuffer(buffers.pixel_depth, 4 * num_pixels);
+        return;
+    }
+
+    bufferMemoryBarrier({
+        { buffers.sorted_gauss_idx().deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.tile_ranges.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.rgb.deviceBuffer, COMPUTE_SHADER_WRITE },
+        { buffers.depths.deviceBuffer, COMPUTE_SHADER_WRITE },
+    }, COMPUTE_SHADER_READ);
+
+    executeCompute(
+        {{uniforms.image_width, TILE_WIDTH}, {uniforms.image_height, TILE_HEIGHT}},
+        &uniforms, sizeof(uniforms),
+        pipeline_rasterize_forward_depth[buffers.is_unsorted_1],
+        std::vector<_VulkanBuffer>({
+            // inputs
+            buffers.sorted_gauss_idx().deviceBuffer,
+            buffers.tile_ranges.deviceBuffer,
+            buffers.xy_vs.deviceBuffer,
+            buffers.inv_cov_vs_opacity.deviceBuffer,
+            buffers.rgb.deviceBuffer,
+            // outputs
+            resizeDeviceBuffer(buffers.pixel_state, 4 * num_pixels),
+            resizeDeviceBuffer(buffers.n_contributors, num_pixels),
+            // depth input & output
+            buffers.depths.deviceBuffer,
+            resizeDeviceBuffer(buffers.pixel_depth, 4 * num_pixels),
+        }),
+        GATE_RASTER_FWD
+    );
 }
 
 

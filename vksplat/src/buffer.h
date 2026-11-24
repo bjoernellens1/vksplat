@@ -105,6 +105,7 @@ struct VulkanGSPipelineBuffers {
 
     // pixels
     Buffer<float> pixel_state;  // (H, W, 4)
+    Buffer<float> pixel_depth;  // (H, W, 4): [depth_expected, depth_first_surface, acc_alpha, 0]
     Buffer<int32_t> n_contributors;  // (H, W, 1)
 
     // rasterization v_outputs

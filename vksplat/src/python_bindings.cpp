@@ -124,6 +124,7 @@ public:
             "sparse_tile_select",
             "compute_tile_ranges",
             "rasterize_forward",
+            "rasterize_forward_depth",
             "rasterize_backward_0",
             "rasterize_backward_1",
             "rasterize_backward_2",
@@ -1230,6 +1231,7 @@ public:
         trainer.copyToDevice(buffers.sh_coeffs);
         trainer.copyToDevice(buffers.rotations);
         trainer.copyToDevice(buffers.scales_opacs);
+        trainer.bumpMapGeneration();
     }
 
     void set_pixel_state(
@@ -1586,6 +1588,86 @@ public:
         forward();
     }
 
+    py::dict forward_rgbd_dict() {
+        const size_t h = uniforms.image_height;
+        const size_t w = uniforms.image_width;
+        const size_t num_pixels = h * w;
+
+        py::array_t<float> depth_expected({h, w});
+        py::array_t<float> depth_first_surface({h, w});
+        py::array_t<float> alpha({h, w});
+        py::array_t<float> rgb({h, w, static_cast<size_t>(3)});
+
+        float* d_exp_ptr = depth_expected.mutable_data();
+        float* d_first_ptr = depth_first_surface.mutable_data();
+        float* alpha_ptr = alpha.mutable_data();
+        float* rgb_ptr = rgb.mutable_data();
+
+        if (buffers.num_splats == 0 || num_pixels == 0) {
+            std::fill(d_exp_ptr, d_exp_ptr + num_pixels, 0.0f);
+            std::fill(d_first_ptr, d_first_ptr + num_pixels, 0.0f);
+            std::fill(alpha_ptr, alpha_ptr + num_pixels, 0.0f);
+            std::fill(rgb_ptr, rgb_ptr + 3 * num_pixels, 0.0f);
+        } else {
+            {
+                py::gil_scoped_release release;
+                projection_forward();
+                process_tiles();
+                trainer.executeRasterizeForwardDepth(uniforms, buffers);
+                trainer.copyFromDevice(buffers.pixel_state);
+                trainer.copyFromDevice(buffers.pixel_depth);
+            }
+            // Convert normalized-space camera Z depth into world-space camera Z units matching c2w.
+            const float inv_scale = 1.0f / trainer.get_world_to_normalized_scale();
+            const float* ps = buffers.pixel_state.data();
+            const float* pd = buffers.pixel_depth.data();
+            for (size_t i = 0; i < num_pixels; ++i) {
+                d_exp_ptr[i] = pd[4 * i + 0] * inv_scale;
+                d_first_ptr[i] = pd[4 * i + 1] * inv_scale;
+                alpha_ptr[i] = pd[4 * i + 2];
+                rgb_ptr[3 * i + 0] = ps[4 * i + 0];
+                rgb_ptr[3 * i + 1] = ps[4 * i + 1];
+                rgb_ptr[3 * i + 2] = ps[4 * i + 2];
+            }
+        }
+
+        py::dict out;
+        out["depth_expected"] = depth_expected;
+        out["depth_first_surface"] = depth_first_surface;
+        out["alpha"] = alpha;
+        out["rgb"] = rgb;
+        out["depth_eval_source"] = "native_rendered";
+        return out;
+    }
+
+    py::dict render_val_depth(size_t idx) {
+        if (idx >= trainer.num_val()) {
+            throw std::out_of_range("render_val_depth: val index out of range");
+        }
+        trainer.get_val_camera(idx, uniforms);
+        return forward_rgbd_dict();
+    }
+
+    py::dict render_pose_rgbd(
+        py::array_t<float, py::array::c_style | py::array::forcecast> c2w,
+        float fx,
+        float fy,
+        float cx,
+        float cy,
+        int width,
+        int height
+    ) {
+        auto buf = c2w.request();
+        if (buf.ndim != 2 || buf.shape[0] != 4 || buf.shape[1] != 4) {
+            throw std::invalid_argument("render_pose_rgbd: c2w must be a (4, 4) float32 array");
+        }
+        if (width <= 0 || height <= 0) {
+            throw std::invalid_argument("render_pose_rgbd: width and height must be positive");
+        }
+        trainer.pose_to_uniforms(height, width, fx, fy, cx, cy, static_cast<const float*>(buf.ptr), uniforms);
+        return forward_rgbd_dict();
+    }
+
     size_t get_vram_usage() {
         return buffers.getTotalAllocSize();
     }
@@ -1691,7 +1773,17 @@ public:
         d["active_dispatch_splats"] = active_dispatch_splats;
         d["active_fraction"] = active_fraction;
         d["gpu_active_buffer_bound"] = gpu_active_buffer_bound;
+        d["map_generation"] = trainer.get_map_generation();
+        d["active_set_generation"] = trainer.get_active_set_generation();
         return d;
+    }
+
+    uint64_t get_map_generation() const {
+        return trainer.get_map_generation();
+    }
+
+    uint64_t get_active_set_generation() const {
+        return trainer.get_active_set_generation();
     }
 
     static void extract_k_params(const py::buffer_info& b, size_t v, float out[4], const char* name) {
@@ -2186,6 +2278,13 @@ PYBIND11_MODULE(vksplat, m) {
              "Render the train camera pose to buffer.", py::call_guard<py::gil_scoped_release>())
         .def("render_val", &VkSplat::render_val,
              "Render the eval camera pose to buffer.", py::call_guard<py::gil_scoped_release>())
+        .def("render_val_depth", &VkSplat::render_val_depth,
+             "Render eval camera pose with native Vulkan expected depth, first-surface depth, alpha, and RGB.",
+             py::arg("idx"))
+        .def("render_pose_rgbd", &VkSplat::render_pose_rgbd,
+             "Render arbitrary camera pose (c2w world 4x4) with native Vulkan expected depth, first-surface depth, alpha, and RGB.",
+             py::arg("c2w"), py::arg("fx"), py::arg("fy"), py::arg("cx"), py::arg("cy"),
+             py::arg("width"), py::arg("height"))
         .def("post_backward_step", &VkSplat::post_backward_step,
              "Run this after each step for densification.", py::call_guard<py::gil_scoped_release>())
         .def("get_vram_usage", &VkSplat::get_vram_usage, "Get VRAM Usage")
@@ -2197,6 +2296,14 @@ PYBIND11_MODULE(vksplat, m) {
              "Reset Vulkan GPU stage timestamp accumulators")
         .def("compact_mode0_active_set", &VkSplat::compact_mode0_active_set,
              "Sync freeze flags and return Mode-0 frozen vs. active trainable Gaussian counts")
+        .def("get_map_generation", &VkSplat::get_map_generation,
+             "Current splat map mutation generation counter")
+        .def("get_active_set_generation", &VkSplat::get_active_set_generation,
+             "Map generation counter at which the GPU active-set index buffer was last compacted")
+        .def_property_readonly("map_generation", &VkSplat::get_map_generation,
+             "Current splat map mutation generation counter")
+        .def_property_readonly("active_set_generation", &VkSplat::get_active_set_generation,
+             "Map generation counter at which the GPU active-set index buffer was last compacted")
         .def("project_and_fit_sh_vulkan", &VkSplat::project_and_fit_sh_vulkan,
              "Native Slang/Vulkan multi-view RGB-D projection and regularized WLS degree-0/1 SH initializer",
              py::arg("means_world"), py::arg("normals_world"),
@@ -2349,6 +2456,7 @@ PYBIND11_MODULE(vksplat, m) {
         .DEF_BUFFER_ARRAY(v_rgb, float, 3)
         .def("_set_num_splats", [] (VkSplat &self, size_t n) {
             self.buffers.num_splats = n;
+            self.trainer.bumpMapGeneration();
         }, "Directly set buffers.num_splats (use at own risk)", py::arg("num_splats"))
         ;
 
