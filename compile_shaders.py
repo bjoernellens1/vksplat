@@ -341,6 +341,11 @@ class ShaderCompiler:
             ShaderJob(f"projection_forward", {"EXPORT_MODE": forward}),
         ], ["config.slang", "utils.slang", "spherical_harmonics.slang"]))
 
+        # Multi-view RGB-D projection + WLS degree-1 SH initialization
+        jobs.append(("appearance_init.slang", [
+            ShaderJob("appearance_init", {}),
+        ], ["config.slang"]))
+
         return jobs
 
     def compile_all(self, force: bool = False) -> bool:

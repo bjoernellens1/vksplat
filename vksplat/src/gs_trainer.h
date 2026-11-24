@@ -357,6 +357,37 @@ public:
     // readback; the keep list comes from the host group mirror). Returns old index -> new index (-1 = removed).
     std::vector<int32_t> compact_retracted(VulkanGSPipelineBuffers& buffers);
 
+    struct AppearanceInitResult {
+        std::vector<float> sh_coeffs;   // (N * 16 * 3)
+        std::vector<float> rgb_init;    // (N * 3)
+        std::vector<int32_t> obs_count; // (N)
+        std::vector<float> weight_sum;  // (N)
+        double wls_sh_fit_rmse = 0.0;
+        double kernel_wall_ms = 0.0;
+        double total_wall_ms = 0.0;
+    };
+
+    // Native Slang/Vulkan multi-view RGB-D projection + regularized WLS degree-0/1 SH solver.
+    AppearanceInitResult project_and_fit_sh_vulkan(
+        const float* means_world,      // (N, 3)
+        const float* normals_world,    // (N, 3) or nullptr
+        size_t n_points,
+        const uint8_t* rgb_views_u8,   // (V, H_rgb, W_rgb, rgb_channels)
+        size_t n_views,
+        int h_rgb,
+        int w_rgb,
+        int rgb_channels,
+        const float* depth_views_f32,  // (V, H_d, W_d)
+        int h_d,
+        int w_d,
+        const float* view_params_24,   // (V, 24): w2c_r0, w2c_r1, w2c_r2, cam_o, k_rgb, k_depth (6 float4s/view)
+        const float* fallback_rgb_f32, // (N, 3)
+        int sh_degree = 1,
+        float reg_lambda = 0.25f,
+        float depth_tol_m = 0.12f,
+        float min_cos_angle = 0.15f
+    );
+
 private:
     std::default_random_engine rng;
 
@@ -391,6 +422,20 @@ private:
     Buffer<uint32_t> rayguard_stats_;    // (4) GPU atomic stats [proposed, skipped_protected, applied, 0]
     std::vector<uint64_t> rayguard_uids_;
     void syncRayGuardEvidenceOnDevice(VulkanGSPipelineBuffers& buffers);
+
+    // Reusable device buffers for appearance_init.slang
+    Buffer<float> appear_means_;
+    Buffer<float> appear_normals_;
+    Buffer<float> appear_fallback_;
+    Buffer<float> appear_view_params_;
+    Buffer<uint8_t> appear_rgb_u8_;
+    Buffer<float> appear_depth_f32_;
+    Buffer<float> appear_out_sh_;
+    Buffer<float> appear_out_rgb_;
+    Buffer<int32_t> appear_out_obs_;
+    Buffer<float> appear_out_wsum_;
+    Buffer<float> appear_out_se_;
+    _ComputePipeline pipeline_appearance_init = _ComputePipeline(11);
     size_t mcmc_relocated_count = 0;
     size_t mcmc_added_count = 0;
     std::atomic<size_t> runtime_growth_cap{std::numeric_limits<size_t>::max()};

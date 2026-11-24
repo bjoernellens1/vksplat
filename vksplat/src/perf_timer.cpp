@@ -35,6 +35,19 @@ void reset() {
     work_counters = {};
 }
 
+void reset_stage_timers() {
+    for (int i = 0; i < int(TrainStage::END); i++) {
+        stages[i] = {0, 0.0};
+    }
+    marks.clear();
+}
+
+double get_stage_total_time_s(TrainStage stage) {
+    if (int(stage) < 0 || int(stage) >= int(TrainStage::END))
+        return 0.0;
+    return stages[int(stage)].total_time;
+}
+
 void hostTic() {
     if (hostHold)
         _THROW_ERROR("hostTic");
