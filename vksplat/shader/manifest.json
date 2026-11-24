@@ -109,14 +109,14 @@
         "fused_projection_backward_optimizer.slang": {
             "sources": {
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
-                "slang/fused_projection_backward_optimizer.slang": "722d6af48575e98362b3b082813615da104de295fb74d0f3fd14271c59c36247",
+                "slang/fused_projection_backward_optimizer.slang": "3dd8acdabed3f994769d8685e270221efe161250d13f377c50a1fb2995953f4d",
                 "slang/spherical_harmonics.slang": "dfab0c9d0414cf5a0ade15152a034997a9fb0d78ef41c14b9bb0d1a2db7b7fcc",
                 "slang/strategy_utils.slang": "183c5a30f7c2ac19a1bb8738acb79a23a3bb5a79cdbce42ff90e75d0eb183ed9",
                 "slang/utils.slang": "cfd2d3969b43ebb5f4fdd463d1698369218a3c671fe9161c9faebfa76846531e",
                 "slang/vertex_shader.slang": "6c76579bef6b2ffa402ecd41ffd70d878142a56e4a63ad10fcbb2a2e43242462"
             },
             "outputs": {
-                "shader/generated/fused_projection_backward_optimizer.spv": "214a21167446e2bba4669a4f2321430291818868013dc7414c6858b3dcff4f60"
+                "shader/generated/fused_projection_backward_optimizer.spv": "9e09527022521624dcac3a4bb5d08322a71c962437206dac5810b5e026cc185d"
             }
         },
         "ssim.slang": {

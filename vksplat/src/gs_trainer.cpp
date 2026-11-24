@@ -46,6 +46,8 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     float normal_scale_cap;
     uint32_t active_splat_count;
     uint32_t use_active_index_dispatch;
+    uint32_t ago_telemetry_enabled;
+    uint32_t _ago_pad;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -128,6 +130,11 @@ void VulkanGSTrainer::cleanup() {
     use_active_index_dispatch_ = false;
     map_generation_ = 1u;
     active_set_generation_ = 0u;
+    destroyBuffer(ago_telemetry_buf_.deviceBuffer);
+    ago_telemetry_buf_.clear();
+    ago_telemetry_buf_.shrink_to_fit();
+    ago_telemetry_enabled_ = false;
+    ago_last_step_ = 0;
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -1048,6 +1055,8 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     const bool sparse_grad = sparse && ds == 1;
     shader_uniforms[5].u = sparse_grad ? 1u : 0u;
 
+    DEVICE_GUARD;
+
     auto& train_image = dataset_train[train_idx].buffer;
     if (train_image.deviceBuffer.buffer == VK_NULL_HANDLE) {
         PerfTimer::Timer<PerfTimer::CopyTrainImageToDevice> timer(this);
@@ -1063,8 +1072,6 @@ void VulkanGSTrainer::executeComputeSSIMGradient(
     }, COMPUTE_SHADER_READ);
 
     PerfTimer::Timer<PerfTimer::ComputeSSIMGradient> timer(this);
-
-    DEVICE_GUARD;
 
     if (sparse)
         executeSelectSparseTiles(uniforms, buffers, config.sparse_tile_quantile, config.sparse_tile_halo);
@@ -1120,6 +1127,60 @@ void VulkanGSTrainer::set_active_indices_gpu(const std::vector<uint32_t>& active
     }
 }
 
+std::vector<uint32_t> VulkanGSTrainer::get_active_indices_host() {
+    HOST_GUARD;
+    if (!use_active_index_dispatch_ || active_splat_count_ == 0u ||
+        active_set_generation_ != map_generation_ ||
+        active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        return {};
+    }
+    std::vector<uint32_t> out(active_splat_count_);
+    downloadDeviceSlice(active_indices_buf_.deviceBuffer, 0, out.data(),
+                        static_cast<size_t>(active_splat_count_) * sizeof(uint32_t));
+    return out;
+}
+
+void VulkanGSTrainer::set_ago_telemetry_enabled(bool enabled, size_t num_splats) {
+    ago_telemetry_enabled_ = enabled;
+    if (enabled && num_splats > 0) {
+        DEVICE_GUARD;
+        resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * num_splats, true);
+    }
+}
+
+void VulkanGSTrainer::reset_ago_telemetry(size_t num_splats) {
+    DEVICE_GUARD;
+    const size_t target_floats = 8 * std::max<size_t>(1, num_splats);
+    clearDeviceBuffer(ago_telemetry_buf_, target_floats);
+}
+
+std::vector<float> VulkanGSTrainer::get_ago_telemetry_host(size_t num_splats) {
+    HOST_GUARD;
+    const size_t needed = 8 * num_splats;
+    std::vector<float> out(needed, 0.0f);
+    if (needed == 0 || ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE) {
+        return out;
+    }
+    const size_t avail = std::min(needed, ago_telemetry_buf_.deviceSize());
+    if (avail > 0) {
+        downloadDeviceSlice(ago_telemetry_buf_.deviceBuffer, 0, out.data(), avail * sizeof(float));
+    }
+    return out;
+}
+
+void VulkanGSTrainer::set_ago_telemetry_host(const float* data, size_t n_floats) {
+    if (data == nullptr || n_floats == 0) {
+        if (ago_telemetry_buf_.deviceBuffer.buffer != VK_NULL_HANDLE && ago_telemetry_buf_.deviceSize() > 0) {
+            DEVICE_GUARD;
+            clearDeviceBuffer(ago_telemetry_buf_, ago_telemetry_buf_.deviceSize());
+        }
+        return;
+    }
+    HOST_GUARD;
+    resizeDeviceBuffer(ago_telemetry_buf_, n_floats);
+    uploadDeviceSlice(ago_telemetry_buf_.deviceBuffer, 0, data, n_floats * sizeof(float));
+}
+
 void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     const TrainerConfig &config,
     const VulkanGSRendererUniforms& uniforms,
@@ -1132,8 +1193,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
         return;
     }
 
-    PerfTimer::Timer<PerfTimer::FusedProjectionBackwardOptimizerStep> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::FusedProjectionBackwardOptimizerStep> timer(this);
 
     const bool use_active_dispatch =
         dispatch_active && active_splat_count_ > 0u && active_splat_count_ < num_splats;
@@ -1208,6 +1269,9 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.normal_scale_cap = config.surfel_normal_cap_m * scene_scale;
     shaderUniforms.active_splat_count = use_active_dispatch ? active_splat_count_ : static_cast<uint32_t>(num_splats);
     shaderUniforms.use_active_index_dispatch = use_active_dispatch ? 1u : 0u;
+    shaderUniforms.ago_telemetry_enabled = ago_telemetry_enabled_ ? 1u : 0u;
+    shaderUniforms._ago_pad = 0u;
+    ago_last_step_ = step;
     if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() == 0) {
         resizeDeviceBuffer(active_indices_buf_, 1);
     }
@@ -1216,6 +1280,11 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     size_t alloc_size = num_splats;
     if (config.strategy == TrainerConfig::Strategy::MCMC)
         alloc_size = std::max(alloc_size, config.mcmc_alloc_cap());
+    if (ago_telemetry_enabled_) {
+        resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * alloc_size, true);
+    } else if (ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_telemetry_buf_.deviceSize() == 0) {
+        resizeDeviceBuffer(ago_telemetry_buf_, 8);
+    }
     executeCompute(
         {{dispatch_count, SUBGROUP_SIZE}},
         &shaderUniforms, sizeof(shaderUniforms),
@@ -1239,6 +1308,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             buffers.splat_state.deviceBuffer,
             buffers.splat_anchor.deviceBuffer,
             active_indices_buf_.deviceBuffer,
+            ago_telemetry_buf_.deviceBuffer,
         },
         GATE_OPTIMIZER
     );
@@ -1288,8 +1358,8 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     VulkanGSPipelineBuffers& buffers,
     int step
 ) {
-    PerfTimer::Timer<PerfTimer::DefaultPostBackward> timer(this);
     DEVICE_GUARD;
+    PerfTimer::Timer<PerfTimer::DefaultPostBackward> timer(this);
 
     size_t num_splats = buffers.num_splats;
     if (num_splats == 0)
