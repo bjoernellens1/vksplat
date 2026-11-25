@@ -495,11 +495,14 @@ def test_gpu_ago_l0_freeze_reopen_retract_prune(tmp_path):
     assert not np.array_equal(xyz_reopened[:half], xyz_before[:half]), "Reopened group 0 did not update!"
 
     # 3. RETRACT group 0 -> opacities masked to 0 on GPU and render changes
-    img_before = np.array(vk.render_train(0), copy=True)
+    rgbd_before = vk.render_val_depth(0)
+    img_before = np.array(rgbd_before["rgb"], copy=True)
+    assert img_before.ndim >= 2 and img_before.size > 0
     assert vk.ago_execute_external_op(vksplat.AgoOperationType.RETRACT, 0) == vksplat.AgoCompletionStatus.OK
     opacs_after_retract = np.array(vk.opacities, copy=True)
     assert float(np.max(opacs_after_retract[:half])) == 0.0, "Retracted group 0 opacities must be 0 on GPU!"
-    img_after = np.array(vk.render_train(0), copy=True)
+    rgbd_after = vk.render_val_depth(0)
+    img_after = np.array(rgbd_after["rgb"], copy=True)
     assert not np.array_equal(img_before, img_after), "Retracted splats did not disappear from GPU render!"
 
     # 4. PRUNE group 0 -> slots compacted and freed
