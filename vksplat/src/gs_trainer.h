@@ -284,7 +284,39 @@ public:
         float newborn_warmup_steps = 2.0f,
         bool exclude_frozen = true
     );
+    AgoActiveSetSummary select_ago_exact_k_gpu(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float target_fraction = 0.5f,
+        float newborn_warmup_steps = 10.0f,
+        bool exclude_frozen = true
+    );
     AgoActiveSetSummary get_ago_step_gain_summary(size_t current_num_gaussians) const;
+
+    // GPU Temporal Depth Reprojection (atomic uint32 z-buffer + view-angle cosine weight + support count)
+    struct TemporalDepthReprojectResult {
+        std::vector<float> depth;      // (dst_h * dst_w)
+        std::vector<float> weight;     // (dst_h * dst_w)
+        std::vector<uint32_t> support; // (dst_h * dst_w)
+        double kernel_ms = 0.0;
+        double total_ms = 0.0;
+    };
+    TemporalDepthReprojectResult reproject_temporal_depth_gpu(
+        const float* src_depths,       // (num_views * src_h * src_w)
+        size_t num_views,
+        int src_h,
+        int src_w,
+        const float* view_params_16,   // (num_views * 16): T_s2d rows 0..2 + (inv_fx_s, inv_fy_s, cx_s, cy_s)
+        int dst_h,
+        int dst_w,
+        float dst_fx,
+        float dst_fy,
+        float dst_cx,
+        float dst_cy,
+        float max_depth_m = 10.0f,
+        float min_depth_m = 0.05f,
+        float min_cos_angle = 0.0f
+    );
 
     // D1 opt-in native differentiable physical expected-depth supervision
     void set_train_depth(size_t frame_idx, const float* depth_m, const float* weight_map, int h, int w);
@@ -581,11 +613,23 @@ private:
     Buffer<float> ago_telemetry_buf_;
     int ago_last_step_ = 0;
 
-    // AGO-2 GPU-resident active-set compaction & 16-byte summary buffer
+    // AGO-2 GPU-resident active-set compaction, 256-bin log-gain histogram, & summary buffers
     Buffer<uint32_t> ago_select_summary_buf_;
+    Buffer<uint32_t> ago_hist_buf_;
     _ComputePipeline pipeline_ago_select_active_set = _ComputePipeline(6);
+    _ComputePipeline pipeline_ago_gain_histogram = _ComputePipeline(5);
     AgoActiveSetSummary last_ago_summary_{};
     float ago_prev_mean_gain_ = 0.0f;
+
+    // Reusable device buffers & pipelines for temporal_depth_reproject.slang
+    Buffer<float> treproj_src_depths_;
+    Buffer<float> treproj_view_params_;
+    Buffer<uint32_t> treproj_dst_zbuf_;
+    Buffer<float> treproj_dst_weight_;
+    Buffer<uint32_t> treproj_dst_support_;
+    Buffer<float> treproj_dst_depth_;
+    _ComputePipeline pipeline_temporal_depth_scatter = _ComputePipeline(5);
+    _ComputePipeline pipeline_temporal_depth_finalize = _ComputePipeline(3);
 
     // D1 opt-in differentiable physical expected-depth loss (strictly opt-in; 0.0 = disabled)
     float depth_loss_weight_ = 0.0f;

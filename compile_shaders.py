@@ -347,9 +347,16 @@ class ShaderCompiler:
             ShaderJob("appearance_init", {}),
         ], ["config.slang"]))
 
-        # GPU-resident AGO-2 active-set compaction & step-gain summary
+        # GPU-resident AGO-2 active-set compaction, 256-bin log-gain histogram, & step-gain summary
         jobs.append(("ago_select_active_set.slang", [
-            ShaderJob("ago_select_active_set", {}),
+            ShaderJob("ago_select_active_set", {"ENTRY": 0}),
+            ShaderJob("ago_gain_histogram", {"ENTRY": 1}),
+        ], ["config.slang"]))
+
+        # GPU temporal depth reprojection (atomic uint32 z-buffer + cosine weight + support count)
+        jobs.append(("temporal_depth_reproject.slang", [
+            ShaderJob("temporal_depth_reproject_scatter", {"ENTRY": 0}),
+            ShaderJob("temporal_depth_reproject_finalize", {"ENTRY": 1}),
         ], ["config.slang"]))
 
         return jobs

@@ -144,8 +144,17 @@ void VulkanGSTrainer::cleanup() {
     destroyBuffer(ago_select_summary_buf_.deviceBuffer);
     ago_select_summary_buf_.clear();
     ago_select_summary_buf_.shrink_to_fit();
+    destroyBuffer(ago_hist_buf_.deviceBuffer);
+    ago_hist_buf_.clear();
+    ago_hist_buf_.shrink_to_fit();
     last_ago_summary_ = {};
     ago_prev_mean_gain_ = 0.0f;
+    destroyBuffer(treproj_src_depths_.deviceBuffer);
+    destroyBuffer(treproj_view_params_.deviceBuffer);
+    destroyBuffer(treproj_dst_zbuf_.deviceBuffer);
+    destroyBuffer(treproj_dst_weight_.deviceBuffer);
+    destroyBuffer(treproj_dst_support_.deviceBuffer);
+    destroyBuffer(treproj_dst_depth_.deviceBuffer);
     destroyBuffer(anchored_xyz_ws.deviceBuffer);
     anchored_xyz_ws.clear();
     anchored_xyz_ws.shrink_to_fit();
@@ -214,6 +223,9 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_morton_sort.update_buffer_sh, spirv_paths.at("morton_sort_update_buffer_sh"));
     createComputePipeline(pipeline_appearance_init, spirv_paths.at("appearance_init"));
     createComputePipeline(pipeline_ago_select_active_set, spirv_paths.at("ago_select_active_set"));
+    createComputePipeline(pipeline_ago_gain_histogram, spirv_paths.at("ago_gain_histogram"));
+    createComputePipeline(pipeline_temporal_depth_scatter, spirv_paths.at("temporal_depth_reproject_scatter"));
+    createComputePipeline(pipeline_temporal_depth_finalize, spirv_paths.at("temporal_depth_reproject_finalize"));
 
     rng.seed(42);
 }
@@ -1229,8 +1241,8 @@ VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_active_set_gpu(
     if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() < n) {
         resizeDeviceBuffer(active_indices_buf_, n);
     }
-    if (ago_select_summary_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_select_summary_buf_.deviceSize() < 4) {
-        resizeDeviceBuffer(ago_select_summary_buf_, 4);
+    if (ago_select_summary_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_select_summary_buf_.deviceSize() < 5) {
+        resizeDeviceBuffer(ago_select_summary_buf_, 5);
     }
 
     uint32_t raw_summary[4] = {0u, 0u, 0u, 0u};
@@ -1243,19 +1255,21 @@ VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_active_set_gpu(
                 command_buffer,
                 ago_select_summary_buf_.deviceBuffer.buffer,
                 0,
-                sizeof(raw_summary),
+                5 * sizeof(uint32_t),
                 0u
             );
 
-            Uniform32_t u[8];
+            Uniform32_t u[10];
             u[0].u = static_cast<uint32_t>(n);
             u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
             u[2].u = config.mcmc_protect_structural_groups ? 1u : 0u;
             u[3].u = exclude_frozen ? 1u : 0u;
             u[4].f = gain_threshold;
             u[5].f = newborn_warmup_steps;
-            u[6].u = 0u;
+            u[6].u = 0u;  // mode 0: legacy threshold
             u[7].u = 0u;
+            u[8].u = 0u;
+            u[9].u = 0u;
 
             bufferMemoryBarrier({
                 { ago_select_summary_buf_.deviceBuffer, TRANSFER_WRITE },
@@ -1361,6 +1375,436 @@ VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_adaptive_active
     const float ratio = std::isfinite(target_gain_ratio) ? std::max(0.0f, target_gain_ratio) : 0.0f;
     const float thr = std::max(0.0f, ago_prev_mean_gain_ * ratio);
     return select_ago_active_set_gpu(config, buffers, thr, newborn_warmup_steps, exclude_frozen);
+}
+
+VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_exact_k_gpu(
+    const TrainerConfig& config,
+    VulkanGSPipelineBuffers& buffers,
+    float target_fraction,
+    float newborn_warmup_steps,
+    bool exclude_frozen
+) {
+    const size_t n = buffers.num_splats;
+    const float frac = std::isfinite(target_fraction) ? std::clamp(target_fraction, 0.0f, 1.0f) : 0.0f;
+    AgoActiveSetSummary summary{};
+    summary.num_gaussians = static_cast<uint32_t>(n);
+    if (n == 0) {
+        invalidateActiveIndexDispatch();
+        active_set_generation_ = map_generation_;
+        summary.active_fraction = 0.0f;
+        last_ago_summary_ = summary;
+        ago_prev_mean_gain_ = 0.0f;
+        return summary;
+    }
+
+    ensureGroupBuffersOnDevice(buffers, n);
+    if (ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_telemetry_buf_.deviceSize() < 8 * n) {
+        DEVICE_GUARD;
+        resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * n, true);
+    }
+    if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() < n) {
+        resizeDeviceBuffer(active_indices_buf_, n);
+    }
+    if (ago_select_summary_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_select_summary_buf_.deviceSize() < 5) {
+        resizeDeviceBuffer(ago_select_summary_buf_, 5);
+    }
+    static constexpr size_t kHistWords = 4u + 512u;  // 16-byte header + 256 mature + 256 newborn bins (2064 B)
+    if (ago_hist_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_hist_buf_.deviceSize() < kHistWords) {
+        resizeDeviceBuffer(ago_hist_buf_, kHistWords);
+    }
+
+    Uniform32_t u[10];
+    u[0].u = static_cast<uint32_t>(n);
+    u[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+    u[2].u = config.mcmc_protect_structural_groups ? 1u : 0u;
+    u[3].u = exclude_frozen ? 1u : 0u;
+    u[4].f = 0.0f;
+    u[5].f = newborn_warmup_steps;
+    u[6].u = 0u;
+    u[7].u = 0u;
+    u[8].u = 0u;
+    u[9].u = 0u;
+
+    // Pass 1: 256-bin log-gain histogram (mature + newborn) + 16-byte summary (2064 B readback)
+    uint32_t raw_hist[kHistWords] = {};
+    allocStagingBuffer(sizeof(raw_hist));
+    {
+        std::lock_guard<std::mutex> lock(stager.mutex);
+        {
+            DEVICE_GUARD;
+            vkCmdFillBuffer(
+                command_buffer,
+                ago_hist_buf_.deviceBuffer.buffer,
+                0,
+                sizeof(raw_hist),
+                0u
+            );
+
+            bufferMemoryBarrier({
+                { ago_hist_buf_.deviceBuffer, TRANSFER_WRITE },
+                { ago_telemetry_buf_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+                { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+
+            executeCompute(
+                {{n, 256}},
+                &u, sizeof(u),
+                pipeline_ago_gain_histogram,
+                {
+                    ago_telemetry_buf_.deviceBuffer,
+                    buffers.splat_state.deviceBuffer,
+                    buffers.group_ids.deviceBuffer,
+                    buffers.group_state.deviceBuffer,
+                    ago_hist_buf_.deviceBuffer,
+                }
+            );
+
+            bufferMemoryBarrier({
+                { ago_hist_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+
+            VkBufferCopy copy_region{};
+            copy_region.srcOffset = 0;
+            copy_region.dstOffset = 0;
+            copy_region.size = sizeof(raw_hist);
+            vkCmdCopyBuffer(
+                command_buffer,
+                ago_hist_buf_.deviceBuffer.buffer,
+                stager.buffer,
+                1,
+                &copy_region
+            );
+        }
+        HOST_GUARD;
+        void* mapped = nullptr;
+        vkMapMemory(device, stager.memory, 0, sizeof(raw_hist), 0, &mapped);
+        memcpy(raw_hist, mapped, sizeof(raw_hist));
+        vkUnmapMemory(device, stager.memory);
+    }
+
+    const uint32_t eligible_cnt = std::min<uint32_t>(raw_hist[0], static_cast<uint32_t>(n));
+    float total_gain = 0.0f;
+    float max_gain = 0.0f;
+    memcpy(&total_gain, &raw_hist[1], sizeof(float));
+    const uint32_t newborn_cnt = std::min<uint32_t>(raw_hist[2], eligible_cnt);
+    memcpy(&max_gain, &raw_hist[3], sizeof(float));
+    if (!std::isfinite(total_gain) || total_gain < 0.0f)
+        total_gain = 0.0f;
+    if (!std::isfinite(max_gain) || max_gain < 0.0f)
+        max_gain = 0.0f;
+
+    const float mean_gain = (eligible_cnt > 0u)
+        ? (total_gain / static_cast<float>(eligible_cnt))
+        : 0.0f;
+
+    uint32_t target_k = 0u;
+    if (eligible_cnt > 0u && frac > 0.0f) {
+        if (frac >= 1.0f) {
+            target_k = eligible_cnt;
+        } else {
+            const long rounded = std::lround(static_cast<double>(frac) * static_cast<double>(eligible_cnt));
+            target_k = static_cast<uint32_t>(std::clamp<long>(rounded, 1L, static_cast<long>(eligible_cnt)));
+        }
+    }
+
+    summary.eligible_count = eligible_cnt;
+    summary.total_predicted_gain = total_gain;
+    summary.mean_predicted_gain = mean_gain;
+    summary.max_predicted_gain = max_gain;
+    active_set_generation_ = map_generation_;
+
+    if (target_k == 0u) {
+        active_splat_count_ = 0u;
+        use_active_index_dispatch_ = false;
+        summary.active_count = 0u;
+        summary.active_fraction = 0.0f;
+        summary.gain_threshold = max_gain;
+        summary.fell_back_to_full = true;
+        last_ago_summary_ = summary;
+        ago_prev_mean_gain_ = mean_gain;
+        return summary;
+    }
+
+    if (target_k >= static_cast<uint32_t>(n)) {
+        active_splat_count_ = static_cast<uint32_t>(n);
+        use_active_index_dispatch_ = false;
+        summary.active_count = static_cast<uint32_t>(n);
+        summary.active_fraction = 1.0f;
+        summary.gain_threshold = 0.0f;
+        summary.fell_back_to_full = false;
+        last_ago_summary_ = summary;
+        ago_prev_mean_gain_ = mean_gain;
+        return summary;
+    }
+
+    // Solve exact quantile cut (mode, cutoff_bin, boundary_quota) from the 512-bin histogram
+    auto bin_to_threshold = [](uint32_t b) -> float {
+        if (b == 0u) return 0.0f;
+        const float log2_val = -30.0f + (static_cast<float>(b - 1u) / 254.0f) * 40.0f;
+        return std::exp2(log2_val);
+    };
+
+    uint32_t mode = 1u;
+    uint32_t cutoff_bin = 0u;
+    uint32_t boundary_quota = 0u;
+    float gain_thr = 0.0f;
+
+    if (newborn_cnt <= target_k) {
+        mode = 1u;
+        const uint32_t k_mature = target_k - newborn_cnt;
+        if (k_mature == 0u) {
+            cutoff_bin = 256u;
+            boundary_quota = 0u;
+            gain_thr = max_gain;
+        } else {
+            const uint32_t* mature_hist = &raw_hist[4];
+            uint32_t cum = 0u;
+            for (int b = 255; b >= 0; --b) {
+                const uint32_t c = mature_hist[b];
+                if (cum + c >= k_mature) {
+                    cutoff_bin = static_cast<uint32_t>(b);
+                    boundary_quota = k_mature - cum;
+                    break;
+                }
+                cum += c;
+            }
+            gain_thr = bin_to_threshold(cutoff_bin);
+        }
+    } else {
+        mode = 2u;
+        const uint32_t* nb_hist = &raw_hist[4 + 256];
+        uint32_t cum = 0u;
+        for (int b = 255; b >= 0; --b) {
+            const uint32_t c = nb_hist[b];
+            if (cum + c >= target_k) {
+                cutoff_bin = static_cast<uint32_t>(b);
+                boundary_quota = target_k - cum;
+                break;
+            }
+            cum += c;
+        }
+        gain_thr = bin_to_threshold(cutoff_bin);
+    }
+
+    // Pass 2: Asynchronous GPU compaction of exact K indices (no second host readback)
+    u[4].f = gain_thr;
+    u[6].u = mode;
+    u[7].u = cutoff_bin;
+    u[8].u = boundary_quota;
+    u[9].u = 0u;
+
+    {
+        DEVICE_GUARD;
+        vkCmdFillBuffer(
+            command_buffer,
+            ago_select_summary_buf_.deviceBuffer.buffer,
+            0,
+            5 * sizeof(uint32_t),
+            0u
+        );
+
+        bufferMemoryBarrier({
+            { ago_select_summary_buf_.deviceBuffer, TRANSFER_WRITE },
+            { active_indices_buf_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+
+        executeCompute(
+            {{n, 256}},
+            &u, sizeof(u),
+            pipeline_ago_select_active_set,
+            {
+                ago_telemetry_buf_.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                active_indices_buf_.deviceBuffer,
+                ago_select_summary_buf_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { active_indices_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { ago_select_summary_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+    }
+
+    active_splat_count_ = target_k;
+    use_active_index_dispatch_ = true;
+    summary.active_count = target_k;
+    summary.active_fraction = static_cast<float>(target_k) / static_cast<float>(n);
+    summary.gain_threshold = gain_thr;
+    summary.fell_back_to_full = false;
+
+    last_ago_summary_ = summary;
+    ago_prev_mean_gain_ = mean_gain;
+    return summary;
+}
+
+VulkanGSTrainer::TemporalDepthReprojectResult VulkanGSTrainer::reproject_temporal_depth_gpu(
+    const float* src_depths,
+    size_t num_views,
+    int src_h,
+    int src_w,
+    const float* view_params_16,
+    int dst_h,
+    int dst_w,
+    float dst_fx,
+    float dst_fy,
+    float dst_cx,
+    float dst_cy,
+    float max_depth_m,
+    float min_depth_m,
+    float min_cos_angle
+) {
+    if (src_h <= 0 || src_w <= 0 || dst_h <= 0 || dst_w <= 0) {
+        throw std::invalid_argument("reproject_temporal_depth_gpu: image dimensions must be positive");
+    }
+    if (!std::isfinite(max_depth_m) || max_depth_m <= 0.0f) {
+        throw std::invalid_argument("reproject_temporal_depth_gpu: max_depth_m must be finite and > 0");
+    }
+    if (!std::isfinite(min_depth_m) || min_depth_m < 0.0f || min_depth_m >= max_depth_m) {
+        throw std::invalid_argument("reproject_temporal_depth_gpu: min_depth_m must be in [0, max_depth_m)");
+    }
+
+    const auto t_total_0 = std::chrono::steady_clock::now();
+    const size_t n_dst = static_cast<size_t>(dst_h) * static_cast<size_t>(dst_w);
+    TemporalDepthReprojectResult res;
+    res.depth.assign(n_dst, 0.0f);
+    res.weight.assign(n_dst, 0.0f);
+    res.support.assign(n_dst, 0u);
+    if (num_views == 0) {
+        res.total_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_total_0
+        ).count();
+        return res;
+    }
+
+    const size_t total_src = num_views * static_cast<size_t>(src_h) * static_cast<size_t>(src_w);
+    resizeDeviceBuffer(treproj_src_depths_, total_src);
+    resizeDeviceBuffer(treproj_view_params_, 16 * num_views);
+    resizeDeviceBuffer(treproj_dst_zbuf_, n_dst);
+    resizeDeviceBuffer(treproj_dst_weight_, n_dst);
+    resizeDeviceBuffer(treproj_dst_support_, n_dst);
+    resizeDeviceBuffer(treproj_dst_depth_, n_dst);
+
+    uploadDeviceSlice(treproj_src_depths_.deviceBuffer, 0, src_depths, total_src * sizeof(float));
+    uploadDeviceSlice(treproj_view_params_.deviceBuffer, 0, view_params_16, 16 * num_views * sizeof(float));
+
+    const size_t depth_bytes = n_dst * sizeof(float);
+    const size_t weight_bytes = n_dst * sizeof(float);
+    const size_t support_bytes = n_dst * sizeof(uint32_t);
+    const size_t total_out_bytes = depth_bytes + weight_bytes + support_bytes;
+
+    allocStagingBuffer(total_out_bytes);
+    const auto t_kern_0 = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(stager.mutex);
+        {
+            DEVICE_GUARD;
+            vkCmdFillBuffer(command_buffer, treproj_dst_zbuf_.deviceBuffer.buffer, 0, n_dst * sizeof(uint32_t), 0x7F800000u);
+            vkCmdFillBuffer(command_buffer, treproj_dst_weight_.deviceBuffer.buffer, 0, weight_bytes, 0u);
+            vkCmdFillBuffer(command_buffer, treproj_dst_support_.deviceBuffer.buffer, 0, support_bytes, 0u);
+
+            bufferMemoryBarrier({
+                { treproj_src_depths_.deviceBuffer, TRANSFER_WRITE },
+                { treproj_view_params_.deviceBuffer, TRANSFER_WRITE },
+                { treproj_dst_zbuf_.deviceBuffer, TRANSFER_WRITE },
+                { treproj_dst_weight_.deviceBuffer, TRANSFER_WRITE },
+                { treproj_dst_support_.deviceBuffer, TRANSFER_WRITE },
+            }, COMPUTE_SHADER_READ_WRITE);
+
+            Uniform32_t u_scatter[12];
+            u_scatter[0].u = static_cast<uint32_t>(num_views);
+            u_scatter[1].u = static_cast<uint32_t>(src_h);
+            u_scatter[2].u = static_cast<uint32_t>(src_w);
+            u_scatter[3].u = static_cast<uint32_t>(dst_h);
+            u_scatter[4].u = static_cast<uint32_t>(dst_w);
+            u_scatter[5].f = dst_fx;
+            u_scatter[6].f = dst_fy;
+            u_scatter[7].f = dst_cx;
+            u_scatter[8].f = dst_cy;
+            u_scatter[9].f = min_depth_m;
+            u_scatter[10].f = max_depth_m;
+            u_scatter[11].f = min_cos_angle;
+
+            executeCompute(
+                {{total_src, 256}},
+                &u_scatter, sizeof(u_scatter),
+                pipeline_temporal_depth_scatter,
+                {
+                    treproj_src_depths_.deviceBuffer,
+                    treproj_view_params_.deviceBuffer,
+                    treproj_dst_zbuf_.deviceBuffer,
+                    treproj_dst_weight_.deviceBuffer,
+                    treproj_dst_support_.deviceBuffer,
+                }
+            );
+
+            bufferMemoryBarrier({
+                { treproj_dst_zbuf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { treproj_dst_support_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, COMPUTE_SHADER_READ);
+
+            Uniform32_t u_fin[4];
+            u_fin[0].u = static_cast<uint32_t>(n_dst);
+            u_fin[1].u = 0u;
+            u_fin[2].u = 0u;
+            u_fin[3].u = 0u;
+
+            executeCompute(
+                {{n_dst, 256}},
+                &u_fin, sizeof(u_fin),
+                pipeline_temporal_depth_finalize,
+                {
+                    treproj_dst_zbuf_.deviceBuffer,
+                    treproj_dst_support_.deviceBuffer,
+                    treproj_dst_depth_.deviceBuffer,
+                }
+            );
+
+            bufferMemoryBarrier({
+                { treproj_dst_depth_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { treproj_dst_weight_.deviceBuffer, COMPUTE_SHADER_WRITE },
+                { treproj_dst_support_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+
+            VkBufferCopy c0{};
+            c0.srcOffset = 0;
+            c0.dstOffset = 0;
+            c0.size = depth_bytes;
+            vkCmdCopyBuffer(command_buffer, treproj_dst_depth_.deviceBuffer.buffer, stager.buffer, 1, &c0);
+
+            VkBufferCopy c1{};
+            c1.srcOffset = 0;
+            c1.dstOffset = depth_bytes;
+            c1.size = weight_bytes;
+            vkCmdCopyBuffer(command_buffer, treproj_dst_weight_.deviceBuffer.buffer, stager.buffer, 1, &c1);
+
+            VkBufferCopy c2{};
+            c2.srcOffset = 0;
+            c2.dstOffset = depth_bytes + weight_bytes;
+            c2.size = support_bytes;
+            vkCmdCopyBuffer(command_buffer, treproj_dst_support_.deviceBuffer.buffer, stager.buffer, 1, &c2);
+        }
+        HOST_GUARD;
+        const auto t_kern_1 = std::chrono::steady_clock::now();
+        res.kernel_ms = std::chrono::duration<double, std::milli>(t_kern_1 - t_kern_0).count();
+
+        void* mapped = nullptr;
+        vkMapMemory(device, stager.memory, 0, total_out_bytes, 0, &mapped);
+        const uint8_t* base = static_cast<const uint8_t*>(mapped);
+        memcpy(res.depth.data(), base, depth_bytes);
+        memcpy(res.weight.data(), base + depth_bytes, weight_bytes);
+        memcpy(res.support.data(), base + depth_bytes + weight_bytes, support_bytes);
+        vkUnmapMemory(device, stager.memory);
+    }
+
+    res.total_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_total_0
+    ).count();
+    return res;
 }
 
 VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::get_ago_step_gain_summary(size_t current_num_gaussians) const {
