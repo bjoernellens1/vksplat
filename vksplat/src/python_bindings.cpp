@@ -320,6 +320,8 @@ public:
         trainer.setBackwardPinAfter((size_t)std::max(config.rasterize_backward_pin_after, 0));
         config.external_strategy_mode = train_config.contains(py::str("external_strategy_mode"))
             ? train_config["external_strategy_mode"].cast<bool>() : false;
+        config.ago_param_mask = train_config.contains(py::str("ago_param_mask"))
+            ? train_config["ago_param_mask"].cast<uint32_t>() : TrainerConfig::AGO_PARAM_ALL;
 
         // load dataset
         trainer.load_colmap_dataset(config, buffers);
@@ -1239,6 +1241,14 @@ public:
         return config.external_strategy_mode;
     }
 
+    void set_ago_param_mask(uint32_t mask) {
+        config.ago_param_mask = mask;
+    }
+
+    uint32_t get_ago_param_mask() const {
+        return config.ago_param_mask;
+    }
+
     vksplat::ago::CompletionStatus ago_execute_external_op(
         vksplat::ago::OperationType op,
         int32_t group_id = -1
@@ -1246,8 +1256,50 @@ public:
         return trainer.ago_execute_external_op(config, buffers, op, group_id);
     }
 
-    void ago_scheduler_init(const vksplat::ago::SchedulerConfig& cfg = {}) {
-        ago_scheduler_ = std::make_unique<vksplat::ago::AgoScheduler>(cfg, nullptr);
+    uint64_t ago_offload_snapshot_to_ram() {
+        return trainer.ago_offload_snapshot_to_ram(buffers);
+    }
+
+    bool ago_restore_snapshot_from_ram(uint64_t snapshot_id) {
+        return trainer.ago_restore_snapshot_from_ram(buffers, snapshot_id);
+    }
+
+    bool ago_drop_ram_snapshot(uint64_t snapshot_id) {
+        return trainer.ago_drop_ram_snapshot(snapshot_id);
+    }
+
+    size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const {
+        return trainer.ago_ram_snapshot_bytes(snapshot_id);
+    }
+
+    vksplat::ago::SubmitResult ago_gpu_submit_action(const vksplat::ago::AGOAction& action) {
+        return trainer.ago_gpu_submit_action(action);
+    }
+
+    std::vector<vksplat::ago::CompletionRecord> ago_gpu_poll_completions(size_t max_count = 16u) {
+        return trainer.ago_gpu_poll_completions(max_count);
+    }
+
+    uint32_t ago_gpu_available_credits() const {
+        return const_cast<VulkanGSTrainer&>(trainer).ago_gpu_executor().available_credits();
+    }
+
+    uint32_t ago_gpu_inflight_count() const {
+        return const_cast<VulkanGSTrainer&>(trainer).ago_gpu_executor().inflight_count();
+    }
+
+    void ago_gpu_shutdown() {
+        trainer.ago_gpu_shutdown();
+    }
+
+    void ago_scheduler_init(
+        const vksplat::ago::SchedulerConfig& cfg = {},
+        bool use_gpu_executor = false
+    ) {
+        vksplat::ago::ActionExecutorInterface* exec =
+            use_gpu_executor ? static_cast<vksplat::ago::ActionExecutorInterface*>(&trainer.ago_gpu_executor())
+                             : nullptr;
+        ago_scheduler_ = std::make_unique<vksplat::ago::AgoScheduler>(cfg, exec);
     }
 
     vksplat::ago::TickResult ago_scheduler_tick() {
@@ -3028,7 +3080,15 @@ PYBIND11_MODULE(vksplat, m) {
             .value("NO_CREDITS", SubmitResult::NO_CREDITS)
             .value("INVALID_ACTION", SubmitResult::INVALID_ACTION)
             .value("UNSUPPORTED_OP", SubmitResult::UNSUPPORTED_OP)
-            .value("DEVICE_ERROR", SubmitResult::DEVICE_ERROR);
+            .value("DEVICE_ERROR", SubmitResult::DEVICE_ERROR)
+            .value("REJECTED_NO_EXECUTOR", SubmitResult::REJECTED_NO_EXECUTOR);
+
+        m.attr("AGO_PARAM_POS")   = TrainerConfig::AGO_PARAM_POS;
+        m.attr("AGO_PARAM_ROT")   = TrainerConfig::AGO_PARAM_ROT;
+        m.attr("AGO_PARAM_SCALE") = TrainerConfig::AGO_PARAM_SCALE;
+        m.attr("AGO_PARAM_OPAC")  = TrainerConfig::AGO_PARAM_OPAC;
+        m.attr("AGO_PARAM_SH")    = TrainerConfig::AGO_PARAM_SH;
+        m.attr("AGO_PARAM_ALL")   = TrainerConfig::AGO_PARAM_ALL;
 
         py::enum_<TraceEventType>(m, "AgoTraceEventType")
             .value("EVIDENCE_CRITICAL", TraceEventType::EVIDENCE_CRITICAL)
@@ -3068,7 +3128,25 @@ PYBIND11_MODULE(vksplat, m) {
             .def_readwrite("max_splats", &AGOAction::max_splats)
             .def_readwrite("target_fraction", &AGOAction::target_fraction)
             .def_readwrite("requires_exclusive_region", &AGOAction::requires_exclusive_region)
-            .def_readwrite("requires_gpu", &AGOAction::requires_gpu);
+            .def_readwrite("requires_gpu", &AGOAction::requires_gpu)
+            .def_readwrite("enqueued_at_ms", &AGOAction::enqueued_at_ms)
+            .def_readwrite("evidence_ingested_at_ms", &AGOAction::evidence_ingested_at_ms)
+            .def_readwrite("deadline_ms", &AGOAction::deadline_ms);
+
+        py::class_<CompletionRecord>(m, "AgoCompletionRecord")
+            .def(py::init<>())
+            .def_readonly("action_id", &CompletionRecord::action_id)
+            .def_readonly("region_id", &CompletionRecord::region_id)
+            .def_readonly("op", &CompletionRecord::op)
+            .def_readonly("service_class", &CompletionRecord::service_class)
+            .def_readonly("status", &CompletionRecord::status)
+            .def_readonly("active_set_state", &CompletionRecord::active_set_state)
+            .def_readonly("affected_splats", &CompletionRecord::affected_splats)
+            .def_readonly("realized_gain", &CompletionRecord::realized_gain)
+            .def_readonly("actual_cost_ms", &CompletionRecord::actual_cost_ms)
+            .def_readonly("completed_at_ms", &CompletionRecord::completed_at_ms)
+            .def_readonly("event_to_map_correction_ms", &CompletionRecord::event_to_map_correction_ms)
+            .def_readonly("was_exclusive", &CompletionRecord::was_exclusive);
 
         py::class_<DeadlineBudget>(m, "AgoDeadlineBudget")
             .def(py::init<>())
@@ -3127,7 +3205,11 @@ PYBIND11_MODULE(vksplat, m) {
             .def_readonly("total_dropped_telemetry", &SchedulerSummary::total_dropped_telemetry)
             .def_readonly("total_critical_backpressure", &SchedulerSummary::total_critical_backpressure)
             .def_readonly("last_tick_us", &SchedulerSummary::last_tick_us)
-            .def_readonly("available_budget_ms", &SchedulerSummary::available_budget_ms);
+            .def_readonly("available_budget_ms", &SchedulerSummary::available_budget_ms)
+            .def_readonly("last_event_to_map_correction_ms", &SchedulerSummary::last_event_to_map_correction_ms)
+            .def_readonly("max_event_to_map_correction_ms", &SchedulerSummary::max_event_to_map_correction_ms)
+            .def_readonly("mean_event_to_map_correction_ms", &SchedulerSummary::mean_event_to_map_correction_ms)
+            .def_readonly("event_to_map_correction_samples", &SchedulerSummary::event_to_map_correction_samples);
 
         py::class_<EventTraceEntry>(m, "AgoEventTraceEntry")
             .def_readonly("tick", &EventTraceEntry::tick)
@@ -3138,6 +3220,14 @@ PYBIND11_MODULE(vksplat, m) {
             .def_readonly("op", &EventTraceEntry::op)
             .def_readonly("status", &EventTraceEntry::status)
             .def_readonly("value", &EventTraceEntry::value);
+
+        py::class_<NonBlockingGpuExecutor>(m, "NonBlockingGpuExecutor")
+            .def(py::init<>())
+            .def("is_initialized", &NonBlockingGpuExecutor::is_initialized)
+            .def("available_credits", &NonBlockingGpuExecutor::available_credits)
+            .def("inflight_count", &NonBlockingGpuExecutor::inflight_count)
+            .def("try_submit", &NonBlockingGpuExecutor::try_submit, py::arg("action"))
+            .def("shutdown", &NonBlockingGpuExecutor::shutdown, py::arg("drain_timeout_ms") = 5000u);
 
         py::class_<SimulatedAgoExecutor>(m, "SimulatedAgoExecutor")
             .def(py::init<uint32_t, uint32_t>(),
@@ -3427,12 +3517,41 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("enabled"))
         .def("get_external_strategy_mode", &VkSplat::get_external_strategy_mode,
              "Return whether AGO-0 external strategy ownership mode is active")
+        .def("set_ago_param_mask", &VkSplat::set_ago_param_mask,
+             "Set AGO-L0 parameter-specific Adam update bitmask (POS=1, ROT=2, SCALE=4, OPAC=8, SH=16, ALL=31)",
+             py::arg("mask"))
+        .def("get_ago_param_mask", &VkSplat::get_ago_param_mask,
+             "Return active AGO-L0 parameter-specific Adam update bitmask")
         .def("ago_execute_external_op", &VkSplat::ago_execute_external_op,
-             "Execute an explicit AGO-0 external strategy op (returns REJECTED_UNSUPPORTED for unsupported ops)",
+             "Execute an explicit AGO-0/L0 external strategy op (FREEZE/REOPEN/RETRACT/PRUNE/REFINE; REJECTED_UNSUPPORTED otherwise)",
              py::arg("op"), py::arg("group_id") = -1)
+        .def("ago_offload_snapshot_to_ram", &VkSplat::ago_offload_snapshot_to_ram,
+             "Offload Gaussian params, Adam moments, and group states bit-for-bit to host RAM; returns snapshot_id")
+        .def("ago_restore_snapshot_from_ram", &VkSplat::ago_restore_snapshot_from_ram,
+             "Restore Gaussian params, Adam moments, and group states bit-for-bit from host RAM snapshot",
+             py::arg("snapshot_id"))
+        .def("ago_drop_ram_snapshot", &VkSplat::ago_drop_ram_snapshot,
+             "Release a host RAM snapshot by snapshot_id",
+             py::arg("snapshot_id"))
+        .def("ago_ram_snapshot_bytes", &VkSplat::ago_ram_snapshot_bytes,
+             "Return byte size of a stored host RAM snapshot",
+             py::arg("snapshot_id"))
+        .def("ago_gpu_submit_action", &VkSplat::ago_gpu_submit_action,
+             "Submit an AGOAction to the real NonBlockingGpuExecutor (non-blocking)",
+             py::arg("action"))
+        .def("ago_gpu_poll_completions", &VkSplat::ago_gpu_poll_completions,
+             "Poll completed GPU actions via vkGetFenceStatus (strictly non-blocking)",
+             py::arg("max_count") = 16u)
+        .def("ago_gpu_available_credits", &VkSplat::ago_gpu_available_credits,
+             "Return available ring-slot credits in the NonBlockingGpuExecutor")
+        .def("ago_gpu_inflight_count", &VkSplat::ago_gpu_inflight_count,
+             "Return in-flight submission count in the NonBlockingGpuExecutor")
+        .def("ago_gpu_shutdown", &VkSplat::ago_gpu_shutdown,
+             "Safely drain and shut down the NonBlockingGpuExecutor")
         .def("ago_scheduler_init", &VkSplat::ago_scheduler_init,
              "Initialize integrated native C++ AgoScheduler",
-             py::arg("config") = vksplat::ago::SchedulerConfig{})
+             py::arg("config") = vksplat::ago::SchedulerConfig{},
+             py::arg("use_gpu_executor") = false)
         .def("ago_scheduler_tick", &VkSplat::ago_scheduler_tick,
              "Execute one bounded non-blocking AgoScheduler tick")
         .def("ago_scheduler_enqueue_action", &VkSplat::ago_scheduler_enqueue_action,

@@ -98,6 +98,10 @@ struct SchedulerSummary {
     uint64_t total_critical_backpressure = 0;
     double last_tick_us = 0.0;
     double available_budget_ms = 0.0;
+    double last_event_to_map_correction_ms = 0.0;
+    double max_event_to_map_correction_ms = 0.0;
+    double mean_event_to_map_correction_ms = 0.0;
+    uint64_t event_to_map_correction_samples = 0;
 };
 
 struct SchedulerConfig {
@@ -222,6 +226,7 @@ private:
     uint64_t evidence_version_ = 0;
     uint64_t ticks_since_last_maintenance_ = 0;
     ActionId next_action_id_ = 1;
+    double event_to_map_correction_sum_ms_ = 0.0;
 };
 
 }  // namespace vksplat::ago

@@ -87,6 +87,7 @@ struct ShaderUniforms {
     uint32_t use_active_index_dispatch;
     uint32_t ago_telemetry_enabled;
     uint32_t depth_loss_enabled;
+    uint32_t ago_param_mask;
 };
 
 
@@ -127,8 +128,13 @@ void main(
         const uint32_t st = splat_base_state(raw_st);
         is_surfel_2d = is_splat_surfel_2d(raw_st);
         const int32_t gid = group_ids[g_idx];
-        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups && group_state[gid] == 3u)
-            return;
+        if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
+            const uint32_t gstate = group_state[gid];
+            if (gstate == 3u)
+                return;
+            if (gstate == 2u && uniforms.protect_locked_groups != 0u)
+                return;
+        }
         if (st == SPLAT_STATE_CONTRADICTED)
             return;
         if (st == SPLAT_STATE_PREDICTED_UNOBSERVED) {
@@ -137,8 +143,6 @@ void main(
             uncertain_obs = true;
         } else if (st == SPLAT_STATE_LEGACY_GROUP && gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
             const uint32_t gstate = group_state[gid];
-            if (gstate == 2u && uniforms.protect_locked_groups != 0u)
-                return;
             imagined = (gstate == 1u);
         }
     }
@@ -237,12 +241,13 @@ void main(
     uint32_t g2_idx = 2*g_idx+1;
 
     const bool collect_ago = (uniforms.ago_telemetry_enabled != 0u);
+    const uint32_t pmask = uniforms.ago_param_mask;
     float ago_grad_sq = 0.0f;
     float ago_upd_sq = 0.0f;
     float ago_pred_gain = 0.0f;
 
-    // means
-    if (!imagined) {
+    // means (PARAM_POS = 1)
+    if (!imagined && (pmask & 1u) != 0u) {
         float3 x = gauss.xyz_ws;
         float3 x_old = x;
         float3 v = v_xyz_ws;
@@ -260,8 +265,8 @@ void main(
         write_mean(g2, g_idx, g_xyz_ws, 2, 1);
     }
 
-    // rotations (normalized)
-    if (!imagined) {
+    // rotations (normalized, PARAM_ROT = 2)
+    if (!imagined && (pmask & 2u) != 0u) {
         float4 x = gauss.rotations;
         float4 x_old = x;
         float4 v = v_rotation; // TODO: should ideally project when NORMALIZE_QUATS_IN_OPTIMIZER is True
@@ -280,16 +285,21 @@ void main(
         g_rotations[g2_idx] = g2;
     }
 
-    // scales (exp) and opac (sigmoid)
-    if (!imagined) {
+    // scales (exp, PARAM_SCALE = 4) and opac (sigmoid, PARAM_OPAC = 8)
+    const bool upd_scale = !imagined && ((pmask & 4u) != 0u);
+    const bool upd_opac  = !imagined && ((pmask & 8u) != 0u);
+    if (upd_scale || upd_opac) {
         // load
-        float4 x = float4(gauss.scales, gauss.opacities);
+        float4 x_orig = float4(gauss.scales, gauss.opacities);
+        float4 x = x_orig;
         float4 v = float4(
             v_scale_opac.xyz + uniforms.reg_scale,
             v_scale_opac.w + uniforms.reg_opacity
         );
-        float4 g1 = g_scales_opacs[g1_idx];
-        float4 g2 = g_scales_opacs[g2_idx];
+        float4 g1_orig = g_scales_opacs[g1_idx];
+        float4 g2_orig = g_scales_opacs[g2_idx];
+        float4 g1 = g1_orig;
+        float4 g2 = g2_orig;
 
         // inverse map
         float4 u = float4(
@@ -305,61 +315,74 @@ void main(
         // update
         float opac_lr = uncertain_obs ? (0.25f * uniforms.lr_opacities) : uniforms.lr_opacities;
         float lr_sz = is_surfel_2d ? 0.0f : uniforms.lr_scales;
-        float4 lr = float4(uniforms.lr_scales, uniforms.lr_scales, lr_sz, opac_lr);
+        float4 lr = float4(
+            upd_scale ? uniforms.lr_scales : 0.0f,
+            upd_scale ? uniforms.lr_scales : 0.0f,
+            upd_scale ? lr_sz : 0.0f,
+            upd_opac ? opac_lr : 0.0f
+        );
         optimizer_update(u, dLdu, g1, g2, g1_sc, g2_sc, lr);
         if (collect_ago) {
             float4 delta_u = u - u_old;
-            ago_grad_sq += dot(dLdu, dLdu);
-            ago_upd_sq += dot(delta_u, delta_u);
-            ago_pred_gain += -dot(dLdu, delta_u);
+            if (upd_scale) {
+                ago_grad_sq += dot(dLdu.xyz, dLdu.xyz);
+                ago_upd_sq += dot(delta_u.xyz, delta_u.xyz);
+                ago_pred_gain += -dot(dLdu.xyz, delta_u.xyz);
+            }
+            if (upd_opac) {
+                ago_grad_sq += dLdu.w * dLdu.w;
+                ago_upd_sq += delta_u.w * delta_u.w;
+                ago_pred_gain += -dLdu.w * delta_u.w;
+            }
         }
 
         // map (no blanket opacity floor: false priors remain retractable!)
-        x.xyz = exp(u.xyz);  // scale: x = exp(u)
-        if (is_surfel_2d) {
+        x.xyz = upd_scale ? exp(u.xyz) : x_orig.xyz;
+        if (upd_scale && is_surfel_2d) {
             x.z = 0.0f;
         }
-        x.w = 1.0 / (1.0+exp(-u.w));  // opacity: x = sigmoid(u)
+        x.w = upd_opac ? (1.0 / (1.0+exp(-u.w))) : x_orig.w;
 
-        // save
+        // save (bit-exact preservation of masked-out components & Adam moments)
         scales_opacs[g_idx] = x;
-        g_scales_opacs[g1_idx] = g1;
-        g_scales_opacs[g2_idx] = g2;
+        g_scales_opacs[g1_idx] = float4(upd_scale ? g1.xyz : g1_orig.xyz, upd_opac ? g1.w : g1_orig.w);
+        g_scales_opacs[g2_idx] = float4(upd_scale ? g2.xyz : g2_orig.xyz, upd_opac ? g2.w : g2_orig.w);
     }
 
-    // SH
+    // SH (PARAM_SH = 16)
+    if ((pmask & 16u) != 0u) {
+        uint reorder_offset = g_idx % SH_REORDER_SIZE;
+        uint reorder_base = g_idx - reorder_offset;
 
-    uint reorder_offset = g_idx % SH_REORDER_SIZE;
-    uint reorder_base = g_idx - reorder_offset;
+        float lr0 = uniforms.lr_sh_dc;
+        float lr1 = uniforms.lr_sh_rest;
+        uint num_sh = get_num_sh(uniforms.active_sh);
+        for (int di = 0; di < 12; di++) {
+            uint cid = 12 * g_idx + di;
+            uint bid = 12 * reorder_base + di * SH_REORDER_SIZE + reorder_offset;
+            if (is_sh_skipped(uniforms.step, cid, num_sh))
+                continue;
 
-    float lr0 = uniforms.lr_sh_dc;
-    float lr1 = uniforms.lr_sh_rest;
-    uint num_sh = get_num_sh(uniforms.active_sh);
-    for (int di = 0; di < 12; di++) {
-        uint cid = 12 * g_idx + di;
-        uint bid = 12 * reorder_base + di * SH_REORDER_SIZE + reorder_offset;
-        if (is_sh_skipped(uniforms.step, cid, num_sh))
-            continue;
+            float4 lr = (cid%12 == 0) ? float4(lr0, lr0, lr0, lr1) : float4(lr1);
 
-        float4 lr = (cid%12 == 0) ? float4(lr0, lr0, lr0, lr1) : float4(lr1);
-
-        float4 x = get_sh_coeff_4(gauss.sh_coeffs, di);
-        float4 x_old = x;
-        float4 v = is_zero_grad ? float4(0) :
-            get_sh_coeff_4(v_gauss.d.sh_coeffs, di);
-        // default optimizer (Adam)
-        float4 g1 = g_sh_coeffs_1[bid];
-        float4 g2 = g_sh_coeffs_2[bid];
-        optimizer_update(x, v, g1, g2, g1_sc, g2_sc, lr);
-        if (collect_ago) {
-            float4 delta_sh = x - x_old;
-            ago_grad_sq += dot(v, v);
-            ago_upd_sq += dot(delta_sh, delta_sh);
-            ago_pred_gain += -dot(v, delta_sh);
+            float4 x = get_sh_coeff_4(gauss.sh_coeffs, di);
+            float4 x_old = x;
+            float4 v = is_zero_grad ? float4(0) :
+                get_sh_coeff_4(v_gauss.d.sh_coeffs, di);
+            // default optimizer (Adam)
+            float4 g1 = g_sh_coeffs_1[bid];
+            float4 g2 = g_sh_coeffs_2[bid];
+            optimizer_update(x, v, g1, g2, g1_sc, g2_sc, lr);
+            if (collect_ago) {
+                float4 delta_sh = x - x_old;
+                ago_grad_sq += dot(v, v);
+                ago_upd_sq += dot(delta_sh, delta_sh);
+                ago_pred_gain += -dot(v, delta_sh);
+            }
+            sh_coeffs[bid] = x;
+            g_sh_coeffs_1[bid] = g1;
+            g_sh_coeffs_2[bid] = g2;
         }
-        sh_coeffs[bid] = x;
-        g_sh_coeffs_1[bid] = g1;
-        g_sh_coeffs_2[bid] = g2;
     }
 
     if (collect_ago) {

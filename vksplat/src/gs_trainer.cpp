@@ -48,6 +48,7 @@ PACK_STRUCT(struct VulkanGSFusedProjectionBackwardOptimizerUniforms {
     uint32_t use_active_index_dispatch;
     uint32_t ago_telemetry_enabled;
     uint32_t depth_loss_enabled;
+    uint32_t ago_param_mask;
 });
 
 PACK_STRUCT(struct VulkanGSDefaultStrategyUniforms {
@@ -91,7 +92,12 @@ VulkanGSTrainer::~VulkanGSTrainer() {
 }
 
 void VulkanGSTrainer::cleanup() {
+    // Safely drain and destroy NonBlockingGpuExecutor command buffers and fences before device teardown.
+    ago_gpu_executor_.shutdown();
+    ago_ram_snapshots_.clear();
+
     HOST_GUARD;
+    destroyBuffer(ago_exec_marker_buf_.deviceBuffer);
 
     for (auto& im : dataset_train) {
         destroyBuffer(im.buffer.deviceBuffer);
@@ -232,6 +238,32 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_ago_select_active_set_indirect, spirv_paths.at("ago_select_active_set_indirect"));
     createComputePipeline(pipeline_temporal_depth_scatter, spirv_paths.at("temporal_depth_reproject_scatter"));
     createComputePipeline(pipeline_temporal_depth_finalize, spirv_paths.at("temporal_depth_reproject_finalize"));
+
+    // Initialize NonBlockingGpuExecutor with clean teardown drain and real GPU work recorder.
+    resizeDeviceBuffer(ago_exec_marker_buf_, 64u);
+    ago_gpu_executor_.init(device, command_queue, queue_family_index, 4u);
+    ago_gpu_executor_.set_teardown_drain_callback([this]() { waitIdle(); });
+    ago_gpu_executor_.set_record_callback(
+        [this](VkCommandBuffer cb, const vksplat::ago::AGOAction& action, uint32_t& recorded_ops)
+            -> vksplat::ago::SubmitResult {
+            using vksplat::ago::SubmitResult;
+            if (ago_exec_marker_buf_.deviceBuffer.buffer == VK_NULL_HANDLE) {
+                return SubmitResult::REJECTED_NO_EXECUTOR;
+            }
+            const uint32_t slot = static_cast<uint32_t>(action.action_id % 64u);
+            const uint32_t marker = static_cast<uint32_t>(action.action_id & 0xFFFFFFFFu) ^
+                                    (static_cast<uint32_t>(action.op) << 24u);
+            vkCmdFillBuffer(
+                cb,
+                ago_exec_marker_buf_.deviceBuffer.buffer,
+                static_cast<VkDeviceSize>(slot) * sizeof(uint32_t),
+                sizeof(uint32_t),
+                marker
+            );
+            recorded_ops = 1u;
+            return SubmitResult::OK;
+        }
+    );
 
     rng.seed(42);
 }
@@ -1920,24 +1952,47 @@ vksplat::ago::CompletionStatus VulkanGSTrainer::ago_execute_external_op(
     }
     switch (op) {
         case OperationType::FREEZE:
-            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+            if (group_id < 0) {
                 return CompletionStatus::REJECTED_INVALID;
             }
-            buffers.group_state[static_cast<size_t>(group_id)] = 2u;  // LOCKED
+            ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+            set_group_state(buffers, group_id, 2u);  // LOCKED (synced directly to GPU)
             return CompletionStatus::OK;
         case OperationType::REOPEN:
-            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+            if (group_id < 0) {
                 return CompletionStatus::REJECTED_INVALID;
             }
-            buffers.group_state[static_cast<size_t>(group_id)] = 0u;  // FREE
+            ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+            set_group_state(buffers, group_id, 0u);  // FREE (synced directly to GPU)
             return CompletionStatus::OK;
         case OperationType::RETRACT:
-            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+            if (group_id < 0) {
                 return CompletionStatus::REJECTED_INVALID;
             }
-            buffers.group_state[static_cast<size_t>(group_id)] = 3u;  // RETRACTED
-            bumpMapGeneration();
+            // Syncs group_state=3u to GPU and masks opacity to 0 so retracted splats disappear from renders.
+            retract_group_sparse(buffers, group_id);
             return CompletionStatus::OK;
+        case OperationType::PRUNE: {
+            if (group_id < 0) {
+                return CompletionStatus::REJECTED_INVALID;
+            }
+            // Mark retracted on GPU + compact surviving splats to free slots.
+            retract_group_sparse(buffers, group_id);
+            size_t surviving = 0u;
+            for (size_t i = 0; i < buffers.num_splats; ++i) {
+                const int32_t gid = (i < splat_group_ids.size()) ? splat_group_ids[i] : -1;
+                const uint32_t st = (i < splat_states.size()) ? splat_states[i] : 0xFFFFFFFFu;
+                const bool retracted = (gid >= 0 && static_cast<size_t>(gid) < buffers.group_state.size() &&
+                                        buffers.group_state[static_cast<size_t>(gid)] == 3u) || (st == 4u);
+                if (!retracted) {
+                    ++surviving;
+                }
+            }
+            if (surviving > 0u && surviving < buffers.num_splats && num_anchored_splats == 0u) {
+                compact_retracted(buffers);
+            }
+            return CompletionStatus::OK;
+        }
         case OperationType::REFINE:
             // Photometric refinement is handled by the active-set optimizer step.
             return CompletionStatus::OK;
@@ -1945,6 +2000,127 @@ vksplat::ago::CompletionStatus VulkanGSTrainer::ago_execute_external_op(
             // Explicit error status rather than silently falling back to ADC/MCMC.
             return CompletionStatus::REJECTED_UNSUPPORTED;
     }
+}
+
+uint64_t VulkanGSTrainer::ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers) {
+    HOST_GUARD;
+    AgoRamSnapshot snap{};
+    snap.num_splats = buffers.num_splats;
+    snap.map_generation = map_generation_;
+    snap.ago_last_step = ago_last_step_;
+    snap.next_splat_uid = next_splat_uid_;
+
+    auto download_raw = [this](const _VulkanBuffer& buf, std::vector<uint8_t>& out) {
+        if (buf.buffer == VK_NULL_HANDLE || buf.size == 0u) {
+            out.clear();
+            return;
+        }
+        out.resize(buf.size);
+        downloadDeviceSlice(buf, 0u, out.data(), buf.size);
+    };
+
+    download_raw(buffers.xyz_ws.deviceBuffer, snap.xyz_ws_bytes);
+    download_raw(buffers.sh_coeffs.deviceBuffer, snap.sh_coeffs_bytes);
+    download_raw(buffers.rotations.deviceBuffer, snap.rotations_bytes);
+    download_raw(buffers.scales_opacs.deviceBuffer, snap.scales_opacs_bytes);
+    download_raw(buffers.g_xyz_ws.deviceBuffer, snap.g_xyz_ws_bytes);
+    download_raw(buffers.g_sh_coeffs_1.deviceBuffer, snap.g_sh_coeffs_1_bytes);
+    download_raw(buffers.g_sh_coeffs_2.deviceBuffer, snap.g_sh_coeffs_2_bytes);
+    download_raw(buffers.g_rotations.deviceBuffer, snap.g_rotations_bytes);
+    download_raw(buffers.g_scales_opacs.deviceBuffer, snap.g_scales_opacs_bytes);
+
+    snap.group_ids = splat_group_ids;
+    snap.group_state.assign(buffers.group_state.begin(), buffers.group_state.end());
+    snap.splat_state = splat_states;
+    snap.splat_entity_ids = splat_entity_ids;
+    snap.splat_uids = splat_uids;
+    snap.splat_anchors_host = splat_anchors_host;
+
+    const uint64_t id = next_ago_snapshot_id_++;
+    ago_ram_snapshots_.emplace(id, std::move(snap));
+    return id;
+}
+
+bool VulkanGSTrainer::ago_restore_snapshot_from_ram(
+    VulkanGSPipelineBuffers& buffers,
+    uint64_t snapshot_id
+) {
+    auto it = ago_ram_snapshots_.find(snapshot_id);
+    if (it == ago_ram_snapshots_.end()) {
+        return false;
+    }
+    const AgoRamSnapshot& snap = it->second;
+    HOST_GUARD;
+
+    auto upload_raw = [this](_VulkanBuffer& buf, const std::vector<uint8_t>& raw) {
+        if (raw.empty()) {
+            return;
+        }
+        resizeDeviceBuffer(buf, raw.size(), true);
+        uploadDeviceSlice(buf, 0u, raw.data(), raw.size());
+    };
+
+    buffers.num_splats = snap.num_splats;
+    upload_raw(buffers.xyz_ws.deviceBuffer, snap.xyz_ws_bytes);
+    upload_raw(buffers.sh_coeffs.deviceBuffer, snap.sh_coeffs_bytes);
+    upload_raw(buffers.rotations.deviceBuffer, snap.rotations_bytes);
+    upload_raw(buffers.scales_opacs.deviceBuffer, snap.scales_opacs_bytes);
+    upload_raw(buffers.g_xyz_ws.deviceBuffer, snap.g_xyz_ws_bytes);
+    upload_raw(buffers.g_sh_coeffs_1.deviceBuffer, snap.g_sh_coeffs_1_bytes);
+    upload_raw(buffers.g_sh_coeffs_2.deviceBuffer, snap.g_sh_coeffs_2_bytes);
+    upload_raw(buffers.g_rotations.deviceBuffer, snap.g_rotations_bytes);
+    upload_raw(buffers.g_scales_opacs.deviceBuffer, snap.g_scales_opacs_bytes);
+
+    splat_group_ids = snap.group_ids;
+    if (!splat_group_ids.empty()) {
+        buffers.group_ids.assign(splat_group_ids.begin(), splat_group_ids.end());
+        copyToDevice(buffers.group_ids);
+    }
+    buffers.group_state.assign(snap.group_state.begin(), snap.group_state.end());
+    if (!buffers.group_state.empty()) {
+        copyToDevice(buffers.group_state);
+    }
+    splat_states = snap.splat_state;
+    if (!splat_states.empty()) {
+        buffers.splat_state.assign(splat_states.begin(), splat_states.end());
+        copyToDevice(buffers.splat_state);
+    }
+    splat_entity_ids = snap.splat_entity_ids;
+    splat_uids = snap.splat_uids;
+    next_splat_uid_ = snap.next_splat_uid;
+    splat_anchors_host = snap.splat_anchors_host;
+    if (!splat_anchors_host.empty()) {
+        buffers.splat_anchor.assign(splat_anchors_host.begin(), splat_anchors_host.end());
+        copyToDevice(buffers.splat_anchor);
+    }
+
+    ago_last_step_ = snap.ago_last_step;
+    bumpMapGeneration();
+    return true;
+}
+
+bool VulkanGSTrainer::ago_drop_ram_snapshot(uint64_t snapshot_id) {
+    return ago_ram_snapshots_.erase(snapshot_id) > 0u;
+}
+
+size_t VulkanGSTrainer::ago_ram_snapshot_bytes(uint64_t snapshot_id) const {
+    auto it = ago_ram_snapshots_.find(snapshot_id);
+    return (it == ago_ram_snapshots_.end()) ? 0u : it->second.total_bytes();
+}
+
+vksplat::ago::SubmitResult VulkanGSTrainer::ago_gpu_submit_action(
+    const vksplat::ago::AGOAction& action
+) {
+    return ago_gpu_executor_.try_submit(action);
+}
+
+std::vector<vksplat::ago::CompletionRecord> VulkanGSTrainer::ago_gpu_poll_completions(
+    size_t max_count
+) {
+    std::vector<vksplat::ago::CompletionRecord> out(std::max<size_t>(max_count, 1u));
+    const size_t n = ago_gpu_executor_.poll_completed(out.data(), out.size());
+    out.resize(n);
+    return out;
 }
 
 VulkanGSTrainer::TemporalDepthReprojectResult VulkanGSTrainer::reproject_temporal_depth_gpu(
@@ -2281,7 +2457,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
         shaderUniforms.world_view_transform[i] = uniforms.world_view_transform[i];
     ensureGroupBuffersOnDevice(buffers, num_splats);
     shaderUniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
-    shaderUniforms.protect_locked_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
+    shaderUniforms.protect_locked_groups =
+        (config.mcmc_protect_structural_groups || config.external_strategy_mode) ? 1u : 0u;
     shaderUniforms.num_anchors = static_cast<uint32_t>(buffers.splat_anchor.deviceSize() / 8);
     shaderUniforms.normal_scale_cap = config.surfel_normal_cap_m * scene_scale;
     shaderUniforms.active_splat_count = use_indirect_ago
@@ -2290,6 +2467,7 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.use_active_index_dispatch = use_active_dispatch ? 1u : 0u;
     shaderUniforms.ago_telemetry_enabled = ago_telemetry_enabled_ ? 1u : 0u;
     shaderUniforms.depth_loss_enabled = depth_loss_active ? 1u : 0u;
+    shaderUniforms.ago_param_mask = config.ago_param_mask;
     ago_last_step_ = step;
     if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() == 0) {
         resizeDeviceBuffer(active_indices_buf_, 1);

@@ -1,8 +1,17 @@
 #include "gpu_executor.h"
 
 #include <algorithm>
+#include <thread>
 
 namespace vksplat::ago {
+
+namespace {
+double steady_now_ms() noexcept {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+}  // namespace
 
 NonBlockingGpuExecutor::~NonBlockingGpuExecutor() {
     shutdown();
@@ -66,8 +75,39 @@ bool NonBlockingGpuExecutor::init(
     return true;
 }
 
-void NonBlockingGpuExecutor::shutdown() noexcept {
+void NonBlockingGpuExecutor::shutdown(uint64_t drain_timeout_ms) noexcept {
     if (device_ != VK_NULL_HANDLE) {
+        // Teardown-only drain: ensure all in-flight submissions complete before destroying
+        // command buffers and fences. Never called from the scheduler hot path.
+        if (inflight_count_ > 0u) {
+            if (teardown_drain_cb_) {
+                try {
+                    teardown_drain_cb_();
+                } catch (...) {
+                }
+            }
+            const auto deadline = std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds(drain_timeout_ms);
+            while (inflight_count_ > 0u) {
+                for (auto& slot : slots_) {
+                    if (!slot.in_use || slot.fence == VK_NULL_HANDLE) {
+                        continue;
+                    }
+                    const VkResult status = vkGetFenceStatus(device_, slot.fence);
+                    if (status != VK_NOT_READY) {
+                        slot.in_use = false;
+                        if (inflight_count_ > 0u) {
+                            --inflight_count_;
+                        }
+                    }
+                }
+                if (inflight_count_ == 0u || std::chrono::steady_clock::now() >= deadline) {
+                    break;
+                }
+                std::this_thread::yield();
+            }
+        }
+
         for (auto& slot : slots_) {
             if (slot.fence != VK_NULL_HANDLE) {
                 vkDestroyFence(device_, slot.fence, nullptr);
@@ -98,6 +138,9 @@ uint32_t NonBlockingGpuExecutor::available_credits() const noexcept {
 }
 
 SubmitResult NonBlockingGpuExecutor::try_submit(const AGOAction& action) noexcept {
+    if (!record_cb_) {
+        return SubmitResult::REJECTED_NO_EXECUTOR;
+    }
     if (!initialized_ || device_ == VK_NULL_HANDLE || queue_ == VK_NULL_HANDLE) {
         return SubmitResult::DEVICE_ERROR;
     }
@@ -130,12 +173,15 @@ SubmitResult NonBlockingGpuExecutor::try_submit(const AGOAction& action) noexcep
         return SubmitResult::DEVICE_ERROR;
     }
 
-    if (record_cb_) {
-        const SubmitResult rec_res = record_cb_(chosen->cmd_buf, action);
-        if (rec_res != SubmitResult::OK) {
-            vkEndCommandBuffer(chosen->cmd_buf);
-            return rec_res;
-        }
+    uint32_t recorded_ops = 0u;
+    const SubmitResult rec_res = record_cb_(chosen->cmd_buf, action, recorded_ops);
+    if (rec_res != SubmitResult::OK) {
+        vkEndCommandBuffer(chosen->cmd_buf);
+        return rec_res;
+    }
+    if (recorded_ops == 0u) {
+        vkEndCommandBuffer(chosen->cmd_buf);
+        return SubmitResult::REJECTED_NO_EXECUTOR;
     }
 
     if (vkEndCommandBuffer(chosen->cmd_buf) != VK_SUCCESS) {
@@ -171,6 +217,7 @@ size_t NonBlockingGpuExecutor::poll_completed(CompletionRecord* out_buf, size_t 
     }
 
     const auto now = std::chrono::steady_clock::now();
+    const double now_ms = std::chrono::duration<double, std::milli>(now.time_since_epoch()).count();
     size_t completed = 0u;
     for (auto& slot : slots_) {
         if (!slot.in_use || completed >= max_count) {
@@ -191,6 +238,14 @@ size_t NonBlockingGpuExecutor::poll_completed(CompletionRecord* out_buf, size_t 
         rec.actual_cost_ms = static_cast<float>(
             std::chrono::duration<double, std::milli>(now - slot.submitted_at).count()
         );
+        rec.completed_at_ms = now_ms;
+        if (slot.action.evidence_ingested_at_ms > 0.0) {
+            rec.event_to_map_correction_ms = std::max(0.0, now_ms - slot.action.evidence_ingested_at_ms);
+        } else if (slot.action.enqueued_at_ms > 0.0) {
+            rec.event_to_map_correction_ms = std::max(0.0, now_ms - slot.action.enqueued_at_ms);
+        } else {
+            rec.event_to_map_correction_ms = static_cast<double>(rec.actual_cost_ms);
+        }
         rec.was_exclusive = slot.action.requires_exclusive_region;
 
         slot.in_use = false;
@@ -275,6 +330,15 @@ size_t SimulatedAgoExecutor::poll_completed(CompletionRecord* out_buf, size_t ma
         }
         rec.realized_gain = (rec.status == CompletionStatus::OK) ? slot.action.expected_gain : 0.0f;
         rec.actual_cost_ms = slot.action.estimated_cost_ms;
+        const double now_ms = steady_now_ms();
+        rec.completed_at_ms = now_ms;
+        if (slot.action.evidence_ingested_at_ms > 0.0) {
+            rec.event_to_map_correction_ms = std::max(0.0, now_ms - slot.action.evidence_ingested_at_ms);
+        } else if (slot.action.enqueued_at_ms > 0.0) {
+            rec.event_to_map_correction_ms = std::max(0.0, now_ms - slot.action.enqueued_at_ms);
+        } else {
+            rec.event_to_map_correction_ms = static_cast<double>(rec.actual_cost_ms);
+        }
         rec.was_exclusive = slot.action.requires_exclusive_region;
 
         slot.in_use = false;

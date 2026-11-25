@@ -1,0 +1,14 @@
+[package]
+name = "ago_control_plane"
+version = "0.1.0"
+edition = "2021"
+description = "Hierarchical Rust AGO control plane with explicit ActionState typestate and batched C ABI"
+
+[lib]
+name = "ago_control_plane"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

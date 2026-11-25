@@ -71,6 +71,7 @@ enum class SubmitResult : uint8_t {
     INVALID_ACTION = 2,
     UNSUPPORTED_OP = 3,
     DEVICE_ERROR = 4,
+    REJECTED_NO_EXECUTOR = 5,
 };
 
 // Region dirty-flag bitmask
@@ -108,6 +109,7 @@ struct AGOAction {
     bool requires_exclusive_region = false;
     bool requires_gpu = true;
     double enqueued_at_ms = 0.0;
+    double evidence_ingested_at_ms = 0.0;
     double deadline_ms = 0.0;
 };
 
@@ -121,6 +123,8 @@ struct CompletionRecord {
     uint32_t affected_splats = 0;
     float realized_gain = 0.0f;
     float actual_cost_ms = 0.0f;
+    double completed_at_ms = 0.0;
+    double event_to_map_correction_ms = 0.0;
     uint64_t result_map_version = 0;
     uint64_t result_pose_version = 0;
     uint64_t completed_at_tick = 0;
@@ -142,6 +146,7 @@ struct RegionWorkState {
     bool exclusive_locked = false;
     bool in_ready_queue = false;
     uint64_t last_updated_tick = 0;
+    double last_evidence_ingested_ms = 0.0;
 };
 
 inline bool is_structural_op(OperationType op) noexcept {

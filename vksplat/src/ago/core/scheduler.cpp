@@ -6,6 +6,14 @@
 
 namespace vksplat::ago {
 
+namespace {
+double scheduler_now_ms() noexcept {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+}  // namespace
+
 AgoScheduler::AgoScheduler(
     const SchedulerConfig& config,
     ActionExecutorInterface* executor
@@ -51,6 +59,20 @@ bool AgoScheduler::enqueue_action(const AGOAction& action) noexcept {
     } else if (copy.action_id >= next_action_id_) {
         next_action_id_ = copy.action_id + 1u;
     }
+    const double now_ms = scheduler_now_ms();
+    if (copy.enqueued_at_ms <= 0.0) {
+        copy.enqueued_at_ms = now_ms;
+    }
+    if (copy.evidence_ingested_at_ms <= 0.0 && copy.region_id != 0u) {
+        if (const RegionWorkState* st = dirty_tracker_.find(copy.region_id)) {
+            if (st->last_evidence_ingested_ms > 0.0) {
+                copy.evidence_ingested_at_ms = st->last_evidence_ingested_ms;
+            }
+        }
+    }
+    if (copy.evidence_ingested_at_ms <= 0.0) {
+        copy.evidence_ingested_at_ms = copy.enqueued_at_ms;
+    }
     pending_actions_[pending_count_++] = copy;
     return true;
 }
@@ -89,6 +111,9 @@ void AgoScheduler::handle_evidence(const EvidenceMessage& msg, bool is_critical)
             evidence_version_,
             tick_count_
         );
+        if (RegionWorkState* st = dirty_tracker_.find(msg.region_id)) {
+            st->last_evidence_ingested_ms = (msg.timestamp_ms > 0.0) ? msg.timestamp_ms : scheduler_now_ms();
+        }
     }
 
     EventTraceEntry ev{};
@@ -119,6 +144,29 @@ void AgoScheduler::handle_completion(const CompletionRecord& rec) noexcept {
 
     if (ok) {
         ++summary_.total_completed;
+        double e2m_ms = rec.event_to_map_correction_ms;
+        if (e2m_ms <= 0.0) {
+            const double done_ms = (rec.completed_at_ms > 0.0) ? rec.completed_at_ms : scheduler_now_ms();
+            if (rec.region_id != 0u) {
+                if (const RegionWorkState* st = dirty_tracker_.find(rec.region_id)) {
+                    if (st->last_evidence_ingested_ms > 0.0) {
+                        e2m_ms = std::max(0.0, done_ms - st->last_evidence_ingested_ms);
+                    }
+                }
+            }
+            if (e2m_ms <= 0.0) {
+                e2m_ms = std::max<double>(0.0, static_cast<double>(rec.actual_cost_ms));
+            }
+        }
+        summary_.last_event_to_map_correction_ms = e2m_ms;
+        if (e2m_ms > summary_.max_event_to_map_correction_ms) {
+            summary_.max_event_to_map_correction_ms = e2m_ms;
+        }
+        event_to_map_correction_sum_ms_ += e2m_ms;
+        ++summary_.event_to_map_correction_samples;
+        summary_.mean_event_to_map_correction_ms =
+            event_to_map_correction_sum_ms_ / static_cast<double>(summary_.event_to_map_correction_samples);
+
         if (rec.result_map_version > map_version_) {
             map_version_ = rec.result_map_version;
         } else if (is_structural_op(rec.op)) {
