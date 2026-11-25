@@ -179,6 +179,9 @@ public:
             "morton_sort_update_buffer_sh",
             "appearance_init",
             "ago_select_active_set",
+            "ago_gain_histogram",
+            "temporal_depth_reproject_scatter",
+            "temporal_depth_reproject_finalize",
         };
         std::map<std::string, std::string> spirv_paths_dict;
         for (std::string name : spirv_paths) {
@@ -1178,6 +1181,172 @@ public:
             config, buffers, target_gain_ratio, newborn_warmup_steps, exclude_frozen
         );
         return _ago_summary_to_dict(s);
+    }
+
+    py::dict select_ago_exact_k_gpu(
+        float target_fraction = 0.5f,
+        float newborn_warmup_steps = 10.0f,
+        bool exclude_frozen = true
+    ) {
+        const auto s = trainer.select_ago_exact_k_gpu(
+            config, buffers, target_fraction, newborn_warmup_steps, exclude_frozen
+        );
+        return _ago_summary_to_dict(s);
+    }
+
+    py::dict reproject_temporal_depth_gpu(
+        py::array_t<float, py::array::c_style | py::array::forcecast> src_depths,
+        py::array_t<float, py::array::c_style | py::array::forcecast> src_c2ws,
+        py::array_t<float, py::array::c_style | py::array::forcecast> dst_c2w,
+        py::array_t<float, py::array::c_style | py::array::forcecast> K_src,
+        py::array_t<float, py::array::c_style | py::array::forcecast> K_dst,
+        float max_depth_m = 10.0f,
+        py::object dst_hw_obj = py::none(),
+        float min_depth_m = 0.05f,
+        float min_cos_angle = 0.0f
+    ) {
+        auto dbuf = src_depths.request();
+        if (dbuf.ndim != 3) {
+            throw std::invalid_argument("src_depths must have shape (H_hist, H_src, W_src)");
+        }
+        const size_t num_views = static_cast<size_t>(dbuf.shape[0]);
+        const int src_h = static_cast<int>(dbuf.shape[1]);
+        const int src_w = static_cast<int>(dbuf.shape[2]);
+
+        int dst_h = src_h;
+        int dst_w = src_w;
+        if (!dst_hw_obj.is_none()) {
+            auto seq = dst_hw_obj.cast<py::sequence>();
+            if (py::len(seq) != 2) {
+                throw std::invalid_argument("dst_hw must be a (H_dst, W_dst) pair");
+            }
+            dst_h = seq[0].cast<int>();
+            dst_w = seq[1].cast<int>();
+        }
+
+        auto scbuf = src_c2ws.request();
+        if (scbuf.ndim != 3 || static_cast<size_t>(scbuf.shape[0]) != num_views ||
+            scbuf.shape[1] != 4 || scbuf.shape[2] != 4) {
+            throw std::invalid_argument("src_c2ws must have shape (H_hist, 4, 4)");
+        }
+        auto dcbuf = dst_c2w.request();
+        if (dcbuf.ndim != 2 || dcbuf.shape[0] != 4 || dcbuf.shape[1] != 4) {
+            throw std::invalid_argument("dst_c2w must have shape (4, 4)");
+        }
+
+        auto extract_single_k = [](const py::buffer_info& b, float out[4], const char* name) {
+            const float* p = static_cast<const float*>(b.ptr);
+            if (b.ndim == 2 && b.shape[0] == 3 && b.shape[1] == 3) {
+                out[0] = p[0];
+                out[1] = p[4];
+                out[2] = p[2];
+                out[3] = p[5];
+            } else if (b.ndim == 1 && b.shape[0] == 4) {
+                out[0] = p[0];
+                out[1] = p[1];
+                out[2] = p[2];
+                out[3] = p[3];
+            } else {
+                throw std::invalid_argument(std::string(name) + " must have shape (3, 3) or (4,)");
+            }
+            if (!(out[0] > 0.0f && out[1] > 0.0f && std::isfinite(out[0]) && std::isfinite(out[1]))) {
+                throw std::invalid_argument(std::string(name) + " focal lengths fx, fy must be finite and > 0");
+            }
+        };
+
+        float kd[4] = {};
+        extract_single_k(K_dst.request(), kd, "K_dst");
+
+        auto ksbuf = K_src.request();
+        const bool ks_shared = (ksbuf.ndim == 2 && ksbuf.shape[0] == 3 && ksbuf.shape[1] == 3) ||
+                               (ksbuf.ndim == 1 && ksbuf.shape[0] == 4);
+        const bool ks_per_view = (ksbuf.ndim == 3 && static_cast<size_t>(ksbuf.shape[0]) == num_views &&
+                                  ksbuf.shape[1] == 3 && ksbuf.shape[2] == 3) ||
+                                 (ksbuf.ndim == 2 && static_cast<size_t>(ksbuf.shape[0]) == num_views &&
+                                  ksbuf.shape[1] == 4);
+        if (!ks_shared && !ks_per_view) {
+            throw std::invalid_argument("K_src must have shape (3, 3), (4,), (H_hist, 3, 3), or (H_hist, 4)");
+        }
+        float ks_shared_vals[4] = {};
+        if (ks_shared) {
+            extract_single_k(ksbuf, ks_shared_vals, "K_src");
+        }
+
+        // Load row-major 4x4 dst_c2w into column-major glm::dmat4 and invert in float64
+        const float* dptr = static_cast<const float*>(dcbuf.ptr);
+        glm::dmat4 dst_c2w_d(1.0);
+        for (int r = 0; r < 4; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                dst_c2w_d[c][r] = static_cast<double>(dptr[4 * r + c]);
+            }
+        }
+        const glm::dmat4 dst_w2c_d = glm::inverse(dst_c2w_d);
+
+        std::vector<float> view_params(16 * num_views, 0.0f);
+        const float* sptr = static_cast<const float*>(scbuf.ptr);
+        for (size_t v = 0; v < num_views; ++v) {
+            const float* sv = sptr + 16 * v;
+            glm::dmat4 src_c2w_d(1.0);
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    src_c2w_d[c][r] = static_cast<double>(sv[4 * r + c]);
+                }
+            }
+            const glm::dmat4 t_s2d = dst_w2c_d * src_c2w_d;
+            float* vp = &view_params[16 * v];
+            // Store rows 0, 1, 2 of T_src_to_dst
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    vp[4 * r + c] = static_cast<float>(t_s2d[c][r]);
+                }
+            }
+            float kv[4] = {};
+            if (ks_shared) {
+                memcpy(kv, ks_shared_vals, sizeof(kv));
+            } else {
+                extract_k_params(ksbuf, v, kv, "K_src");
+                if (!(kv[0] > 0.0f && kv[1] > 0.0f && std::isfinite(kv[0]) && std::isfinite(kv[1]))) {
+                    throw std::invalid_argument("K_src focal lengths fx, fy must be finite and > 0");
+                }
+            }
+            vp[12] = 1.0f / kv[0];  // inv_fx_s
+            vp[13] = 1.0f / kv[1];  // inv_fy_s
+            vp[14] = kv[2];         // cx_s
+            vp[15] = kv[3];         // cy_s
+        }
+
+        auto res = trainer.reproject_temporal_depth_gpu(
+            static_cast<const float*>(dbuf.ptr),
+            num_views,
+            src_h,
+            src_w,
+            view_params.data(),
+            dst_h,
+            dst_w,
+            kd[0],
+            kd[1],
+            kd[2],
+            kd[3],
+            max_depth_m,
+            min_depth_m,
+            min_cos_angle
+        );
+
+        py::array_t<float> depth_arr({dst_h, dst_w});
+        py::array_t<float> weight_arr({dst_h, dst_w});
+        py::array_t<uint32_t> support_arr({dst_h, dst_w});
+        const size_t n_dst = static_cast<size_t>(dst_h) * static_cast<size_t>(dst_w);
+        memcpy(depth_arr.mutable_data(), res.depth.data(), n_dst * sizeof(float));
+        memcpy(weight_arr.mutable_data(), res.weight.data(), n_dst * sizeof(float));
+        memcpy(support_arr.mutable_data(), res.support.data(), n_dst * sizeof(uint32_t));
+
+        py::dict out;
+        out["depth"] = std::move(depth_arr);
+        out["weight"] = std::move(weight_arr);
+        out["support_count"] = std::move(support_arr);
+        out["kernel_ms"] = res.kernel_ms;
+        out["total_ms"] = res.total_ms;
+        return out;
     }
 
     py::dict get_ago_step_gain_summary() const {
@@ -2905,6 +3074,22 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("target_gain_ratio") = 0.5f,
              py::arg("newborn_warmup_steps") = 2.0f,
              py::arg("exclude_frozen") = true)
+        .def("select_ago_exact_k_gpu", &VkSplat::select_ago_exact_k_gpu,
+             "2-pass GPU 256-bin log-gain histogram + exact-K active-set compaction guaranteeing active_count == round(target_fraction * eligible) with zero per-Gaussian host readback",
+             py::arg("target_fraction") = 0.5f,
+             py::arg("newborn_warmup_steps") = 10.0f,
+             py::arg("exclude_frozen") = true)
+        .def("reproject_temporal_depth_gpu", &VkSplat::reproject_temporal_depth_gpu,
+             "GPU temporal depth reprojection of historical depth maps into target viewpoint with atomic uint32 z-buffer, view-angle cosine weighting, and valid-support count",
+             py::arg("src_depths"),
+             py::arg("src_c2ws"),
+             py::arg("dst_c2w"),
+             py::arg("K_src"),
+             py::arg("K_dst"),
+             py::arg("max_depth_m") = 10.0f,
+             py::arg("dst_hw") = py::none(),
+             py::arg("min_depth_m") = 0.05f,
+             py::arg("min_cos_angle") = 0.0f)
         .def("get_ago_step_gain_summary", &VkSplat::get_ago_step_gain_summary,
              "Return cached 16-byte GPU AGO-2 step-gain summary without per-Gaussian readback")
         .def("snapshot_ago_state", &VkSplat::snapshot_ago_state,

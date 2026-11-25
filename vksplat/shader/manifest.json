@@ -193,11 +193,22 @@
         },
         "ago_select_active_set.slang": {
             "sources": {
-                "slang/ago_select_active_set.slang": "ea201caa154db6764b669c95847628129b2e296c44477ace3b136c1a08642bb6",
+                "slang/ago_select_active_set.slang": "a113fe71e04cf1d6aeba91f227a412c92bcc2f805ff8f7aaf75df3f909f67344",
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
             },
             "outputs": {
-                "shader/generated/ago_select_active_set.spv": "c01f5301a2a5b69c3b55e9cd7c4c60ecb16a5b735b66c5b6fc48610ddca929dc"
+                "shader/generated/ago_gain_histogram.spv": "4297fc4f0d60a84823e531bec9ea117048756152369cdb8080e405c90f145a7e",
+                "shader/generated/ago_select_active_set.spv": "bf8506851dbd1455e9865992abf51a7ec168bc433eab708cf3108cb05cc92d26"
+            }
+        },
+        "temporal_depth_reproject.slang": {
+            "sources": {
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd",
+                "slang/temporal_depth_reproject.slang": "30d67af5c461423f6c3267b39a2466dbe0a649d027b63d9f9fdf502d86fe41f9"
+            },
+            "outputs": {
+                "shader/generated/temporal_depth_reproject_finalize.spv": "b140b13d7f975da598ad7ea9664ab659445b1bcd825d7d09642cb6ca0bc49e4f",
+                "shader/generated/temporal_depth_reproject_scatter.spv": "f969d1553a634346a8d7940a89d7b1f1f148a3cee875b5ae8a43cb7947ce011d"
             }
         }
     }
