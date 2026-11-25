@@ -432,6 +432,12 @@ public:
         std::optional<double> optimizer_ms;
         std::optional<double> ago_selection_ms;
     };
+    struct AgoDeviceCounters {
+        std::optional<uint64_t> gpu_projected_gaussians;
+        std::optional<uint64_t> gpu_tile_intersections;
+        std::optional<uint64_t> gpu_backward_tiles_executed;
+        std::optional<uint64_t> gpu_backward_tiles_skipped;
+    };
     struct AgoWorkloadFunnel {
         size_t total_stored_gaussians = 0u;
         size_t gpu_resident_gaussians = 0u;
@@ -448,6 +454,7 @@ public:
     void collectAgoStageTimings();
     void collectAgoSelectionStageTiming();
     const AgoStageTimings& get_ago_stage_timings() const { return last_ago_stage_timings_; }
+    const AgoDeviceCounters& get_ago_device_counters() const { return last_ago_device_counters_; }
     AgoWorkloadFunnel compute_ago_workload_funnel(
         const TrainerConfig& config,
         const VulkanGSPipelineBuffers& buffers
@@ -834,9 +841,10 @@ private:
     bool ago_gpu_evicted_ = false;
     size_t ago_evicted_splats_ = 0u;
 
-    // S100: Opt-in per-stage Vulkan timestamp profiling state
+    // S100 / S104: Opt-in per-stage Vulkan timestamp & device counter profiling state
     bool ago_stage_profiling_enabled_ = false;
     AgoStageTimings last_ago_stage_timings_{};
+    AgoDeviceCounters last_ago_device_counters_{};
 
     // Reusable device buffers & pipelines for temporal_depth_reproject.slang
     Buffer<float> treproj_src_depths_;

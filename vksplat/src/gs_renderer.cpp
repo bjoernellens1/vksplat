@@ -24,7 +24,7 @@ VulkanGSRenderer::~VulkanGSRenderer() {
 }
 
 void VulkanGSRenderer::cleanup() {
-    for (auto* b : {&sparse_residual, &sparse_mask, &sparse_active_tiles, &sparse_args, &sparse_counters})
+    for (auto* b : {&sparse_residual, &sparse_mask, &sparse_active_tiles, &sparse_args, &sparse_counters, &ago_gpu_counters_buf_})
         destroyBuffer(*b);
     sparse_capacity = 0;
     destroyBuffer(ago_contrib_step_buf_.deviceBuffer);
@@ -73,9 +73,11 @@ void VulkanGSRenderer::initialize(const std::map<std::string, std::string> &spir
     createComputePipeline(pipeline_sparse_select, spirv_paths.at("sparse_tile_select"));
     createBuffer(4 * sizeof(uint32_t), sparse_args);
     createBuffer(sizeof(uint32_t), sparse_counters);
+    createBuffer(kAgoGpuCounterCount * sizeof(uint32_t), ago_gpu_counters_buf_);
     {
         DEVICE_GUARD;
         vkCmdFillBuffer(command_buffer, sparse_counters.buffer, 0, sizeof(uint32_t), 0);
+        vkCmdFillBuffer(command_buffer, ago_gpu_counters_buf_.buffer, 0, kAgoGpuCounterCount * sizeof(uint32_t), 0);
     }
     ensureSparseTileBuffers(1);
     for (int i = 0; i < 2; ++i) {
@@ -120,12 +122,17 @@ void VulkanGSRenderer::executeProjectionForward(
         { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
         { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
     };
-    if (uniforms.render_exclude_flags != 0u) {
+    const bool has_render_exclude = (uniforms.render_exclude_flags & 3u) != 0u;
+    const bool gpu_counters_enabled = (uniforms.render_exclude_flags & 4u) != 0u;
+    if (has_render_exclude) {
         proj_barriers.push_back({ buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
         proj_barriers.push_back({ buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
         proj_barriers.push_back({ buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
     }
     bufferMemoryBarrier(proj_barriers, COMPUTE_SHADER_READ);
+    if (gpu_counters_enabled) {
+        bufferMemoryBarrier({{ ago_gpu_counters_buf_, TRANSFER_WRITE }}, COMPUTE_SHADER_READ_WRITE);
+    }
 
     size_t alloc_size = std::max(num_splats, alloc_reserve);
     executeCompute(
@@ -146,10 +153,12 @@ void VulkanGSRenderer::executeProjectionForward(
             reserveDeviceBuffer(buffers.depths, alloc_size),
             reserveDeviceBuffer(buffers.inv_cov_vs_opacity, 4*alloc_size),
             reserveDeviceBuffer(buffers.rgb, 3*alloc_size),
-            // S104: group & per-splat tables (read only when uniforms.render_exclude_flags != 0)
-            uniforms.render_exclude_flags ? buffers.group_ids.deviceBuffer : sparse_active_tiles,
-            uniforms.render_exclude_flags ? buffers.group_state.deviceBuffer : sparse_active_tiles,
-            uniforms.render_exclude_flags ? buffers.splat_state.deviceBuffer : sparse_active_tiles,
+            // S104: group & per-splat tables (read only when (uniforms.render_exclude_flags & 3u) != 0)
+            has_render_exclude ? buffers.group_ids.deviceBuffer : sparse_active_tiles,
+            has_render_exclude ? buffers.group_state.deviceBuffer : sparse_active_tiles,
+            has_render_exclude ? buffers.splat_state.deviceBuffer : sparse_active_tiles,
+            // S104 Phase 12: device-side atomic counters (written only when (uniforms.render_exclude_flags & 4u) != 0)
+            ago_gpu_counters_buf_,
         }
     );
 
@@ -450,6 +459,9 @@ void VulkanGSRenderer::executeRasterizeBackward(
         barriers.push_back({ buffers.pixel_depth.deviceBuffer, COMPUTE_SHADER_WRITE });
         barriers.push_back({ buffers.v_depths.deviceBuffer, TRANSFER_WRITE });
     }
+    if ((uniforms.render_exclude_flags & 4u) != 0u) {
+        barriers.push_back({ ago_gpu_counters_buf_, TRANSFER_COMPUTE_SHADER_WRITE });
+    }
     bufferMemoryBarrier(barriers, COMPUTE_SHADER_READ_WRITE);
 
     std::vector<std::pair<size_t, size_t>> dims;
@@ -506,6 +518,8 @@ void VulkanGSRenderer::executeRasterizeBackward(
             depth_enabled ? buffers.pixel_depth.deviceBuffer : sparse_active_tiles,
             depth_enabled ? *train_depth_weight_buf : sparse_active_tiles,
             depth_enabled ? buffers.v_depths.deviceBuffer : sparse_active_tiles,
+            // S104 Phase 12: device-side atomic counters (written only when (uniforms.render_exclude_flags & 4u) != 0)
+            ago_gpu_counters_buf_,
         },
         GATE_RASTER_BWD,
         sparse ? &sparse_args : nullptr
@@ -1043,6 +1057,27 @@ uint64_t VulkanGSRenderer::sparseTilesDispatched() {
     sparse_counter_total += (uint32_t)(now - sparse_counter_last);
     sparse_counter_last = now;
     return sparse_counter_total;
+}
+
+void VulkanGSRenderer::resetAgoGpuCounters() {
+    if (ago_gpu_counters_buf_.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    DEVICE_GUARD;
+    bufferMemoryBarrier({{ ago_gpu_counters_buf_, COMPUTE_SHADER_READ_WRITE }}, TRANSFER_WRITE);
+    vkCmdFillBuffer(command_buffer, ago_gpu_counters_buf_.buffer, 0, kAgoGpuCounterCount * sizeof(uint32_t), 0);
+}
+
+bool VulkanGSRenderer::readAgoGpuCounters(uint32_t out_counters[4]) {
+    if (ago_gpu_counters_buf_.buffer == VK_NULL_HANDLE || commandBatchInProgress) {
+        return false;
+    }
+    // Diagnostic profiling readback: keep fence_waits_total a measure of the step path.
+    auto& fences = PerfTimer::work_counters.fence_waits_total;
+    const uint64_t fences_before = fences;
+    downloadDeviceSlice(ago_gpu_counters_buf_, 0u, out_counters, 4u * sizeof(uint32_t));
+    fences = fences_before;
+    return true;
 }
 
 int VulkanGSRenderer::sampleBackwardImpl() {

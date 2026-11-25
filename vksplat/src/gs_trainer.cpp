@@ -2459,6 +2459,7 @@ void VulkanGSTrainer::set_ago_stage_profiling(bool enabled) {
     ago_stage_profiling_enabled_ = enabled;
     if (!enabled) {
         last_ago_stage_timings_ = AgoStageTimings{};
+        last_ago_device_counters_ = AgoDeviceCounters{};
     }
 }
 
@@ -2489,6 +2490,14 @@ void VulkanGSTrainer::collectAgoStageTimings() {
         last_ago_stage_timings_.optimizer_ms = *v;
     }
     collectAgoSelectionStageTiming();
+
+    uint32_t raw_counters[4] = {0u, 0u, 0u, 0u};
+    if (readAgoGpuCounters(raw_counters)) {
+        last_ago_device_counters_.gpu_projected_gaussians = static_cast<uint64_t>(raw_counters[0]);
+        last_ago_device_counters_.gpu_tile_intersections = static_cast<uint64_t>(raw_counters[1]);
+        last_ago_device_counters_.gpu_backward_tiles_executed = static_cast<uint64_t>(raw_counters[2]);
+        last_ago_device_counters_.gpu_backward_tiles_skipped = static_cast<uint64_t>(raw_counters[3]);
+    }
 }
 
 void VulkanGSTrainer::collectAgoSelectionStageTiming() {
@@ -2509,7 +2518,9 @@ VulkanGSTrainer::AgoWorkloadFunnel VulkanGSTrainer::compute_ago_workload_funnel(
     f.gpu_resident_gaussians = gpu_n;
     f.total_stored_gaussians = gpu_n + ago_evicted_splats_;
     f.projection_candidates = gpu_n;
-    f.visible_gaussians = std::nullopt;  // not read back on hot path
+    f.visible_gaussians = (ago_stage_profiling_enabled_ && last_ago_device_counters_.gpu_projected_gaussians.has_value())
+        ? std::optional<size_t>(static_cast<size_t>(*last_ago_device_counters_.gpu_projected_gaussians))
+        : std::nullopt;
 
     if (gpu_n == 0u) {
         return f;

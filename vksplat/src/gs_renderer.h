@@ -28,7 +28,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
     float depth_huber_delta;   // Huber delta in meters
     float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
-    uint32_t render_exclude_flags;  // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER present, bit 1: splat_state FROZEN_INVISIBLE present
+    uint32_t render_exclude_flags;  // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER, bit 1: splat FROZEN_INVISIBLE, bit 2: GPU workload counters enabled
 });
 
 
@@ -95,6 +95,13 @@ public:
     // Tiles dispatched by sparse backward passes so far (device counter; reads back, never call mid-step).
     uint64_t sparseTilesDispatched();
 
+    // S104 Phase 12: Device-side GPU workload counters (zeroed & incremented only when stage profiling is enabled).
+    // Slots: [0]=gpu_projected_gaussians, [1]=gpu_tile_intersections,
+    //        [2]=gpu_backward_tiles_executed, [3]=gpu_backward_tiles_skipped.
+    static constexpr size_t kAgoGpuCounterCount = 8u;
+    void resetAgoGpuCounters();
+    bool readAgoGpuCounters(uint32_t out_counters[4]);
+
 private:
     enum class RasterBackwardImpl {
         PerPixel = 0,
@@ -131,7 +138,7 @@ protected:
         Buffer<int32_t> &output_buffer
     );
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(14);
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(15);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
     _ComputePipeline pipeline_step_gate = _ComputePipeline(4);
     _ComputePipeline pipeline_sparse_residual = _ComputePipeline(3);
@@ -139,6 +146,7 @@ protected:
     _VulkanBuffer sparse_residual, sparse_mask, sparse_active_tiles;  // (tiles,) uint32
     _VulkanBuffer sparse_args;      // one VkDispatchIndirectCommand
     _VulkanBuffer sparse_counters;  // [0]: tiles dispatched by sparse backward passes (wraps at 2^32)
+    _VulkanBuffer ago_gpu_counters_buf_;  // S104: 8-uint device atomic workload counters
     size_t sparse_capacity = 0;
     uint32_t sparse_counter_last = 0;
     uint64_t sparse_counter_total = 0;
@@ -149,11 +157,11 @@ protected:
     _ComputePipelinePair pipeline_rasterize_forward = _ComputePipelinePair(7);
     _ComputePipelinePair pipeline_rasterize_forward_depth = _ComputePipelinePair(9);
     _ComputePipelinePair pipeline_rasterize_backward[(size_t)RasterBackwardImpl::size] = {
-        _ComputePipelinePair(21),  // per pixel
-        _ComputePipelinePair(21),  // per splat
-        _ComputePipelinePair(21),  // tensor
-        _ComputePipelinePair(21),  // tensor
-        _ComputePipelinePair(21),  // tensor
+        _ComputePipelinePair(22),  // per pixel
+        _ComputePipelinePair(22),  // per splat
+        _ComputePipelinePair(22),  // tensor
+        _ComputePipelinePair(22),  // tensor
+        _ComputePipelinePair(22),  // tensor
     };
     // Per-step AGO rasterize-backward scratch buffers (zeroed & accumulated only when ago_telemetry_enabled != 0)
     Buffer<float> ago_contrib_step_buf_;

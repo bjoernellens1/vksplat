@@ -38,6 +38,30 @@ def test_s104_python_binding_and_funnel_schema():
     assert "frozen_invisible_gaussians" in wf
     assert wf["projection_candidates"] == 0
     assert wf["frozen_invisible_gaussians"] == 0
+    assert wf["visible_gaussians"] is None
+
+    expected_counters = {
+        "gpu_projected_gaussians",
+        "gpu_tile_intersections",
+        "gpu_backward_tiles_executed",
+        "gpu_backward_tiles_skipped",
+    }
+    dc = st["device_executed_counters"]
+    assert set(dc.keys()) == expected_counters
+    assert all(dc[k] is None for k in expected_counters)
+
+    # Enabling profiling before any GPU step must still report None (zero fabrication).
+    vk.set_ago_stage_profiling(True)
+    st_on = vk.ago_get_stage_telemetry()
+    assert all(st_on["device_executed_counters"][k] is None for k in expected_counters)
+    assert st_on["workload_funnel"]["visible_gaussians"] is None
+    vk.set_ago_stage_profiling(False)
+
+    # S3 envelope fence accounting keys are present even on empty CPU invocation.
+    env = vk.ago_execute_multi_batch_gpu_envelope([], first_step=0)
+    assert env["cpu_gpu_sync_count"] == 0
+    assert env["intermediate_sync_count"] == 0
+    assert env["envelope_completion_fence_count"] == 0
 
 
 def test_s104_shaders_contain_exclusion_and_tile_skip():
@@ -47,6 +71,9 @@ def test_s104_shaders_contain_exclusion_and_tile_skip():
     assert "render_exclude_flags" in vertex_src
     assert "GROUP_STATE_EXCLUDED_RENDER" in vertex_src
     assert "is_splat_frozen_invisible" in vertex_src
+    assert "out_ago_gpu_counters" in vertex_src
+    assert "InterlockedAdd(out_ago_gpu_counters[0], 1u)" in vertex_src
+    assert "InterlockedAdd(out_ago_gpu_counters[1], uint32_t(n_tiles))" in vertex_src
 
     for bwd_name in (
         "alphablend_shader_bwd_per_pixel.slang",
@@ -56,6 +83,9 @@ def test_s104_shaders_contain_exclusion_and_tile_skip():
         src = (slang_dir / bwd_name).read_text()
         assert "groupshared uint tile_has_active_splat;" in src, f"Missing tile_has_active_splat in {bwd_name}"
         assert "if (tile_has_active_splat == 0u)" in src, f"Missing early return in {bwd_name}"
+        assert "out_ago_gpu_counters" in src, f"Missing out_ago_gpu_counters in {bwd_name}"
+        assert "InterlockedAdd(out_ago_gpu_counters[2], 1u)" in src, f"Missing executed tile counter in {bwd_name}"
+        assert "InterlockedAdd(out_ago_gpu_counters[3], 1u)" in src, f"Missing skipped tile counter in {bwd_name}"
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +224,91 @@ def test_gpu_s104_frozen_visible_tile_skip_preserves_exact_mixed_gradients(tmp_p
     # 2. Active group 1 (including splats occluded by frozen-visible group 0) must match < 1e-4
     active_diff = float(np.max(np.abs(opt_xyz[active_mask] - ref_xyz[active_mask])))
     assert active_diff < 1e-4, f"Active xyz mismatch for variant {bwd_variant}: max_diff={active_diff}"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("RUN_GPU_TESTS", "0") != "1",
+    reason="GPU S104 tests run serially under Coordinator control (set RUN_GPU_TESTS=1)",
+)
+def test_gpu_s104_device_executed_counters_and_envelope_fences(tmp_path):
+    """Phase 12 Lane A: verify real device-side GPU counters, zero fabrication, and S3 fence accounting."""
+    import append_scenario as sc
+
+    ds = sc.build_dataset(tmp_path / "ds_s104_counters", n_points=2048, w=128, h=96, structured=True)
+    vk = sc.new_trainer(ds, tmp_path / "out_s104_counters", mcmc_protect_structural_groups=True)
+    vk.set_external_strategy_mode(True)
+
+    n = int(len(vk.xyz_ws))
+    n_excl = int(round(0.8 * n))
+    gids = np.zeros(n, dtype=np.int32)
+    gids[n_excl:] = 1
+    vk.set_splat_group_ids(gids)
+    vk.set_group_state(0, 0)
+    vk.set_group_state(1, 0)
+
+    # (a) Profiling disabled -> device_executed_counters values must all be None (zero fabrication)
+    vk.set_ago_stage_profiling(False)
+    vk.train_step(0, 1)
+    st_off = vk.ago_get_stage_telemetry()
+    assert st_off["instrumentation_enabled"] is False
+    assert all(v is None for v in st_off["device_executed_counters"].values())
+    assert st_off["workload_funnel"]["visible_gaussians"] is None
+
+    # (b) Profiling enabled -> exact device-side counts + visible_gaussians populated
+    vk.set_ago_stage_profiling(True)
+    vk.train_step(0, 2)
+    st_full = vk.ago_get_stage_telemetry()
+    dc_full = st_full["device_executed_counters"]
+    assert isinstance(dc_full["gpu_projected_gaussians"], int) and dc_full["gpu_projected_gaussians"] > 0
+    assert isinstance(dc_full["gpu_tile_intersections"], int) and dc_full["gpu_tile_intersections"] > 0
+    assert isinstance(dc_full["gpu_backward_tiles_executed"], int) and dc_full["gpu_backward_tiles_executed"] > 0
+    assert dc_full["gpu_backward_tiles_skipped"] == 0
+    assert st_full["workload_funnel"]["visible_gaussians"] == dc_full["gpu_projected_gaussians"]
+
+    # Excluding 80% invisible chunk dramatically drops both gpu_projected_gaussians and gpu_tile_intersections
+    vk.ago_set_group_render_excluded(0, True)
+    vk.train_step(0, 3)
+    st_excl = vk.ago_get_stage_telemetry()
+    dc_excl = st_excl["device_executed_counters"]
+    assert dc_excl["gpu_projected_gaussians"] > 0
+    assert dc_excl["gpu_tile_intersections"] > 0
+    assert dc_excl["gpu_projected_gaussians"] < dc_full["gpu_projected_gaussians"] * 0.5, (
+        f"Expected dramatic drop in gpu_projected_gaussians: full={dc_full}, excl={dc_excl}"
+    )
+    assert dc_excl["gpu_tile_intersections"] < dc_full["gpu_tile_intersections"] * 0.5, (
+        f"Expected dramatic drop in gpu_tile_intersections: full={dc_full}, excl={dc_excl}"
+    )
+    assert st_excl["workload_funnel"]["visible_gaussians"] == dc_excl["gpu_projected_gaussians"]
+
+    # Restore group 0 and freeze spatial left half -> gpu_backward_tiles_skipped > 0
+    vk.ago_set_group_render_excluded(0, False)
+    xyz = np.asarray(vk.xyz_ws, dtype=np.float32)
+    med_x = float(np.median(xyz[:, 0]))
+    spatial_gids = np.where(xyz[:, 0] <= med_x, 0, 1).astype(np.int32)
+    vk.set_splat_group_ids(spatial_gids)
+    vk.set_group_state(0, 2)  # FROZEN_VISIBLE (LOCKED)
+    vk.set_group_state(1, 0)  # ACTIVE
+    vk.set_freeze_skip_backward(True)
+    vk.train_step(0, 4)
+    dc_frozen = vk.ago_get_stage_telemetry()["device_executed_counters"]
+    assert dc_frozen["gpu_backward_tiles_skipped"] > 0, (
+        f"Expected frozen spatial half to skip backward tiles: {dc_frozen}"
+    )
+    assert dc_frozen["gpu_backward_tiles_executed"] > 0
+
+    # (c) S3 multi-batch GPU envelope fence accounting: intermediate_sync_count == 0, completion == 1
+    n_train = int(vk.num_train)
+    frames = [i % n_train for i in range(4)]
+    _ = vk.ago_execute_multi_batch_gpu_envelope(frames, first_step=5, budget_cost_units=180.0, param_mask=31)
+    summary = vk.ago_execute_multi_batch_gpu_envelope(frames, first_step=9, budget_cost_units=180.0, param_mask=31)
+    assert summary["steps_executed"] == 4
+    assert summary["cpu_gpu_sync_count"] == 1
+    assert summary["intermediate_sync_count"] == 0
+    assert summary["envelope_completion_fence_count"] == 1
+
+    # Disabling profiling resets device_executed_counters back to None
+    vk.set_ago_stage_profiling(False)
+    st_off2 = vk.ago_get_stage_telemetry()
+    assert all(v is None for v in st_off2["device_executed_counters"].values())
+    assert st_off2["workload_funnel"]["visible_gaussians"] is None
