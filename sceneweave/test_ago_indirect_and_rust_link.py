@@ -162,6 +162,65 @@ def test_rust_bench_replay_zero_hot_path_allocations():
     assert "hot_bytes=0" in proc.stdout, f"Expected hot_bytes=0 in output: {proc.stdout}"
 
 
+def test_s93_and_s100_cpu_bindings_and_default_telemetry():
+    """Verify S93 memory telemetry & S100 stage profiling bindings exist and never fabricate timings."""
+    vk = vksplat.VkSplat()
+    assert hasattr(vk, "ago_offload_snapshot_to_ram")
+    assert hasattr(vk, "ago_restore_snapshot_from_ram")
+    assert hasattr(vk, "ago_get_memory_telemetry")
+    assert hasattr(vk, "set_ago_stage_profiling")
+    assert hasattr(vk, "get_ago_stage_profiling")
+    assert hasattr(vk, "ago_get_stage_telemetry")
+
+    mem = vk.ago_get_memory_telemetry()
+    assert set(mem.keys()) >= {
+        "gpu_device_allocated_bytes",
+        "host_snapshot_bytes",
+        "staging_bytes",
+        "is_gpu_evicted",
+        "rss_bytes",
+    }
+    assert mem["gpu_device_allocated_bytes"] == 0
+    assert mem["host_snapshot_bytes"] == 0
+    assert mem["staging_bytes"] == 0
+    assert mem["is_gpu_evicted"] is False
+    assert mem["rss_bytes"] > 0
+
+    assert vk.get_ago_stage_profiling() is False
+    st = vk.ago_get_stage_telemetry()
+    assert st["instrumentation_enabled"] is False
+    expected_stages = {
+        "projection_ms",
+        "tile_intersect_sort_ms",
+        "forward_raster_ms",
+        "backward_raster_ms",
+        "optimizer_ms",
+        "ago_selection_ms",
+    }
+    assert set(st["stage_timings_ms"].keys()) == expected_stages
+    assert all(st["stage_timings_ms"][k] is None for k in expected_stages)
+
+    expected_funnel = {
+        "total_stored_gaussians",
+        "gpu_resident_gaussians",
+        "projection_candidates",
+        "visible_gaussians",
+        "backward_active_gaussians",
+        "geometry_updated_gaussians",
+        "frozen_gaussians",
+    }
+    assert set(st["workload_funnel"].keys()) == expected_funnel
+    assert st["workload_funnel"]["visible_gaussians"] is None
+
+    vk.set_ago_stage_profiling(True)
+    assert vk.get_ago_stage_profiling() is True
+    st_enabled = vk.ago_get_stage_telemetry()
+    assert st_enabled["instrumentation_enabled"] is True
+    assert all(st_enabled["stage_timings_ms"][k] is None for k in expected_stages)
+    vk.set_ago_stage_profiling(False)
+    assert vk.get_ago_stage_profiling() is False
+
+
 # ---------------------------------------------------------------------------
 # (b) GPU-Marked Phase 11 Tests (Coordinator runs serially with RUN_GPU_TESTS=1)
 # ---------------------------------------------------------------------------
@@ -312,3 +371,117 @@ def test_gpu_ago_false_color_render_and_bit_exact_restore(tmp_path):
     assert np.array_equal(np.array(vk.rotations, copy=True), rot_before), "rotations mutated!"
     assert np.array_equal(np.array(vk.scales, copy=True), scales_before), "scales mutated!"
     assert np.array_equal(np.array(vk.opacities, copy=True), opac_before), "opacities mutated!"
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("RUN_GPU_TESTS", "0") != "1",
+    reason="GPU Phase 11 tests run serially under Coordinator control (set RUN_GPU_TESTS=1)",
+)
+def test_s93_gpu_eviction_and_immediate_post_restore_render(tmp_path):
+    """S93: Verify real GPU buffer eviction drops gpu_device_allocated_bytes and immediate post-restore render matches."""
+    vk = _make_warmed_trainer(tmp_path, "p11_s93_evict")
+    n_splats = int(len(vk.xyz_ws))
+    assert n_splats > 0
+
+    ref_render = vk.render_val_depth(0)
+    ref_rgb = np.array(ref_render["rgb"], copy=True)
+    ref_depth = np.array(ref_render["depth_expected"], copy=True)
+
+    mem_before = vk.ago_get_memory_telemetry()
+    assert mem_before["is_gpu_evicted"] is False
+    assert mem_before["gpu_device_allocated_bytes"] > 0
+    assert mem_before["rss_bytes"] > 0
+
+    snap_id = vk.ago_offload_snapshot_to_ram(evict_gpu=True)
+    assert snap_id > 0
+
+    mem_evicted = vk.ago_get_memory_telemetry()
+    assert mem_evicted["is_gpu_evicted"] is True
+    assert mem_evicted["host_snapshot_bytes"] > 0
+    assert mem_evicted["gpu_device_allocated_bytes"] < mem_before["gpu_device_allocated_bytes"] * 0.25
+
+    wf_evicted = vk.ago_get_stage_telemetry()["workload_funnel"]
+    assert wf_evicted["gpu_resident_gaussians"] == 0
+    assert wf_evicted["total_stored_gaussians"] == n_splats
+
+    assert vk.ago_restore_snapshot_from_ram(snap_id) is True
+
+    mem_restored = vk.ago_get_memory_telemetry()
+    assert mem_restored["is_gpu_evicted"] is False
+    assert mem_restored["gpu_device_allocated_bytes"] >= mem_before["gpu_device_allocated_bytes"] * 0.9
+
+    # Immediate render_val_depth(0) BEFORE any extra optimization steps must match ref_render
+    post_render = vk.render_val_depth(0)
+    post_rgb = np.array(post_render["rgb"], copy=True)
+    post_depth = np.array(post_render["depth_expected"], copy=True)
+    assert float(np.max(np.abs(post_rgb - ref_rgb))) < 1e-4
+    assert float(np.max(np.abs(post_depth - ref_depth))) < 1e-4
+
+    # Subsequent training step must also work cleanly after re-allocation
+    vk.train_step(0, 3)
+    assert vk.ago_drop_ram_snapshot(snap_id) is True
+    assert vk.ago_get_memory_telemetry()["host_snapshot_bytes"] == 0
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(
+    os.environ.get("RUN_GPU_TESTS", "0") != "1",
+    reason="GPU Phase 11 tests run serially under Coordinator control (set RUN_GPU_TESTS=1)",
+)
+def test_s100_stage_telemetry_and_workload_funnel(tmp_path):
+    """S100: Verify opt-in per-stage Vulkan timestamps (None when disabled, >0 when enabled) and workload funnel."""
+    vk = _make_warmed_trainer(tmp_path, "p11_s100_stages")
+    n_splats = int(len(vk.xyz_ws))
+
+    # 1. Profiling disabled -> all stage timings must be None (never fabricated 0.0)
+    vk.set_ago_stage_profiling(False)
+    vk.train_step(0, 3)
+    st_off = vk.ago_get_stage_telemetry()
+    assert st_off["instrumentation_enabled"] is False
+    assert all(v is None for v in st_off["stage_timings_ms"].values())
+
+    # 2. Profiling enabled -> real >0 Vulkan stage timestamps on training step + AGO selection
+    vk.set_ago_stage_profiling(True)
+    vk.select_ago_active_set_gpu_async(target_fraction=1.0, newborn_warmup_steps=0.0, selection_mode=0)
+    vk.train_step(0, 4)
+    st_on = vk.ago_get_stage_telemetry()
+    assert st_on["instrumentation_enabled"] is True
+    for k in (
+        "projection_ms",
+        "tile_intersect_sort_ms",
+        "forward_raster_ms",
+        "backward_raster_ms",
+        "optimizer_ms",
+        "ago_selection_ms",
+    ):
+        val = st_on["stage_timings_ms"][k]
+        assert val is not None and np.isfinite(val) and val > 0.0, f"Expected real >0 ms for {k}, got {val}"
+
+    # 3. Workload funnel: PARAM_SH (16) -> geometry_updated_gaussians == 0
+    vk.set_ago_param_mask(16)
+    wf_sh = vk.ago_get_stage_telemetry()["workload_funnel"]
+    assert wf_sh["total_stored_gaussians"] == n_splats
+    assert wf_sh["gpu_resident_gaussians"] == n_splats
+    assert wf_sh["projection_candidates"] == n_splats
+    assert wf_sh["frozen_gaussians"] == 0
+    assert wf_sh["backward_active_gaussians"] == n_splats
+    assert wf_sh["geometry_updated_gaussians"] == 0
+
+    # Restore PARAM_ALL (31) -> geometry_updated_gaussians == backward_active_gaussians
+    vk.set_ago_param_mask(31)
+    wf_all = vk.ago_get_stage_telemetry()["workload_funnel"]
+    assert wf_all["geometry_updated_gaussians"] == wf_all["backward_active_gaussians"] == n_splats
+
+    # 4. Freeze group 0 (half of splats) -> frozen_gaussians increases, backward_active_gaussians shrinks
+    assert vk.ago_execute_external_op(vksplat.AgoOperationType.FREEZE, 0) == vksplat.AgoCompletionStatus.OK
+    wf_frozen = vk.ago_get_stage_telemetry()["workload_funnel"]
+    assert wf_frozen["frozen_gaussians"] == n_splats // 2
+    assert wf_frozen["backward_active_gaussians"] == n_splats - wf_frozen["frozen_gaussians"]
+    assert wf_frozen["geometry_updated_gaussians"] == wf_frozen["backward_active_gaussians"]
+
+    # 5. Disabling profiling resets timings back to None
+    vk.set_ago_stage_profiling(False)
+    st_off2 = vk.ago_get_stage_telemetry()
+    assert st_off2["instrumentation_enabled"] is False
+    assert all(v is None for v in st_off2["stage_timings_ms"].values())

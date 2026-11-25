@@ -535,9 +535,7 @@ VulkanGSPipeline::GpuMemoryStats VulkanGSPipeline::getGpuMemoryStats(size_t pipe
     constexpr double kInvMiB = 1.0 / (1024.0 * 1024.0);
     GpuMemoryStats stats;
     const size_t dev_bytes = std::max(current_vram, pipeline_buffers_bytes);
-    size_t staging_bytes = stager.allocSize + append_stage.allocSize;
-    for (const auto& s : upload_slots)
-        staging_bytes += s.allocSize;
+    const size_t staging_bytes = getStagingAllocBytes();
     stats.device_buffers_mb = static_cast<double>(dev_bytes) * kInvMiB;
     stats.peak_device_buffers_mb = static_cast<double>(std::max(peak_vram, dev_bytes)) * kInvMiB;
     stats.staging_buffers_mb = static_cast<double>(staging_bytes) * kInvMiB;
@@ -845,6 +843,9 @@ void VulkanGSPipeline::resetAgoTimestamps(uint32_t first_query, uint32_t query_c
         return;
     }
     const uint32_t clamped = std::min(query_count, kAgoTimestampQueryCount - first_query);
+    for (uint32_t q = first_query; q < first_query + clamped; ++q) {
+        ago_query_written_[q] = false;
+    }
     vkCmdResetQueryPool(command_buffer, ago_timestamp_query_pool_, first_query, clamped);
 }
 
@@ -856,14 +857,16 @@ void VulkanGSPipeline::writeAgoTimestamp(uint32_t query_index, VkPipelineStageFl
         return;
     }
     vkCmdWriteTimestamp(command_buffer, stage, ago_timestamp_query_pool_, query_index);
+    ago_query_written_[query_index] = true;
 }
 
-double VulkanGSPipeline::readTimestampDeltaMs(uint32_t start_query, uint32_t end_query) const {
+std::optional<double> VulkanGSPipeline::readTimestampDeltaMsOptional(uint32_t start_query, uint32_t end_query) const {
     if (!timestamp_queries_enabled || ago_timestamp_query_pool_ == VK_NULL_HANDLE ||
         timestamp_period_ns_ <= 0.0 ||
         start_query >= kAgoTimestampQueryCount || end_query >= kAgoTimestampQueryCount ||
-        end_query <= start_query) {
-        return 0.0;
+        end_query <= start_query ||
+        !ago_query_written_[start_query] || !ago_query_written_[end_query]) {
+        return std::nullopt;
     }
     const uint32_t count = (end_query - start_query) + 1u;
     std::vector<uint64_t> values(count, 0u);
@@ -878,14 +881,18 @@ double VulkanGSPipeline::readTimestampDeltaMs(uint32_t start_query, uint32_t end
         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
     );
     if (qr != VK_SUCCESS) {
-        return 0.0;
+        return std::nullopt;
     }
     const uint64_t t0 = values.front();
     const uint64_t t1 = values.back();
     if (t1 < t0) {
-        return 0.0;
+        return std::nullopt;
     }
     return static_cast<double>(t1 - t0) * timestamp_period_ns_ * 1e-6;
+}
+
+double VulkanGSPipeline::readTimestampDeltaMs(uint32_t start_query, uint32_t end_query) const {
+    return readTimestampDeltaMsOptional(start_query, end_query).value_or(0.0);
 }
 
 void VulkanGSPipeline::beginDebugLabel(const char* name, float r, float g, float b, float a) {

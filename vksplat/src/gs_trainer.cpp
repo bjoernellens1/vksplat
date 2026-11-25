@@ -1827,8 +1827,14 @@ void VulkanGSTrainer::select_ago_active_set_gpu_async(
 
     // Single non-blocking command batch: histogram -> on-device cutoff -> indirect compaction.
     // ZERO synchronous host readbacks.
+    const bool outer_batch = isCommandBatchInProgress();
+    const bool profile_sel = ago_stage_profiling_enabled_;
     {
         DEVICE_GUARD;
+        if (profile_sel) {
+            resetAgoTimestamps(kStageQ_AgoSelStart, 2u);
+            writeAgoTimestamp(kStageQ_AgoSelStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
 
         vkCmdFillBuffer(
             command_buffer,
@@ -1941,6 +1947,12 @@ void VulkanGSTrainer::select_ago_active_set_gpu_async(
             VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0, 0, nullptr, 1, &indirect_barrier, 0, nullptr
         );
+        if (profile_sel) {
+            writeAgoTimestamp(kStageQ_AgoSelEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
+    }
+    if (profile_sel && !outer_batch) {
+        collectAgoSelectionStageTiming();
     }
 
     active_splat_count_ = static_cast<uint32_t>(n);
@@ -2266,7 +2278,10 @@ vksplat::ago::CompletionStatus VulkanGSTrainer::ago_execute_external_op(
     }
 }
 
-uint64_t VulkanGSTrainer::ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers) {
+uint64_t VulkanGSTrainer::ago_offload_snapshot_to_ram(
+    VulkanGSPipelineBuffers& buffers,
+    bool evict_gpu
+) {
     HOST_GUARD;
     AgoRamSnapshot snap{};
     snap.num_splats = buffers.num_splats;
@@ -2300,8 +2315,33 @@ uint64_t VulkanGSTrainer::ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& b
     snap.splat_uids = splat_uids;
     snap.splat_anchors_host = splat_anchors_host;
 
+    const size_t snap_num_splats = snap.num_splats;
     const uint64_t id = next_ago_snapshot_id_++;
     ago_ram_snapshots_.emplace(id, std::move(snap));
+
+    if (evict_gpu) {
+        waitIdle();
+        destroyBuffer(buffers.xyz_ws.deviceBuffer);
+        destroyBuffer(buffers.sh_coeffs.deviceBuffer);
+        destroyBuffer(buffers.rotations.deviceBuffer);
+        destroyBuffer(buffers.scales_opacs.deviceBuffer);
+        destroyBuffer(buffers.g_xyz_ws.deviceBuffer);
+        destroyBuffer(buffers.g_sh_coeffs_1.deviceBuffer);
+        destroyBuffer(buffers.g_sh_coeffs_2.deviceBuffer);
+        destroyBuffer(buffers.g_rotations.deviceBuffer);
+        destroyBuffer(buffers.g_scales_opacs.deviceBuffer);
+        destroyBuffer(buffers.group_ids.deviceBuffer);
+        destroyBuffer(buffers.group_state.deviceBuffer);
+        destroyBuffer(buffers.splat_state.deviceBuffer);
+        destroyBuffer(buffers.splat_anchor.deviceBuffer);
+        ago_gpu_evicted_ = true;
+        if (snap_num_splats > 0u) {
+            ago_evicted_splats_ = snap_num_splats;
+        }
+        buffers.num_splats = 0u;
+        invalidateAllComputeDescriptors();
+        invalidateActiveIndexDispatch();
+    }
     return id;
 }
 
@@ -2359,6 +2399,9 @@ bool VulkanGSTrainer::ago_restore_snapshot_from_ram(
     }
 
     ago_last_step_ = snap.ago_last_step;
+    ago_gpu_evicted_ = false;
+    ago_evicted_splats_ = 0u;
+    invalidateAllComputeDescriptors();
     bumpMapGeneration();
     return true;
 }
@@ -2370,6 +2413,150 @@ bool VulkanGSTrainer::ago_drop_ram_snapshot(uint64_t snapshot_id) {
 size_t VulkanGSTrainer::ago_ram_snapshot_bytes(uint64_t snapshot_id) const {
     auto it = ago_ram_snapshots_.find(snapshot_id);
     return (it == ago_ram_snapshots_.end()) ? 0u : it->second.total_bytes();
+}
+
+size_t VulkanGSTrainer::ago_total_ram_snapshot_bytes() const {
+    size_t total = 0u;
+    for (const auto& kv : ago_ram_snapshots_) {
+        total += kv.second.total_bytes();
+    }
+    return total;
+}
+
+size_t VulkanGSTrainer::ago_gpu_device_allocated_bytes(const VulkanGSPipelineBuffers& buffers) const {
+    size_t total = 0u;
+    // Gaussian parameter buffers
+    total += buffers.xyz_ws.deviceBuffer.allocSize;
+    total += buffers.sh_coeffs.deviceBuffer.allocSize;
+    total += buffers.rotations.deviceBuffer.allocSize;
+    total += buffers.scales_opacs.deviceBuffer.allocSize;
+    // Adam optimizer moment buffers
+    total += buffers.g_xyz_ws.deviceBuffer.allocSize;
+    total += buffers.g_sh_coeffs_1.deviceBuffer.allocSize;
+    total += buffers.g_sh_coeffs_2.deviceBuffer.allocSize;
+    total += buffers.g_rotations.deviceBuffer.allocSize;
+    total += buffers.g_scales_opacs.deviceBuffer.allocSize;
+    // Group & splat state buffers
+    total += buffers.group_ids.deviceBuffer.allocSize;
+    total += buffers.group_state.deviceBuffer.allocSize;
+    total += buffers.splat_state.deviceBuffer.allocSize;
+    total += buffers.splat_anchor.deviceBuffer.allocSize;
+    // AGO GPU buffers
+    total += active_indices_buf_.deviceBuffer.allocSize;
+    total += ago_telemetry_buf_.deviceBuffer.allocSize;
+    total += ago_select_summary_buf_.deviceBuffer.allocSize;
+    total += ago_hist_buf_.deviceBuffer.allocSize;
+    total += ago_cutoff_indirect_buf_.deviceBuffer.allocSize;
+    total += ago_region_accum_buf_.deviceBuffer.allocSize;
+    total += ago_structural_cand_buf_.deviceBuffer.allocSize;
+    total += ago_exec_marker_buf_.deviceBuffer.allocSize;
+    total += ago_contrib_step_buf_.deviceBuffer.allocSize;
+    total += ago_abs_grad_step_buf_.deviceBuffer.allocSize;
+    return total;
+}
+
+void VulkanGSTrainer::set_ago_stage_profiling(bool enabled) {
+    ago_stage_profiling_enabled_ = enabled;
+    if (!enabled) {
+        last_ago_stage_timings_ = AgoStageTimings{};
+    }
+}
+
+void VulkanGSTrainer::resetAgoStepStageTimestamps() {
+    if (!ago_stage_profiling_enabled_) {
+        return;
+    }
+    resetAgoTimestamps(kStageQ_ProjStart, 10u);
+}
+
+void VulkanGSTrainer::collectAgoStageTimings() {
+    if (!ago_stage_profiling_enabled_) {
+        return;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_ProjStart, kStageQ_ProjEnd)) {
+        last_ago_stage_timings_.projection_ms = *v;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_TileStart, kStageQ_TileEnd)) {
+        last_ago_stage_timings_.tile_intersect_sort_ms = *v;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_FwdStart, kStageQ_FwdEnd)) {
+        last_ago_stage_timings_.forward_raster_ms = *v;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_BwdStart, kStageQ_BwdEnd)) {
+        last_ago_stage_timings_.backward_raster_ms = *v;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_OptStart, kStageQ_OptEnd)) {
+        last_ago_stage_timings_.optimizer_ms = *v;
+    }
+    collectAgoSelectionStageTiming();
+}
+
+void VulkanGSTrainer::collectAgoSelectionStageTiming() {
+    if (!ago_stage_profiling_enabled_) {
+        return;
+    }
+    if (auto v = readTimestampDeltaMsOptional(kStageQ_AgoSelStart, kStageQ_AgoSelEnd)) {
+        last_ago_stage_timings_.ago_selection_ms = *v;
+    }
+}
+
+VulkanGSTrainer::AgoWorkloadFunnel VulkanGSTrainer::compute_ago_workload_funnel(
+    const TrainerConfig& config,
+    const VulkanGSPipelineBuffers& buffers
+) const {
+    AgoWorkloadFunnel f{};
+    const size_t gpu_n = ago_gpu_evicted_ ? 0u : buffers.num_splats;
+    f.gpu_resident_gaussians = gpu_n;
+    f.total_stored_gaussians = gpu_n + ago_evicted_splats_;
+    f.projection_candidates = gpu_n;
+    f.visible_gaussians = std::nullopt;  // not read back on hot path
+
+    if (gpu_n == 0u) {
+        return f;
+    }
+
+    size_t frozen = 0u;
+    size_t skipped = 0u;
+    size_t imagined_only = 0u;
+    const size_t n_groups = buffers.group_state.size();
+    const size_t n_gids = splat_group_ids.size();
+    const size_t n_states = splat_states.size();
+    for (size_t i = 0u; i < gpu_n; ++i) {
+        const int32_t gid = (i < n_gids) ? splat_group_ids[i] : -1;
+        const uint32_t gstate = (gid >= 0 && static_cast<size_t>(gid) < n_groups)
+            ? buffers.group_state[static_cast<size_t>(gid)]
+            : 0u;
+        const uint32_t raw_st = (i < n_states) ? splat_states[i] : 0xFFFFFFFFu;
+        const uint32_t st = (raw_st == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (raw_st & 0xFFu);
+
+        const bool is_frozen = (gstate == 2u);
+        const bool is_retracted = (gstate == 3u) || (st == 4u);
+        if (is_frozen) {
+            ++frozen;
+        }
+        if (is_frozen || is_retracted) {
+            ++skipped;
+            continue;
+        }
+        const bool is_imagined = (st == 0u) || (st == 0xFFFFFFFFu && gstate == 1u);
+        if (is_imagined) {
+            ++imagined_only;
+        }
+    }
+
+    const size_t non_skipped = (gpu_n >= skipped) ? (gpu_n - skipped) : 0u;
+    size_t bwd_active = non_skipped;
+    if (use_active_index_dispatch_ && !use_ago_indirect_dispatch_) {
+        bwd_active = std::min<size_t>(active_splat_count_, non_skipped);
+    }
+
+    const bool geom_mask_enabled = (config.ago_param_mask & 0x0Fu) != 0u;
+    const size_t geom_eligible = (bwd_active > imagined_only) ? (bwd_active - imagined_only) : 0u;
+
+    f.frozen_gaussians = frozen;
+    f.backward_active_gaussians = bwd_active;
+    f.geometry_updated_gaussians = geom_mask_enabled ? geom_eligible : 0u;
+    return f;
 }
 
 vksplat::ago::SubmitResult VulkanGSTrainer::ago_gpu_submit_action(

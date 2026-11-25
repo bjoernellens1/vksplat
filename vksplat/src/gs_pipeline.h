@@ -8,6 +8,7 @@
 #include <cstring>  // memcpy
 #include <functional>
 #include <array>
+#include <optional>
 #include <variant>
 
 
@@ -80,6 +81,7 @@ public:
     static constexpr uint32_t kAgoTimestampQueryCount = 64;
     void resetAgoTimestamps(uint32_t first_query = 0, uint32_t query_count = kAgoTimestampQueryCount);
     void writeAgoTimestamp(uint32_t query_index, VkPipelineStageFlagBits stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    std::optional<double> readTimestampDeltaMsOptional(uint32_t start_query, uint32_t end_query) const;
     double readTimestampDeltaMs(uint32_t start_query, uint32_t end_query) const;
     // Optional VK_EXT_debug_utils command-buffer labels for RGP / Perfetto correlation (no-op if unavailable).
     void beginDebugLabel(const char* name, float r = 0.2f, float g = 0.6f, float b = 0.9f, float a = 1.0f);
@@ -108,6 +110,13 @@ public:
         { return peak_vram; }
     size_t getCurrentAllocSize() const
         { return current_vram; }
+    size_t getStagingAllocBytes() const {
+        size_t staging = stager.allocSize + append_stage.allocSize;
+        for (const auto& s : upload_slots) {
+            staging += s.allocSize;
+        }
+        return staging;
+    }
 
     struct GpuMemoryStats {
         double device_buffers_mb = 0.0;
@@ -197,10 +206,18 @@ protected:
     void freeAppendStage();
     VkQueryPool timestamp_query_pool;
     VkQueryPool ago_timestamp_query_pool_ = VK_NULL_HANDLE;
+    std::array<bool, kAgoTimestampQueryCount> ago_query_written_{};
     double timestamp_period_ns_ = 0.0;
     bool timestamp_queries_enabled = false;
     PFN_vkCmdBeginDebugUtilsLabelEXT pfn_cmd_begin_debug_label_ = nullptr;
     PFN_vkCmdEndDebugUtilsLabelEXT pfn_cmd_end_debug_label_ = nullptr;
+    void invalidateAllComputeDescriptors() {
+        for (auto* p : all_compute_pipelines) {
+            if (p != nullptr) {
+                p->buffers.clear();
+            }
+        }
+    }
 
     enum class DeviceVendor {
         Unknown,

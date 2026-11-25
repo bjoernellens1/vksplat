@@ -400,11 +400,57 @@ public:
         int32_t group_id = -1
     );
 
-    // AGO-L0: Bit-exact RAM eviction & restoration of Gaussian params, Adam moments, and group states.
-    uint64_t ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers);
+    // AGO-L0 / S93: Bit-exact RAM eviction & restoration of Gaussian params, Adam moments, and group states.
+    uint64_t ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers, bool evict_gpu = false);
     bool ago_restore_snapshot_from_ram(VulkanGSPipelineBuffers& buffers, uint64_t snapshot_id);
     bool ago_drop_ram_snapshot(uint64_t snapshot_id);
     size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const;
+    size_t ago_total_ram_snapshot_bytes() const;
+    size_t ago_gpu_device_allocated_bytes(const VulkanGSPipelineBuffers& buffers) const;
+    bool is_ago_gpu_evicted() const { return ago_gpu_evicted_; }
+    size_t ago_evicted_splats() const { return ago_evicted_splats_; }
+
+    // S100: Per-stage Vulkan timestamp profiling & workload funnel telemetry (opt-in; default disabled).
+    static constexpr uint32_t kStageQ_ProjStart   = 16u;
+    static constexpr uint32_t kStageQ_ProjEnd     = 17u;
+    static constexpr uint32_t kStageQ_TileStart   = 18u;
+    static constexpr uint32_t kStageQ_TileEnd     = 19u;
+    static constexpr uint32_t kStageQ_FwdStart    = 20u;
+    static constexpr uint32_t kStageQ_FwdEnd      = 21u;
+    static constexpr uint32_t kStageQ_BwdStart    = 22u;
+    static constexpr uint32_t kStageQ_BwdEnd      = 23u;
+    static constexpr uint32_t kStageQ_OptStart    = 24u;
+    static constexpr uint32_t kStageQ_OptEnd      = 25u;
+    static constexpr uint32_t kStageQ_AgoSelStart = 26u;
+    static constexpr uint32_t kStageQ_AgoSelEnd   = 27u;
+
+    struct AgoStageTimings {
+        std::optional<double> projection_ms;
+        std::optional<double> tile_intersect_sort_ms;
+        std::optional<double> forward_raster_ms;
+        std::optional<double> backward_raster_ms;
+        std::optional<double> optimizer_ms;
+        std::optional<double> ago_selection_ms;
+    };
+    struct AgoWorkloadFunnel {
+        size_t total_stored_gaussians = 0u;
+        size_t gpu_resident_gaussians = 0u;
+        size_t projection_candidates = 0u;
+        std::optional<size_t> visible_gaussians;
+        size_t backward_active_gaussians = 0u;
+        size_t geometry_updated_gaussians = 0u;
+        size_t frozen_gaussians = 0u;
+    };
+    void set_ago_stage_profiling(bool enabled);
+    bool get_ago_stage_profiling() const { return ago_stage_profiling_enabled_; }
+    void resetAgoStepStageTimestamps();
+    void collectAgoStageTimings();
+    void collectAgoSelectionStageTiming();
+    const AgoStageTimings& get_ago_stage_timings() const { return last_ago_stage_timings_; }
+    AgoWorkloadFunnel compute_ago_workload_funnel(
+        const TrainerConfig& config,
+        const VulkanGSPipelineBuffers& buffers
+    ) const;
 
     // AGO-L0: Non-blocking Vulkan GPU executor wired to trainer device/queue with clean teardown.
     vksplat::ago::NonBlockingGpuExecutor& ago_gpu_executor() { return ago_gpu_executor_; }
@@ -783,6 +829,12 @@ private:
     };
     std::unordered_map<uint64_t, AgoRamSnapshot> ago_ram_snapshots_;
     uint64_t next_ago_snapshot_id_ = 1u;
+    bool ago_gpu_evicted_ = false;
+    size_t ago_evicted_splats_ = 0u;
+
+    // S100: Opt-in per-stage Vulkan timestamp profiling state
+    bool ago_stage_profiling_enabled_ = false;
+    AgoStageTimings last_ago_stage_timings_{};
 
     // Reusable device buffers & pipelines for temporal_depth_reproject.slang
     Buffer<float> treproj_src_depths_;

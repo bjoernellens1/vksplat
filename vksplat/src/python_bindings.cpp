@@ -11,7 +11,11 @@
 #endif
 
 #include <chrono>
+#include <fstream>
 #include <memory>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace py = pybind11;
 
@@ -1331,8 +1335,8 @@ public:
         return trainer.ago_execute_external_op(config, buffers, op, group_id);
     }
 
-    uint64_t ago_offload_snapshot_to_ram() {
-        return trainer.ago_offload_snapshot_to_ram(buffers);
+    uint64_t ago_offload_snapshot_to_ram(bool evict_gpu = false) {
+        return trainer.ago_offload_snapshot_to_ram(buffers, evict_gpu);
     }
 
     bool ago_restore_snapshot_from_ram(uint64_t snapshot_id) {
@@ -1345,6 +1349,80 @@ public:
 
     size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const {
         return trainer.ago_ram_snapshot_bytes(snapshot_id);
+    }
+
+    static uint64_t read_process_rss_bytes() {
+#ifdef __linux__
+        std::ifstream f("/proc/self/statm");
+        uint64_t size_pages = 0u;
+        uint64_t rss_pages = 0u;
+        if (!(f >> size_pages >> rss_pages)) {
+            return 0u;
+        }
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            return 0u;
+        }
+        return rss_pages * static_cast<uint64_t>(page_size);
+#else
+        return 0u;
+#endif
+    }
+
+    py::dict ago_get_memory_telemetry() const {
+        py::dict out;
+        out["gpu_device_allocated_bytes"] = trainer.ago_gpu_device_allocated_bytes(buffers);
+        out["host_snapshot_bytes"] = trainer.ago_total_ram_snapshot_bytes();
+        out["staging_bytes"] = trainer.getStagingAllocBytes();
+        out["is_gpu_evicted"] = trainer.is_ago_gpu_evicted();
+        out["rss_bytes"] = read_process_rss_bytes();
+        return out;
+    }
+
+    void set_ago_stage_profiling(bool enabled) {
+        trainer.set_ago_stage_profiling(enabled);
+    }
+
+    bool get_ago_stage_profiling() const {
+        return trainer.get_ago_stage_profiling();
+    }
+
+    py::dict ago_get_stage_telemetry() const {
+        const bool enabled = trainer.get_ago_stage_profiling();
+        const auto& t = trainer.get_ago_stage_timings();
+        const auto funnel = trainer.compute_ago_workload_funnel(config, buffers);
+
+        auto opt_ms = [enabled](const std::optional<double>& v) -> py::object {
+            if (!enabled || !v.has_value()) {
+                return py::none();
+            }
+            return py::float_(*v);
+        };
+
+        py::dict timings;
+        timings["projection_ms"] = opt_ms(t.projection_ms);
+        timings["tile_intersect_sort_ms"] = opt_ms(t.tile_intersect_sort_ms);
+        timings["forward_raster_ms"] = opt_ms(t.forward_raster_ms);
+        timings["backward_raster_ms"] = opt_ms(t.backward_raster_ms);
+        timings["optimizer_ms"] = opt_ms(t.optimizer_ms);
+        timings["ago_selection_ms"] = opt_ms(t.ago_selection_ms);
+
+        py::dict wf;
+        wf["total_stored_gaussians"] = funnel.total_stored_gaussians;
+        wf["gpu_resident_gaussians"] = funnel.gpu_resident_gaussians;
+        wf["projection_candidates"] = funnel.projection_candidates;
+        wf["visible_gaussians"] = funnel.visible_gaussians.has_value()
+            ? py::object(py::int_(*funnel.visible_gaussians))
+            : py::object(py::none());
+        wf["backward_active_gaussians"] = funnel.backward_active_gaussians;
+        wf["geometry_updated_gaussians"] = funnel.geometry_updated_gaussians;
+        wf["frozen_gaussians"] = funnel.frozen_gaussians;
+
+        py::dict out;
+        out["instrumentation_enabled"] = enabled;
+        out["stage_timings_ms"] = timings;
+        out["workload_funnel"] = wf;
+        return out;
     }
 
     vksplat::ago::SubmitResult ago_gpu_submit_action(const vksplat::ago::AGOAction& action) {
@@ -2391,17 +2469,26 @@ public:
         rasterize_forward();
     }
 
-    void backward_optimize(int step) {
+    void backward_optimize(int step, bool profile = false) {
         auto deviceGuard = DeviceGuard(&trainer);
 
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_BwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         rasterize_backward();
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_BwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_OptStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
 
         try {
             trainer.executeFusedProjectionBackwardOptimizerStep(config, uniforms, buffers, step+1);
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeFusedProjectionBackwardOptimizerStep failed");
         }
-
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_OptEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
     }
 
     void compute_pixel_loss_grad(size_t train_idx, int step) {
@@ -2511,27 +2598,89 @@ public:
     // command batch: the intersection count is read back mid-forward (one extra fence per step).
     void train_step_sync(size_t train_idx, int step) {
         begin_step(train_idx, step);
+        const bool profile = trainer.get_ago_stage_profiling();
+        {
+            auto deviceGuard = DeviceGuard(&trainer);
 
-        auto deviceGuard = DeviceGuard(&trainer);
+            if (profile) {
+                trainer.resetAgoTimestamps(VulkanGSTrainer::kStageQ_ProjStart, 2u);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            projection_forward();
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            }
 
-        forward();
-        compute_pixel_loss_grad(train_idx, step);
-        backward_optimize(step);
+            try {
+                trainer.executeCalculateIndexBufferOffset(buffers);
+            } catch (const std::runtime_error& err) {
+                _THROW_ERROR(std::string(err.what()) + ". trainer.executeCalculateIndexBufferOffset failed");
+            }
+            if (profile) {
+                trainer.resetAgoTimestamps(VulkanGSTrainer::kStageQ_TileStart, 8u);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            if (buffers.num_indices > 0) {
+                try {
+                    trainer.executeGenerateKeys(uniforms, buffers);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeGenerateKeys failed");
+                }
+                try {
+                    trainer.executeSort(uniforms, buffers, -1);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeSort failed");
+                }
+                try {
+                    trainer.executeComputeTileRanges(uniforms, buffers);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeComputeTileRanges failed");
+                }
+            }
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            rasterize_forward();
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            }
 
-        // post_backward_step(step+1);
-        post_backward_step(step);
+            compute_pixel_loss_grad(train_idx, step);
+            backward_optimize(step, profile);
+            post_backward_step(step);
+        }
+        if (profile && !trainer.isCommandBatchInProgress()) {
+            trainer.collectAgoStageTimings();
+        }
     }
 
     // One step recorded into the open gated batch: no host readback and no fence; see step_gate.slang.
     void train_step_gated(size_t train_idx, int step, uint32_t step_in_batch) {
         begin_step(train_idx, step);
         trainer.gateBeginStep(step_in_batch);
+        const bool profile_step = trainer.get_ago_stage_profiling() && (step_in_batch == 0u);
+        if (profile_step) {
+            trainer.resetAgoStepStageTimestamps();
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         projection_forward();
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         const int backward_impl = trainer.sampleBackwardImpl();
         trainer.executeTilesDeferred(uniforms, buffers, trainer.buildGatePlan(uniforms, buffers, backward_impl));
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         rasterize_forward();
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
         compute_pixel_loss_grad(train_idx, step);
-        backward_optimize(step);
+        backward_optimize(step, profile_step);
         post_backward_step(step);
     }
 
@@ -2563,6 +2712,9 @@ public:
                 }
                 trainer.gateEndBatch();
             }  // submit + the one fence of the batch
+            if (trainer.get_ago_stage_profiling()) {
+                trainer.collectAgoStageTimings();
+            }
             const auto result = trainer.gateResult();
             auto& w = PerfTimer::work_counters;
             for (uint32_t i = 0; i < result.steps_done; ++i) {
@@ -2758,6 +2910,9 @@ public:
         out["gpu_selection_ms"] = trainer.readTimestampDeltaMs(0u, 1u);
         out["gpu_active_ms"] = trainer.readTimestampDeltaMs(0u, 2u);
         out["overflow"] = gate_res.overflow;
+        if (trainer.get_ago_stage_profiling()) {
+            trainer.collectAgoStageTimings();
+        }
         return out;
     }
 
@@ -4082,9 +4237,10 @@ PYBIND11_MODULE(vksplat, m) {
              "Execute an explicit AGO-0/L0 external strategy op (FREEZE/REOPEN/RETRACT/PRUNE/REFINE; REJECTED_UNSUPPORTED otherwise)",
              py::arg("op"), py::arg("group_id") = -1)
         .def("ago_offload_snapshot_to_ram", &VkSplat::ago_offload_snapshot_to_ram,
-             "Offload Gaussian params, Adam moments, and group states bit-for-bit to host RAM; returns snapshot_id")
+             "Offload Gaussian params, Adam moments, and group states bit-for-bit to host RAM (optionally evicting GPU device buffers); returns snapshot_id",
+             py::arg("evict_gpu") = false)
         .def("ago_restore_snapshot_from_ram", &VkSplat::ago_restore_snapshot_from_ram,
-             "Restore Gaussian params, Adam moments, and group states bit-for-bit from host RAM snapshot",
+             "Restore Gaussian params, Adam moments, and group states bit-for-bit from host RAM snapshot (re-allocating evicted GPU buffers if needed)",
              py::arg("snapshot_id"))
         .def("ago_drop_ram_snapshot", &VkSplat::ago_drop_ram_snapshot,
              "Release a host RAM snapshot by snapshot_id",
@@ -4092,6 +4248,15 @@ PYBIND11_MODULE(vksplat, m) {
         .def("ago_ram_snapshot_bytes", &VkSplat::ago_ram_snapshot_bytes,
              "Return byte size of a stored host RAM snapshot",
              py::arg("snapshot_id"))
+        .def("ago_get_memory_telemetry", &VkSplat::ago_get_memory_telemetry,
+             "Return exact S93 memory accounting dict (gpu_device_allocated_bytes, host_snapshot_bytes, staging_bytes, is_gpu_evicted, rss_bytes)")
+        .def("set_ago_stage_profiling", &VkSplat::set_ago_stage_profiling,
+             "Enable or disable opt-in S100 per-stage Vulkan timestamp profiling (default False)",
+             py::arg("enabled"))
+        .def("get_ago_stage_profiling", &VkSplat::get_ago_stage_profiling,
+             "Return whether S100 per-stage Vulkan timestamp profiling is enabled")
+        .def("ago_get_stage_telemetry", &VkSplat::ago_get_stage_telemetry,
+             "Return S100 per-stage Vulkan timestamps (None when disabled/unrecorded) and live workload_funnel counts")
         .def("ago_gpu_submit_action", &VkSplat::ago_gpu_submit_action,
              "Submit an AGOAction to the real NonBlockingGpuExecutor (non-blocking)",
              py::arg("action"))
