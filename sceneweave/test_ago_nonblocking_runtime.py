@@ -521,53 +521,57 @@ def test_cpu_tick_latency_under_100us_p95():
     os.environ.get("RUN_GPU_TESTS", "0") != "1",
     reason="GPU parity test runs serially under Coordinator control (set RUN_GPU_TESTS=1)",
 )
-def test_gpu_async_cutoff_parity_and_empty_state():
+def test_gpu_async_cutoff_parity_and_empty_state(tmp_path):
     """
     GPU parity between legacy select_ago_exact_k_gpu (S0) and non-blocking
     select_ago_active_set_gpu_async (P2), plus explicit EMPTY -> groupCountX == 0
     and AGO-0 external_strategy_mode checks.
     """
-    vk = vksplat.VkSplat(str(REPO_ROOT / "vksplat" / "shader") + "/")
-    try:
-        n = 1024
-        vk._set_num_splats(n)
-        vk.set_ago_telemetry_enabled(True)
+    import append_scenario as sc
 
-        # Synthetic per-Gaussian telemetry (8 floats per Gaussian)
-        rng = np.random.default_rng(42)
-        telem = np.zeros((n, 8), dtype=np.float32)
-        telem[:, 2] = rng.uniform(1e-4, 1.0, size=n).astype(np.float32)  # predicted_gain
-        telem[:, 3] = rng.uniform(0.0, 0.1, size=n).astype(np.float32)   # abs_proj_grad
-        telem[:, 4] = 20.0  # update_count >= warmup (mature)
-        telem[:64, 4] = 1.0  # 64 newborns
-        vk.set_ago_telemetry_host(telem.reshape(-1))
+    ds = sc.build_dataset(tmp_path / "ds_async_ago", n_points=1024, w=64, h=48, structured=True)
+    vk = sc.new_trainer(ds, tmp_path / "out_async_ago", mcmc_protect_structural_groups=True)
+    vk.force_backward_variant(1)
+    vk.set_ago_telemetry_enabled(True)
+    vk.reset_ago_telemetry()
+    for s in range(1, 13):
+        vk.train_step(s % int(vk.num_train), s)
 
-        # 1. Partial parity (target_fraction = 0.5)
-        s0 = vk.select_ago_exact_k_gpu(target_fraction=0.5, newborn_warmup_steps=10.0, exclude_frozen=True)
+    n = int(len(vk.xyz_ws))
+    assert n == 1024
+
+    # 1. Partial parity (target_fraction = 0.5)
+    s0 = vk.select_ago_exact_k_gpu(target_fraction=0.5, newborn_warmup_steps=10.0, exclude_frozen=True)
+    vk.select_ago_active_set_gpu_async(target_fraction=0.5, newborn_warmup_steps=10.0, exclude_frozen=True)
+    async_st = vk.get_ago_cutoff_indirect_state()
+    assert async_st["active_set_state"] == int(vksplat.AgoActiveSetState.PARTIAL)
+    assert async_st["selected_count"] == s0["active_count"]
+    assert async_st["group_count_x"] > 0
+
+    # 2. Full parity (target_fraction = 1.0)
+    vk.select_ago_active_set_gpu_async(target_fraction=1.0, newborn_warmup_steps=10.0, exclude_frozen=True)
+    full_st = vk.get_ago_cutoff_indirect_state()
+    assert full_st["active_set_state"] == int(vksplat.AgoActiveSetState.FULL)
+    assert full_st["selected_count"] == n
+    assert full_st["group_count_x"] > 0
+
+    # 3. Empty active set (target_fraction = 0.0) MUST encode EMPTY and groupCountX == 0 (never fallback to full)
+    vk.select_ago_active_set_gpu_async(target_fraction=0.0, newborn_warmup_steps=10.0, exclude_frozen=True)
+    empty_st = vk.get_ago_cutoff_indirect_state()
+    assert empty_st["active_set_state"] == int(vksplat.AgoActiveSetState.EMPTY)
+    assert empty_st["selected_count"] == 0
+    assert empty_st["group_count_x"] == 0
+
+    # 4. AGO-0 external_strategy_mode explicit unsupported-op error
+    vk.set_external_strategy_mode(True)
+    assert vk.get_external_strategy_mode() is True
+    st_unsup = vk.ago_execute_external_op(vksplat.AgoOperationType.MERGE, -1)
+    assert st_unsup == vksplat.AgoCompletionStatus.REJECTED_UNSUPPORTED
+
+    # 5. Latency comparison (0-readback GPU-native cutoff vs S0 2064B readback)
+    t0 = time.perf_counter()
+    for _ in range(50):
         vk.select_ago_active_set_gpu_async(target_fraction=0.5, newborn_warmup_steps=10.0, exclude_frozen=True)
-        async_st = vk.get_ago_cutoff_indirect_state()
-        assert async_st["active_set_state"] == int(vksplat.AgoActiveSetState.PARTIAL)
-        assert async_st["selected_count"] == s0["active_count"]
-        assert async_st["group_count_x"] > 0
-
-        # 2. Full parity (target_fraction = 1.0)
-        vk.select_ago_active_set_gpu_async(target_fraction=1.0, newborn_warmup_steps=10.0, exclude_frozen=True)
-        full_st = vk.get_ago_cutoff_indirect_state()
-        assert full_st["active_set_state"] == int(vksplat.AgoActiveSetState.FULL)
-        assert full_st["selected_count"] == n
-        assert full_st["group_count_x"] > 0
-
-        # 3. Empty active set (target_fraction = 0.0) MUST encode EMPTY and groupCountX == 0 (never fallback to full)
-        vk.select_ago_active_set_gpu_async(target_fraction=0.0, newborn_warmup_steps=10.0, exclude_frozen=True)
-        empty_st = vk.get_ago_cutoff_indirect_state()
-        assert empty_st["active_set_state"] == int(vksplat.AgoActiveSetState.EMPTY)
-        assert empty_st["selected_count"] == 0
-        assert empty_st["group_count_x"] == 0
-
-        # 4. AGO-0 external_strategy_mode explicit unsupported-op error
-        vk.set_external_strategy_mode(True)
-        assert vk.get_external_strategy_mode() is True
-        st_unsup = vk.ago_execute_external_op(vksplat.AgoOperationType.MERGE, -1)
-        assert st_unsup == vksplat.AgoCompletionStatus.REJECTED_UNSUPPORTED
-    finally:
-        vk.cleanup()
+    t_async_ms = (time.perf_counter() - t0) * 1000.0 / 50.0
+    print(f"\n[P2 GPU-Native Zero-Readback Cutoff N={n}] avg={t_async_ms:.4f} ms/call (0 bytes host readback)")
+    assert t_async_ms < 0.5
