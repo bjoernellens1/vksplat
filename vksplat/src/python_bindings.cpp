@@ -4,8 +4,11 @@
 #include "gs_renderer.h"
 #include "buffer.h"
 #include "gs_trainer.h"
+#include "ago/core/scheduler.h"
+#include "ago/runtime/gpu_executor.h"
 
 #include <chrono>
+#include <memory>
 
 namespace py = pybind11;
 
@@ -16,6 +19,7 @@ public:
     VulkanGSRendererUniforms uniforms;
     VulkanGSPipelineBuffers buffers;
     TrainerConfig config;
+    std::unique_ptr<vksplat::ago::AgoScheduler> ago_scheduler_;
     bool isect_capacity_forced = false;  // test hook: skip the proactive capacity growth once
     size_t last_isects = 0;  // intersection count of the last gated step (sizes the next batch)
     const _VulkanBuffer* current_train_depth_buf = nullptr;  // active frame's depth+weight GPU buffer when D1 depth loss is enabled
@@ -180,6 +184,8 @@ public:
             "appearance_init",
             "ago_select_active_set",
             "ago_gain_histogram",
+            "ago_histogram_cutoff",
+            "ago_select_active_set_indirect",
             "temporal_depth_reproject_scatter",
             "temporal_depth_reproject_finalize",
         };
@@ -312,6 +318,8 @@ public:
         config.rasterize_backward_pin_after = train_config.contains(py::str("rasterize_backward_pin_after"))
             ? train_config["rasterize_backward_pin_after"].cast<int>() : 20;
         trainer.setBackwardPinAfter((size_t)std::max(config.rasterize_backward_pin_after, 0));
+        config.external_strategy_mode = train_config.contains(py::str("external_strategy_mode"))
+            ? train_config["external_strategy_mode"].cast<bool>() : false;
 
         // load dataset
         trainer.load_colmap_dataset(config, buffers);
@@ -1194,6 +1202,104 @@ public:
         return _ago_summary_to_dict(s);
     }
 
+    void select_ago_active_set_gpu_async(
+        float target_fraction = 0.5f,
+        float newborn_warmup_steps = 10.0f,
+        bool exclude_frozen = true,
+        uint32_t max_budget_splats = 0u
+    ) {
+        trainer.select_ago_active_set_gpu_async(
+            config, buffers, target_fraction, newborn_warmup_steps, exclude_frozen, max_budget_splats
+        );
+    }
+
+    py::dict get_ago_cutoff_indirect_state() {
+        const auto st = trainer.get_ago_cutoff_indirect_state();
+        py::dict d;
+        d["group_count_x"] = st.group_count_x;
+        d["group_count_y"] = st.group_count_y;
+        d["group_count_z"] = st.group_count_z;
+        d["cutoff_bin"] = st.cutoff_bin;
+        d["boundary_quota"] = st.boundary_quota;
+        d["selected_count"] = st.selected_count;
+        d["active_set_state"] = st.active_set_state;
+        d["selection_mode"] = st.selection_mode;
+        d["eligible_count"] = st.eligible_count;
+        d["newborn_count"] = st.newborn_count;
+        d["total_predicted_gain"] = st.total_predicted_gain;
+        d["max_predicted_gain"] = st.max_predicted_gain;
+        return d;
+    }
+
+    void set_external_strategy_mode(bool enabled) {
+        config.external_strategy_mode = enabled;
+    }
+
+    bool get_external_strategy_mode() const {
+        return config.external_strategy_mode;
+    }
+
+    vksplat::ago::CompletionStatus ago_execute_external_op(
+        vksplat::ago::OperationType op,
+        int32_t group_id = -1
+    ) {
+        return trainer.ago_execute_external_op(config, buffers, op, group_id);
+    }
+
+    void ago_scheduler_init(const vksplat::ago::SchedulerConfig& cfg = {}) {
+        ago_scheduler_ = std::make_unique<vksplat::ago::AgoScheduler>(cfg, nullptr);
+    }
+
+    vksplat::ago::TickResult ago_scheduler_tick() {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        return ago_scheduler_->tick();
+    }
+
+    bool ago_scheduler_enqueue_action(const vksplat::ago::AGOAction& action) {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        return ago_scheduler_->enqueue_action(action);
+    }
+
+    bool ago_scheduler_push_evidence(const vksplat::ago::EvidenceMessage& msg) {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        if (msg.critical ||
+            msg.kind == vksplat::ago::EvidenceKind::POSE_REVISION ||
+            msg.kind == vksplat::ago::EvidenceKind::CONTRADICTION ||
+            msg.kind == vksplat::ago::EvidenceKind::STRUCTURAL_COMPLETION) {
+            return ago_scheduler_->push_critical_evidence(msg);
+        }
+        return ago_scheduler_->push_telemetry_evidence(msg);
+    }
+
+    void ago_scheduler_set_budget(const vksplat::ago::DeadlineBudget& budget) {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        ago_scheduler_->publish_deadline_budget(budget);
+    }
+
+    vksplat::ago::SchedulerSummary ago_scheduler_summary() {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        return ago_scheduler_->latest_summary();
+    }
+
+    std::vector<vksplat::ago::EventTraceEntry> ago_scheduler_trace() {
+        if (!ago_scheduler_) {
+            ago_scheduler_init();
+        }
+        std::vector<vksplat::ago::EventTraceEntry> out;
+        ago_scheduler_->event_trace().snapshot(out);
+        return out;
+    }
+
     py::dict reproject_temporal_depth_gpu(
         py::array_t<float, py::array::c_style | py::array::forcecast> src_depths,
         py::array_t<float, py::array::c_style | py::array::forcecast> src_c2ws,
@@ -1980,6 +2086,9 @@ public:
     }
 
     void post_backward_step(int step) {
+        if (config.external_strategy_mode) {
+            return;
+        }
         if (config.strategy == TrainerConfig::Strategy::Default) {
             try {
                 trainer.executeDefaultPostBackward(config, uniforms, buffers, step);
@@ -2854,6 +2963,232 @@ public:
 
 PYBIND11_MODULE(vksplat, m) {
     m.doc() = "Vulkan Gaussian Rasterization Python Bindings";
+
+    // -------------------------------------------------------------------------
+    // Native C++ Non-Blocking AGO Control Plane Bindings (P1 + P3)
+    // Registered before VkSplat so default arguments (e.g. SchedulerConfig) convert cleanly.
+    // -------------------------------------------------------------------------
+    {
+        using namespace vksplat::ago;
+
+        py::enum_<ServiceClass>(m, "AgoServiceClass")
+            .value("P0_CONSISTENCY", ServiceClass::P0_CONSISTENCY)
+            .value("P1_LIVE_MAP", ServiceClass::P1_LIVE_MAP)
+            .value("P2_REFINEMENT", ServiceClass::P2_REFINEMENT)
+            .value("P3_PREDICTIVE", ServiceClass::P3_PREDICTIVE)
+            .value("P4_MAINTENANCE", ServiceClass::P4_MAINTENANCE);
+
+        py::enum_<ActiveSetState>(m, "AgoActiveSetState")
+            .value("EMPTY", ActiveSetState::EMPTY)
+            .value("PARTIAL", ActiveSetState::PARTIAL)
+            .value("FULL", ActiveSetState::FULL)
+            .value("INVALID", ActiveSetState::INVALID);
+
+        py::enum_<OperationType>(m, "AgoOperationType")
+            .value("REFINE", OperationType::REFINE)
+            .value("FREEZE", OperationType::FREEZE)
+            .value("REOPEN", OperationType::REOPEN)
+            .value("INSERT", OperationType::INSERT)
+            .value("CLONE", OperationType::CLONE)
+            .value("SPLIT", OperationType::SPLIT)
+            .value("MERGE", OperationType::MERGE)
+            .value("PRUNE", OperationType::PRUNE)
+            .value("RELOCATE", OperationType::RELOCATE)
+            .value("REANCHOR", OperationType::REANCHOR)
+            .value("RETRACT", OperationType::RETRACT)
+            .value("TRANSFORM", OperationType::TRANSFORM)
+            .value("PARTITION_MOVE", OperationType::PARTITION_MOVE)
+            .value("LOD_CHANGE", OperationType::LOD_CHANGE)
+            .value("SERIALIZE", OperationType::SERIALIZE)
+            .value("RESTORE", OperationType::RESTORE)
+            .value("PREFETCH", OperationType::PREFETCH)
+            .value("EVICT", OperationType::EVICT);
+
+        py::enum_<EvidenceKind>(m, "AgoEvidenceKind")
+            .value("FRAME_OBSERVATION", EvidenceKind::FRAME_OBSERVATION)
+            .value("POSE_REVISION", EvidenceKind::POSE_REVISION)
+            .value("CONTRADICTION", EvidenceKind::CONTRADICTION)
+            .value("COVERAGE_UPDATE", EvidenceKind::COVERAGE_UPDATE)
+            .value("TELEMETRY_SUMMARY", EvidenceKind::TELEMETRY_SUMMARY)
+            .value("STRUCTURAL_COMPLETION", EvidenceKind::STRUCTURAL_COMPLETION)
+            .value("DEADLINE_BUDGET_UPDATE", EvidenceKind::DEADLINE_BUDGET_UPDATE)
+            .value("SHUTDOWN_SIGNAL", EvidenceKind::SHUTDOWN_SIGNAL);
+
+        py::enum_<CompletionStatus>(m, "AgoCompletionStatus")
+            .value("OK", CompletionStatus::OK)
+            .value("REJECTED_STALE", CompletionStatus::REJECTED_STALE)
+            .value("REJECTED_NO_CREDITS", CompletionStatus::REJECTED_NO_CREDITS)
+            .value("REJECTED_UNSUPPORTED", CompletionStatus::REJECTED_UNSUPPORTED)
+            .value("REJECTED_INVALID", CompletionStatus::REJECTED_INVALID)
+            .value("FAILED_EXECUTION", CompletionStatus::FAILED_EXECUTION)
+            .value("CANCELLED", CompletionStatus::CANCELLED);
+
+        py::enum_<SubmitResult>(m, "AgoSubmitResult")
+            .value("OK", SubmitResult::OK)
+            .value("NO_CREDITS", SubmitResult::NO_CREDITS)
+            .value("INVALID_ACTION", SubmitResult::INVALID_ACTION)
+            .value("UNSUPPORTED_OP", SubmitResult::UNSUPPORTED_OP)
+            .value("DEVICE_ERROR", SubmitResult::DEVICE_ERROR);
+
+        py::enum_<TraceEventType>(m, "AgoTraceEventType")
+            .value("EVIDENCE_CRITICAL", TraceEventType::EVIDENCE_CRITICAL)
+            .value("EVIDENCE_TELEMETRY", TraceEventType::EVIDENCE_TELEMETRY)
+            .value("COMPLETION_IN", TraceEventType::COMPLETION_IN)
+            .value("ACTION_ADMITTED", TraceEventType::ACTION_ADMITTED)
+            .value("ACTION_REJECTED_STALE", TraceEventType::ACTION_REJECTED_STALE)
+            .value("ACTION_REJECTED_BUDGET", TraceEventType::ACTION_REJECTED_BUDGET)
+            .value("ACTION_REJECTED_CREDITS", TraceEventType::ACTION_REJECTED_CREDITS)
+            .value("ACTION_REJECTED_UNSUPPORTED", TraceEventType::ACTION_REJECTED_UNSUPPORTED)
+            .value("ACTION_SUBMIT_FAILED", TraceEventType::ACTION_SUBMIT_FAILED)
+            .value("TICK_SUMMARY", TraceEventType::TICK_SUMMARY);
+
+        py::class_<EvidenceMessage>(m, "AgoEvidenceMessage")
+            .def(py::init<>())
+            .def_readwrite("kind", &EvidenceMessage::kind)
+            .def_readwrite("region_id", &EvidenceMessage::region_id)
+            .def_readwrite("map_version", &EvidenceMessage::map_version)
+            .def_readwrite("pose_version", &EvidenceMessage::pose_version)
+            .def_readwrite("evidence_version", &EvidenceMessage::evidence_version)
+            .def_readwrite("timestamp_ms", &EvidenceMessage::timestamp_ms)
+            .def_readwrite("magnitude", &EvidenceMessage::magnitude)
+            .def_readwrite("flags", &EvidenceMessage::flags)
+            .def_readwrite("critical", &EvidenceMessage::critical);
+
+        py::class_<AGOAction>(m, "AgoAction")
+            .def(py::init<>())
+            .def_readwrite("action_id", &AGOAction::action_id)
+            .def_readwrite("region_id", &AGOAction::region_id)
+            .def_readwrite("service_class", &AGOAction::service_class)
+            .def_readwrite("op", &AGOAction::op)
+            .def_readwrite("required_map_version", &AGOAction::required_map_version)
+            .def_readwrite("required_pose_version", &AGOAction::required_pose_version)
+            .def_readwrite("required_evidence_version", &AGOAction::required_evidence_version)
+            .def_readwrite("expected_gain", &AGOAction::expected_gain)
+            .def_readwrite("estimated_cost_ms", &AGOAction::estimated_cost_ms)
+            .def_readwrite("max_splats", &AGOAction::max_splats)
+            .def_readwrite("target_fraction", &AGOAction::target_fraction)
+            .def_readwrite("requires_exclusive_region", &AGOAction::requires_exclusive_region)
+            .def_readwrite("requires_gpu", &AGOAction::requires_gpu);
+
+        py::class_<DeadlineBudget>(m, "AgoDeadlineBudget")
+            .def(py::init<>())
+            .def_readwrite("now_ms", &DeadlineBudget::now_ms)
+            .def_readwrite("next_deadline_ms", &DeadlineBudget::next_deadline_ms)
+            .def_readwrite("reserved_ms", &DeadlineBudget::reserved_ms)
+            .def_readwrite("inflight_ms", &DeadlineBudget::inflight_ms)
+            .def_readwrite("safety_margin_ms", &DeadlineBudget::safety_margin_ms)
+            .def("available_ms", &DeadlineBudget::available_ms);
+
+        py::class_<AdmissionConfig>(m, "AgoAdmissionConfig")
+            .def(py::init<>())
+            .def_readwrite("max_inflight_actions", &AdmissionConfig::max_inflight_actions)
+            .def_readwrite("maintenance_floor_interval_ticks", &AdmissionConfig::maintenance_floor_interval_ticks)
+            .def_readwrite("min_cost_epsilon_ms", &AdmissionConfig::min_cost_epsilon_ms);
+
+        py::class_<SchedulerConfig>(m, "AgoSchedulerConfig")
+            .def(py::init<>())
+            .def_readwrite("max_completions_per_tick", &SchedulerConfig::max_completions_per_tick)
+            .def_readwrite("max_critical_evidence_per_tick", &SchedulerConfig::max_critical_evidence_per_tick)
+            .def_readwrite("max_telemetry_evidence_per_tick", &SchedulerConfig::max_telemetry_evidence_per_tick)
+            .def_readwrite("max_admissions_per_tick", &SchedulerConfig::max_admissions_per_tick)
+            .def_readwrite("max_pending_actions", &SchedulerConfig::max_pending_actions)
+            .def_readwrite("critical_queue_capacity", &SchedulerConfig::critical_queue_capacity)
+            .def_readwrite("telemetry_queue_capacity", &SchedulerConfig::telemetry_queue_capacity)
+            .def_readwrite("max_regions", &SchedulerConfig::max_regions)
+            .def_readwrite("trace_capacity", &SchedulerConfig::trace_capacity)
+            .def_readwrite("admission", &SchedulerConfig::admission);
+
+        py::class_<TickResult>(m, "AgoTickResult")
+            .def_readonly("tick_index", &TickResult::tick_index)
+            .def_readonly("completions_processed", &TickResult::completions_processed)
+            .def_readonly("critical_evidence_processed", &TickResult::critical_evidence_processed)
+            .def_readonly("telemetry_evidence_processed", &TickResult::telemetry_evidence_processed)
+            .def_readonly("actions_admitted", &TickResult::actions_admitted)
+            .def_readonly("stale_actions_pruned", &TickResult::stale_actions_pruned)
+            .def_readonly("budget_rejections", &TickResult::budget_rejections)
+            .def_readonly("credit_rejections", &TickResult::credit_rejections)
+            .def_readonly("tick_duration_us", &TickResult::tick_duration_us);
+
+        py::class_<SchedulerSummary>(m, "AgoSchedulerSummary")
+            .def_readonly("tick_count", &SchedulerSummary::tick_count)
+            .def_readonly("map_version", &SchedulerSummary::map_version)
+            .def_readonly("pose_version", &SchedulerSummary::pose_version)
+            .def_readonly("evidence_version", &SchedulerSummary::evidence_version)
+            .def_readonly("inflight_count", &SchedulerSummary::inflight_count)
+            .def_readonly("queued_actions", &SchedulerSummary::queued_actions)
+            .def_readonly("dirty_regions", &SchedulerSummary::dirty_regions)
+            .def_readonly("total_admitted", &SchedulerSummary::total_admitted)
+            .def_readonly("total_completed", &SchedulerSummary::total_completed)
+            .def_readonly("total_rejected_stale", &SchedulerSummary::total_rejected_stale)
+            .def_readonly("total_rejected_budget", &SchedulerSummary::total_rejected_budget)
+            .def_readonly("total_rejected_credits", &SchedulerSummary::total_rejected_credits)
+            .def_readonly("total_rejected_unsupported", &SchedulerSummary::total_rejected_unsupported)
+            .def_readonly("total_failed", &SchedulerSummary::total_failed)
+            .def_readonly("total_dropped_telemetry", &SchedulerSummary::total_dropped_telemetry)
+            .def_readonly("total_critical_backpressure", &SchedulerSummary::total_critical_backpressure)
+            .def_readonly("last_tick_us", &SchedulerSummary::last_tick_us)
+            .def_readonly("available_budget_ms", &SchedulerSummary::available_budget_ms);
+
+        py::class_<EventTraceEntry>(m, "AgoEventTraceEntry")
+            .def_readonly("tick", &EventTraceEntry::tick)
+            .def_readonly("event_type", &EventTraceEntry::event_type)
+            .def_readonly("action_id", &EventTraceEntry::action_id)
+            .def_readonly("region_id", &EventTraceEntry::region_id)
+            .def_readonly("service_class", &EventTraceEntry::service_class)
+            .def_readonly("op", &EventTraceEntry::op)
+            .def_readonly("status", &EventTraceEntry::status)
+            .def_readonly("value", &EventTraceEntry::value);
+
+        py::class_<SimulatedAgoExecutor>(m, "SimulatedAgoExecutor")
+            .def(py::init<uint32_t, uint32_t>(),
+                 py::arg("ring_slots") = 4u,
+                 py::arg("default_latency_ticks") = 1u)
+            .def("advance_ticks", &SimulatedAgoExecutor::advance_ticks, py::arg("ticks") = 1u)
+            .def("set_stalled", &SimulatedAgoExecutor::set_stalled, py::arg("stalled"))
+            .def("set_fail_next_completion", &SimulatedAgoExecutor::set_fail_next_completion, py::arg("fail"))
+            .def("set_unsupported_op_mask", &SimulatedAgoExecutor::set_unsupported_op_mask, py::arg("mask"))
+            .def("set_default_latency_ticks", &SimulatedAgoExecutor::set_default_latency_ticks, py::arg("ticks"))
+            .def("available_credits", &SimulatedAgoExecutor::available_credits)
+            .def("inflight_count", &SimulatedAgoExecutor::inflight_count)
+            .def("inflight_cost_ms", &SimulatedAgoExecutor::inflight_cost_ms)
+            .def("total_submitted", &SimulatedAgoExecutor::total_submitted)
+            .def("total_completed", &SimulatedAgoExecutor::total_completed)
+            .def("submitted_order", &SimulatedAgoExecutor::submitted_order)
+            .def("clear_history", &SimulatedAgoExecutor::clear_history);
+
+        py::class_<AgoScheduler>(m, "AgoScheduler")
+            .def(py::init([](const SchedulerConfig& cfg, SimulatedAgoExecutor* exec) {
+                return std::make_unique<AgoScheduler>(cfg, exec);
+            }), py::arg("config") = SchedulerConfig{}, py::arg("executor") = nullptr,
+                py::keep_alive<1, 3>())
+            .def("push_critical_evidence", &AgoScheduler::push_critical_evidence, py::arg("msg"))
+            .def("push_telemetry_evidence", &AgoScheduler::push_telemetry_evidence, py::arg("msg"))
+            .def("publish_deadline_budget", &AgoScheduler::publish_deadline_budget, py::arg("budget"))
+            .def("enqueue_action", &AgoScheduler::enqueue_action, py::arg("action"))
+            .def("tick", &AgoScheduler::tick)
+            .def("try_consume_summary", [](AgoScheduler& self) -> py::object {
+                SchedulerSummary out{};
+                if (self.try_consume_summary(out)) {
+                    return py::cast(out);
+                }
+                return py::none();
+            })
+            .def("latest_summary", &AgoScheduler::latest_summary)
+            .def("trace_snapshot", [](const AgoScheduler& self) {
+                std::vector<EventTraceEntry> out;
+                self.event_trace().snapshot(out);
+                return out;
+            })
+            .def("set_region_frozen", &AgoScheduler::set_region_frozen, py::arg("region_id"), py::arg("frozen"))
+            .def("set_region_retracted", &AgoScheduler::set_region_retracted, py::arg("region_id"), py::arg("retracted"))
+            .def("map_version", &AgoScheduler::map_version)
+            .def("pose_version", &AgoScheduler::pose_version)
+            .def("evidence_version", &AgoScheduler::evidence_version)
+            .def("bump_map_version", &AgoScheduler::bump_map_version, py::arg("delta") = 1u)
+            .def("bump_pose_version", &AgoScheduler::bump_pose_version, py::arg("delta") = 1u)
+            .def("region_count", [](const AgoScheduler& self) { return self.dirty_tracker().region_count(); })
+            .def("dirty_queue_size", [](const AgoScheduler& self) { return self.dirty_tracker().dirty_queue_size(); });
+    }
     
     py::class_<VkSplat>(m, "VkSplat")
         .def(py::init<>())
@@ -3079,6 +3414,40 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("target_fraction") = 0.5f,
              py::arg("newborn_warmup_steps") = 10.0f,
              py::arg("exclude_frozen") = true)
+        .def("select_ago_active_set_gpu_async", &VkSplat::select_ago_active_set_gpu_async,
+             "Fully GPU-native histogram -> cutoff -> compaction in a single command batch with zero synchronous host readbacks",
+             py::arg("target_fraction") = 0.5f,
+             py::arg("newborn_warmup_steps") = 10.0f,
+             py::arg("exclude_frozen") = true,
+             py::arg("max_budget_splats") = 0u)
+        .def("get_ago_cutoff_indirect_state", &VkSplat::get_ago_cutoff_indirect_state,
+             "Diagnostic host readback of the 12-word GPU ago_cutoff_indirect_buf_ (tests/verification only)")
+        .def("set_external_strategy_mode", &VkSplat::set_external_strategy_mode,
+             "Enable or disable AGO-0 external strategy ownership mode (disables internal ADC/MCMC/reset_opa)",
+             py::arg("enabled"))
+        .def("get_external_strategy_mode", &VkSplat::get_external_strategy_mode,
+             "Return whether AGO-0 external strategy ownership mode is active")
+        .def("ago_execute_external_op", &VkSplat::ago_execute_external_op,
+             "Execute an explicit AGO-0 external strategy op (returns REJECTED_UNSUPPORTED for unsupported ops)",
+             py::arg("op"), py::arg("group_id") = -1)
+        .def("ago_scheduler_init", &VkSplat::ago_scheduler_init,
+             "Initialize integrated native C++ AgoScheduler",
+             py::arg("config") = vksplat::ago::SchedulerConfig{})
+        .def("ago_scheduler_tick", &VkSplat::ago_scheduler_tick,
+             "Execute one bounded non-blocking AgoScheduler tick")
+        .def("ago_scheduler_enqueue_action", &VkSplat::ago_scheduler_enqueue_action,
+             "Enqueue an AGOAction into the integrated AgoScheduler",
+             py::arg("action"))
+        .def("ago_scheduler_push_evidence", &VkSplat::ago_scheduler_push_evidence,
+             "Push an EvidenceMessage into the integrated AgoScheduler",
+             py::arg("msg"))
+        .def("ago_scheduler_set_budget", &VkSplat::ago_scheduler_set_budget,
+             "Publish a DeadlineBudget snapshot into the integrated AgoScheduler",
+             py::arg("budget"))
+        .def("ago_scheduler_summary", &VkSplat::ago_scheduler_summary,
+             "Return the latest SchedulerSummary from the integrated AgoScheduler")
+        .def("ago_scheduler_trace", &VkSplat::ago_scheduler_trace,
+             "Return chronological EventTrace snapshot from the integrated AgoScheduler")
         .def("reproject_temporal_depth_gpu", &VkSplat::reproject_temporal_depth_gpu,
              "GPU temporal depth reprojection of historical depth maps into target viewpoint with atomic uint32 z-buffer, view-angle cosine weighting, and valid-support count",
              py::arg("src_depths"),

@@ -3,6 +3,7 @@
 #include "gs_renderer.h"
 
 #include "colmap_reader.h"
+#include "ago/core/action_protocol.h"
 
 #include <random>
 #include <atomic>
@@ -126,6 +127,9 @@ struct TrainerConfig {
     // >0: stop exploring the rasterize-backward variants after this many timing updates and keep the
     // fastest measured one (0 = keep sampling, the default).
     int rasterize_backward_pin_after = 20;
+    // AGO-0 External Strategy Ownership: when true, disables internal ADC densification,
+    // MCMC growth/relocation, and global opacity resets so AGO owns splat lifecycle.
+    bool external_strategy_mode = false;
 };
 
 
@@ -237,6 +241,7 @@ public:
     void set_active_indices_gpu(const std::vector<uint32_t>& active_indices, size_t total_splats);
     void invalidateActiveIndexDispatch() {
         use_active_index_dispatch_ = false;
+        use_ago_indirect_dispatch_ = false;
         active_splat_count_ = 0u;
     }
     void bumpMapGeneration() {
@@ -291,6 +296,44 @@ public:
         float newborn_warmup_steps = 10.0f,
         bool exclude_frozen = true
     );
+
+    // P2: Fully GPU-native histogram -> cutoff -> compaction in a single command batch
+    // with ZERO synchronous host readbacks. Writes VkDispatchIndirectCommand into
+    // `ago_cutoff_indirect_buf_` with ActiveSetState::EMPTY -> groupCountX = 0.
+    struct AgoCutoffIndirectState {
+        uint32_t group_count_x = 0u;
+        uint32_t group_count_y = 1u;
+        uint32_t group_count_z = 1u;
+        uint32_t cutoff_bin = 256u;
+        uint32_t boundary_quota = 0u;
+        uint32_t selected_count = 0u;
+        uint32_t active_set_state = static_cast<uint32_t>(vksplat::ago::ActiveSetState::EMPTY);
+        uint32_t selection_mode = 0u;
+        uint32_t eligible_count = 0u;
+        uint32_t newborn_count = 0u;
+        float total_predicted_gain = 0.0f;
+        float max_predicted_gain = 0.0f;
+    };
+    void select_ago_active_set_gpu_async(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float target_fraction = 0.5f,
+        float newborn_warmup_steps = 10.0f,
+        bool exclude_frozen = true,
+        uint32_t max_budget_splats = 0u
+    );
+    AgoCutoffIndirectState get_ago_cutoff_indirect_state();
+    bool get_use_ago_indirect_dispatch() const { return use_ago_indirect_dispatch_; }
+
+    // AGO-0: External strategy operation dispatch (explicitly returns REJECTED_UNSUPPORTED
+    // for unsupported ops rather than silently falling back).
+    vksplat::ago::CompletionStatus ago_execute_external_op(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        vksplat::ago::OperationType op,
+        int32_t group_id = -1
+    );
+
     AgoActiveSetSummary get_ago_step_gain_summary(size_t current_num_gaussians) const;
 
     // GPU Temporal Depth Reprojection (atomic uint32 z-buffer + view-angle cosine weight + support count)
@@ -616,8 +659,12 @@ private:
     // AGO-2 GPU-resident active-set compaction, 256-bin log-gain histogram, & summary buffers
     Buffer<uint32_t> ago_select_summary_buf_;
     Buffer<uint32_t> ago_hist_buf_;
+    Buffer<uint32_t> ago_cutoff_indirect_buf_;
+    bool use_ago_indirect_dispatch_ = false;
     _ComputePipeline pipeline_ago_select_active_set = _ComputePipeline(6);
     _ComputePipeline pipeline_ago_gain_histogram = _ComputePipeline(5);
+    _ComputePipeline pipeline_ago_histogram_cutoff = _ComputePipeline(2);
+    _ComputePipeline pipeline_ago_select_active_set_indirect = _ComputePipeline(7);
     AgoActiveSetSummary last_ago_summary_{};
     float ago_prev_mean_gain_ = 0.0f;
 

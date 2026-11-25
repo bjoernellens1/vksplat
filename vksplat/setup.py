@@ -23,6 +23,10 @@ ext_modules = [
             "src/gs_renderer.cpp",
             "src/gs_trainer.cpp",
             "src/perf_timer.cpp",
+            "src/ago/spatial/dirty_tracking.cpp",
+            "src/ago/core/admission_control.cpp",
+            "src/ago/core/scheduler.cpp",
+            "src/ago/runtime/gpu_executor.cpp",
             "src/python_bindings.cpp",
         ],
         include_dirs=[
