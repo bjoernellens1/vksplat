@@ -125,12 +125,14 @@ void main(
     bool is_surfel_2d = false;
     {
         const uint32_t raw_st = splat_state[g_idx];
+        if (is_splat_frozen_invisible(raw_st))
+            return;
         const uint32_t st = splat_base_state(raw_st);
         is_surfel_2d = is_splat_surfel_2d(raw_st);
         const int32_t gid = group_ids[g_idx];
         if (gid >= 0 && uint32_t(gid) < uniforms.num_groups) {
             const uint32_t gstate = group_state[gid];
-            if (gstate == 3u)
+            if (gstate == 3u || gstate == GROUP_STATE_EXCLUDED_RENDER)
                 return;
             if (gstate == 2u && uniforms.protect_locked_groups != 0u)
                 return;

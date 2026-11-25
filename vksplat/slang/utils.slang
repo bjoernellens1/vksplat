@@ -773,7 +773,7 @@ struct Uniforms {
     float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
     float depth_huber_delta;   // Huber delta in meters
     float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
-    float _pad_depth;
+    uint render_exclude_flags; // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER present, bit 1: splat_state FROZEN_INVISIBLE present
 }
 
 // Per-splat evidence states (Sub-Plan V17.7) + SURFEL_2D primitive flag (defined in config.slang)
@@ -803,7 +803,10 @@ uint splat_freeze_mode(int32_t splat_id, uint freeze_flags, uint num_groups,
     if (freeze_flags == 0 || splat_id < 0)
         return 0;
     if ((freeze_flags & 4u) != 0) {
-        const uint32_t st = splat_base_state(splat_state[splat_id]);
+        const uint32_t raw_st = splat_state[splat_id];
+        if (is_splat_frozen_invisible(raw_st))
+            return 2;
+        const uint32_t st = splat_base_state(raw_st);
         if (st == SPLAT_STATE_PREDICTED_UNOBSERVED)
             return 1;
         if (st == SPLAT_STATE_CONTRADICTED)
@@ -815,7 +818,7 @@ uint splat_freeze_mode(int32_t splat_id, uint freeze_flags, uint num_groups,
     if (gid < 0 || uint32_t(gid) >= num_groups)
         return 0;
     const uint32_t state = group_state[gid];
-    if (state == 3u)
+    if (state == 3u || state == GROUP_STATE_EXCLUDED_RENDER)
         return 2;
     if (state == 1u && (freeze_flags & 1u) != 0)
         return 1;

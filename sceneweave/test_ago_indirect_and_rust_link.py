@@ -208,6 +208,7 @@ def test_s93_and_s100_cpu_bindings_and_default_telemetry():
         "backward_active_gaussians",
         "geometry_updated_gaussians",
         "frozen_gaussians",
+        "frozen_invisible_gaussians",
     }
     assert set(st["workload_funnel"].keys()) == expected_funnel
     assert st["workload_funnel"]["visible_gaussians"] is None

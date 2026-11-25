@@ -114,12 +114,18 @@ void VulkanGSRenderer::executeProjectionForward(
 
     size_t num_splats = buffers.num_splats;
 
-    bufferMemoryBarrier({
+    std::vector<std::pair<_VulkanBuffer, BarrierMask>> proj_barriers = {
         { buffers.xyz_ws.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
         { buffers.sh_coeffs.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
         { buffers.rotations.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
         { buffers.scales_opacs.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE },
-    }, COMPUTE_SHADER_READ);
+    };
+    if (uniforms.render_exclude_flags != 0u) {
+        proj_barriers.push_back({ buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
+        proj_barriers.push_back({ buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
+        proj_barriers.push_back({ buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_WRITE });
+    }
+    bufferMemoryBarrier(proj_barriers, COMPUTE_SHADER_READ);
 
     size_t alloc_size = std::max(num_splats, alloc_reserve);
     executeCompute(
@@ -140,6 +146,10 @@ void VulkanGSRenderer::executeProjectionForward(
             reserveDeviceBuffer(buffers.depths, alloc_size),
             reserveDeviceBuffer(buffers.inv_cov_vs_opacity, 4*alloc_size),
             reserveDeviceBuffer(buffers.rgb, 3*alloc_size),
+            // S104: group & per-splat tables (read only when uniforms.render_exclude_flags != 0)
+            uniforms.render_exclude_flags ? buffers.group_ids.deviceBuffer : sparse_active_tiles,
+            uniforms.render_exclude_flags ? buffers.group_state.deviceBuffer : sparse_active_tiles,
+            uniforms.render_exclude_flags ? buffers.splat_state.deviceBuffer : sparse_active_tiles,
         }
     );
 

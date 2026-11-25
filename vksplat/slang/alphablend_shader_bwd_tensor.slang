@@ -34,6 +34,7 @@ groupshared float splat_embeds[TILE_SIZE][6];  // 6 KB or 8 KB
 
 groupshared float2 shared_alpha[SPLAT_BATCH_SIZE][TILE_SIZE];  // 2..64 KB for SPLAT_BATCH_SIZE=1..32
 groupshared float3 shared_rgb[TILE_SIZE];  // 3 KB or 4 KB
+groupshared uint tile_has_active_splat;
 
 #if GROUP_REDUCE_BEFORE_ATOMIC
 groupshared float reduce_splats[PIXEL_NUM_BATCHES][SPLAT_BATCH_SIZE][6];  // 6 KB or 8 KB
@@ -123,6 +124,33 @@ void main(
     uint pixel_batch_rank = groupThreadID.x / SPLAT_BATCH_SIZE;
     uint group_thread_rank = pixel_batch_rank * SPLAT_BATCH_SIZE + thread_rank;
 
+    uint32_t tile_idx_start = tile_ranges[tile_idx];
+    uint32_t tile_idx_end = tile_ranges[tile_idx+1];
+    if (tile_idx_start >= tile_idx_end)
+        return;
+
+    // S104: Active-tile backward early-exit — skip frozen-only tiles before reading pixel buffers.
+    if (uniforms.freeze_flags != 0u) {
+        if (group_thread_rank == 0u) {
+            tile_has_active_splat = 0u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        bool local_has_active = false;
+        for (uint32_t s = tile_idx_start + group_thread_rank; s < tile_idx_end; s += TILE_SIZE) {
+            int32_t g_id = sorted_gauss_idx[s];
+            if (splat_freeze_mode(g_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state) != 2u) {
+                local_has_active = true;
+                break;
+            }
+        }
+        if (WaveActiveAnyTrue(local_has_active) && WaveIsFirstLane()) {
+            InterlockedOr(tile_has_active_splat, 1u);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tile_has_active_splat == 0u)
+            return;
+    }
+
     const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
     const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f);
 
@@ -161,9 +189,6 @@ void main(
             shared_g_D_eff[pi] = g_D_eff;
         }
     }
-
-    uint32_t tile_idx_start = tile_ranges[tile_idx];
-    uint32_t tile_idx_end = tile_ranges[tile_idx+1];
 
     int sg_max_contrib = WaveActiveMax(n_contrib_fwd);
     if (WaveIsFirstLane()) {

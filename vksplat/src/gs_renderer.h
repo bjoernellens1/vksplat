@@ -28,7 +28,7 @@ PACK_STRUCT(struct VulkanGSRendererUniforms {
     float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
     float depth_huber_delta;   // Huber delta in meters
     float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
-    float _pad_depth;
+    uint32_t render_exclude_flags;  // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER present, bit 1: splat_state FROZEN_INVISIBLE present
 });
 
 
@@ -131,7 +131,7 @@ protected:
         Buffer<int32_t> &output_buffer
     );
 
-    _ComputePipeline pipeline_projection_forward = _ComputePipeline(11);
+    _ComputePipeline pipeline_projection_forward = _ComputePipeline(14);
     _ComputePipeline pipeline_generate_keys = _ComputePipeline(7);
     _ComputePipeline pipeline_step_gate = _ComputePipeline(4);
     _ComputePipeline pipeline_sparse_residual = _ComputePipeline(3);

@@ -113,6 +113,9 @@ layout(binding=7) RWStructuredBuffer<float2> out_xy_vs;
 layout(binding=8) RWStructuredBuffer<float> out_depths;
 layout(binding=9) RWStructuredBuffer<float4> out_inv_cov_vs;
 layout(binding=10) RWStructuredBuffer<float> out_rgb;
+layout(binding=11) StructuredBuffer<int32_t> group_ids;     // S104: read only when uniforms.render_exclude_flags != 0
+layout(binding=12) StructuredBuffer<uint32_t> group_state;
+layout(binding=13) StructuredBuffer<uint32_t> splat_state;
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
@@ -163,6 +166,35 @@ void main(
     
     if (g_idx >= uniforms.num_splats)
         return;
+
+  #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
+    // S104: Pre-projection spatial chunk exclusion (FROZEN_INVISIBLE / GROUP_STATE_EXCLUDED_RENDER).
+    // Culled splats emit zero tiles and zero sort entries; FROZEN_VISIBLE (state 2) stays in the render-active set.
+    if (uniforms.render_exclude_flags != 0u) {
+        bool excluded = false;
+        if ((uniforms.render_exclude_flags & 2u) != 0u && is_splat_frozen_invisible(splat_state[g_idx])) {
+            excluded = true;
+        }
+        if (!excluded && (uniforms.render_exclude_flags & 1u) != 0u) {
+            const int32_t gid = group_ids[g_idx];
+            if (gid >= 0 && uint32_t(gid) < uniforms.num_groups &&
+                group_state[gid] == GROUP_STATE_EXCLUDED_RENDER) {
+                excluded = true;
+            }
+        }
+        if (excluded) {
+            out_radii[g_idx] = 0;
+            out_tiles_touched[g_idx] = 0;
+          #if USE_EMULATED_INT64
+            out_rect_tile_space[2*g_idx+0] = 0;
+            out_rect_tile_space[2*g_idx+1] = 0;
+          #else
+            out_rect_tile_space[g_idx] = int64_t(0);
+          #endif
+            return;
+        }
+    }
+  #endif
 
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
     // no overlap
