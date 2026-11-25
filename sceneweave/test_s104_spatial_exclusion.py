@@ -93,7 +93,6 @@ def test_gpu_s104_invisible_chunk_exclusion_reduces_projection_and_sort(tmp_path
 
     ds = sc.build_dataset(tmp_path / "ds_s104_excl", n_points=4096, w=128, h=96, structured=True)
     vk = sc.new_trainer(ds, tmp_path / "out_s104_excl", mcmc_protect_structural_groups=True)
-    vk.force_backward_variant(0)
     vk.set_external_strategy_mode(True)
     vk.set_ago_stage_profiling(True)
 
@@ -156,14 +155,14 @@ def test_gpu_s104_frozen_visible_tile_skip_preserves_exact_mixed_gradients(tmp_p
     vk_opt = sc.new_trainer(ds, tmp_path / f"out_opt_{bwd_variant}", mcmc_protect_structural_groups=True)
 
     for vk in (vk_ref, vk_opt):
-        vk.force_backward_variant(bwd_variant)
+        try:
+            vk.force_backward_variant(bwd_variant)
+        except ValueError as exc:
+            pytest.skip(f"backward variant {bwd_variant} unavailable on this device: {exc}")
         vk.set_external_strategy_mode(True)
 
-    # Synchronize identical initial state before divergence
-    init_snap = vk_ref.get_snapshot()
-    vk_opt.load_snapshot(init_snap)
-
     xyz0 = np.asarray(vk_ref.xyz_ws, dtype=np.float32).copy()
+    assert np.allclose(xyz0, np.asarray(vk_opt.xyz_ws, dtype=np.float32), atol=1e-6)
     # Partition by x coordinate: left half frozen-visible (group 0), right half active (group 1).
     # Boundary tiles are mixed (frozen-visible + active occlusion); far-left tiles are frozen-only.
     med_x = float(np.median(xyz0[:, 0]))
