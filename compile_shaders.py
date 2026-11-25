@@ -359,6 +359,11 @@ class ShaderCompiler:
             ShaderJob("ago_histogram_cutoff", {}),
         ], ["config.slang"]))
 
+        # GPU-resident 6-component RegionPriorityVector & bounded structural candidate selector
+        jobs.append(("ago_region_vector_priority.slang", [
+            ShaderJob("ago_region_vector_priority", {}),
+        ], ["config.slang"]))
+
         # GPU temporal depth reprojection (atomic uint32 z-buffer + cosine weight + support count)
         jobs.append(("temporal_depth_reproject.slang", [
             ShaderJob("temporal_depth_reproject_scatter", {"ENTRY": 0}),

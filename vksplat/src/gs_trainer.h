@@ -325,16 +325,71 @@ public:
         float total_predicted_gain = 0.0f;
         float max_predicted_gain = 0.0f;
     };
+    void ensureAgoSelectionBuffers(VulkanGSPipelineBuffers& buffers);
     void select_ago_active_set_gpu_async(
         const TrainerConfig& config,
         VulkanGSPipelineBuffers& buffers,
         float target_fraction = 0.5f,
         float newborn_warmup_steps = 10.0f,
         bool exclude_frozen = true,
-        uint32_t max_budget_splats = 0u
+        uint32_t max_budget_splats = 0u,
+        uint32_t selection_mode = 0u,
+        float budget_cost_units = 0.0f
     );
     AgoCutoffIndirectState get_ago_cutoff_indirect_state();
     bool get_use_ago_indirect_dispatch() const { return use_ago_indirect_dispatch_; }
+
+    // P11-B: GPU-resident 6-component RegionPriorityVector & bounded structural candidates
+    struct AgoRegionPriorityVector {
+        uint32_t region_id = 0u;
+        uint32_t splat_count = 0u;
+        uint32_t eligible_count = 0u;
+        float u_geom = 0.0f;
+        float u_app = 0.0f;
+        float u_split = 0.0f;
+        float u_birth = 0.0f;
+        float u_merge = 0.0f;
+        float u_corr = 0.0f;
+        uint32_t dominant_op = 0u;  // 0=REFINE_GEOM, 1=REFINE_APP, 2=SPLIT, 3=BIRTH, 4=MERGE_PRUNE, 5=CORRECTION
+        uint32_t eligibility_flags = 0u;
+    };
+    struct AgoStructuralCandidates {
+        std::vector<uint32_t> split_candidate_indices;
+        std::vector<uint32_t> prune_candidate_indices;
+        uint32_t split_candidates_total = 0u;
+        uint32_t prune_candidates_total = 0u;
+    };
+    std::vector<AgoRegionPriorityVector> compute_ago_region_priority_vectors(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    );
+    AgoStructuralCandidates compute_ago_structural_candidates(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        uint32_t max_split = 64u,
+        uint32_t max_prune = 64u,
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    );
+    std::pair<size_t, size_t> dispatchAgoRegionPriorityPass(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        uint32_t max_split,
+        uint32_t max_prune,
+        float split_scale_thresh,
+        float split_grad_thresh,
+        float prune_opacity_thresh,
+        float merge_scale_thresh,
+        float newborn_warmup_steps
+    );
 
     // AGO-0 / AGO-L0: External strategy operation dispatch (explicitly returns REJECTED_UNSUPPORTED
     // for unsupported ops rather than silently falling back).
@@ -345,11 +400,57 @@ public:
         int32_t group_id = -1
     );
 
-    // AGO-L0: Bit-exact RAM eviction & restoration of Gaussian params, Adam moments, and group states.
-    uint64_t ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers);
+    // AGO-L0 / S93: Bit-exact RAM eviction & restoration of Gaussian params, Adam moments, and group states.
+    uint64_t ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers, bool evict_gpu = false);
     bool ago_restore_snapshot_from_ram(VulkanGSPipelineBuffers& buffers, uint64_t snapshot_id);
     bool ago_drop_ram_snapshot(uint64_t snapshot_id);
     size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const;
+    size_t ago_total_ram_snapshot_bytes() const;
+    size_t ago_gpu_device_allocated_bytes(const VulkanGSPipelineBuffers& buffers) const;
+    bool is_ago_gpu_evicted() const { return ago_gpu_evicted_; }
+    size_t ago_evicted_splats() const { return ago_evicted_splats_; }
+
+    // S100: Per-stage Vulkan timestamp profiling & workload funnel telemetry (opt-in; default disabled).
+    static constexpr uint32_t kStageQ_ProjStart   = 16u;
+    static constexpr uint32_t kStageQ_ProjEnd     = 17u;
+    static constexpr uint32_t kStageQ_TileStart   = 18u;
+    static constexpr uint32_t kStageQ_TileEnd     = 19u;
+    static constexpr uint32_t kStageQ_FwdStart    = 20u;
+    static constexpr uint32_t kStageQ_FwdEnd      = 21u;
+    static constexpr uint32_t kStageQ_BwdStart    = 22u;
+    static constexpr uint32_t kStageQ_BwdEnd      = 23u;
+    static constexpr uint32_t kStageQ_OptStart    = 24u;
+    static constexpr uint32_t kStageQ_OptEnd      = 25u;
+    static constexpr uint32_t kStageQ_AgoSelStart = 26u;
+    static constexpr uint32_t kStageQ_AgoSelEnd   = 27u;
+
+    struct AgoStageTimings {
+        std::optional<double> projection_ms;
+        std::optional<double> tile_intersect_sort_ms;
+        std::optional<double> forward_raster_ms;
+        std::optional<double> backward_raster_ms;
+        std::optional<double> optimizer_ms;
+        std::optional<double> ago_selection_ms;
+    };
+    struct AgoWorkloadFunnel {
+        size_t total_stored_gaussians = 0u;
+        size_t gpu_resident_gaussians = 0u;
+        size_t projection_candidates = 0u;
+        std::optional<size_t> visible_gaussians;
+        size_t backward_active_gaussians = 0u;
+        size_t geometry_updated_gaussians = 0u;
+        size_t frozen_gaussians = 0u;
+    };
+    void set_ago_stage_profiling(bool enabled);
+    bool get_ago_stage_profiling() const { return ago_stage_profiling_enabled_; }
+    void resetAgoStepStageTimestamps();
+    void collectAgoStageTimings();
+    void collectAgoSelectionStageTiming();
+    const AgoStageTimings& get_ago_stage_timings() const { return last_ago_stage_timings_; }
+    AgoWorkloadFunnel compute_ago_workload_funnel(
+        const TrainerConfig& config,
+        const VulkanGSPipelineBuffers& buffers
+    ) const;
 
     // AGO-L0: Non-blocking Vulkan GPU executor wired to trainer device/queue with clean teardown.
     vksplat::ago::NonBlockingGpuExecutor& ago_gpu_executor() { return ago_gpu_executor_; }
@@ -683,11 +784,14 @@ private:
     Buffer<uint32_t> ago_select_summary_buf_;
     Buffer<uint32_t> ago_hist_buf_;
     Buffer<uint32_t> ago_cutoff_indirect_buf_;
+    Buffer<uint32_t> ago_region_accum_buf_;
+    Buffer<uint32_t> ago_structural_cand_buf_;
     bool use_ago_indirect_dispatch_ = false;
     _ComputePipeline pipeline_ago_select_active_set = _ComputePipeline(6);
     _ComputePipeline pipeline_ago_gain_histogram = _ComputePipeline(5);
     _ComputePipeline pipeline_ago_histogram_cutoff = _ComputePipeline(2);
     _ComputePipeline pipeline_ago_select_active_set_indirect = _ComputePipeline(7);
+    _ComputePipeline pipeline_ago_region_vector_priority = _ComputePipeline(7);
     AgoActiveSetSummary last_ago_summary_{};
     float ago_prev_mean_gain_ = 0.0f;
 
@@ -725,6 +829,12 @@ private:
     };
     std::unordered_map<uint64_t, AgoRamSnapshot> ago_ram_snapshots_;
     uint64_t next_ago_snapshot_id_ = 1u;
+    bool ago_gpu_evicted_ = false;
+    size_t ago_evicted_splats_ = 0u;
+
+    // S100: Opt-in per-stage Vulkan timestamp profiling state
+    bool ago_stage_profiling_enabled_ = false;
+    AgoStageTimings last_ago_stage_timings_{};
 
     // Reusable device buffers & pipelines for temporal_depth_reproject.slang
     Buffer<float> treproj_src_depths_;

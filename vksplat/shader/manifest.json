@@ -204,11 +204,20 @@
         },
         "ago_histogram_cutoff.slang": {
             "sources": {
-                "slang/ago_histogram_cutoff.slang": "cb32285a341f84d9c8bb417ff41244bb7c111a4756000f2023dc60672c416c43",
+                "slang/ago_histogram_cutoff.slang": "232d1024729e2ca0c229e042471002b4e9cf9c35048815c71d82b36ca9dd57cd",
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
             },
             "outputs": {
-                "shader/generated/ago_histogram_cutoff.spv": "9e1888fed0bc8c5f4603690bf8214b3dabd974f0eac142cd2b23783c5a34100b"
+                "shader/generated/ago_histogram_cutoff.spv": "ad20ef8ab00d1db0f53eb63b8a9a4b67c8297670a5f1d3a74830e0db28c202d5"
+            }
+        },
+        "ago_region_vector_priority.slang": {
+            "sources": {
+                "slang/ago_region_vector_priority.slang": "4147707d4cb196eba907a953072cb6e82de733f797160117f9ccb4e2c8fec3bd",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
+            },
+            "outputs": {
+                "shader/generated/ago_region_vector_priority.spv": "b62b9f6f3be104034679d9eb5dd0c2ac9eabdd1e1d1f814d7b3d1e070a81e4e2"
             }
         },
         "temporal_depth_reproject.slang": {

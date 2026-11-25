@@ -37,14 +37,18 @@ struct AgoCutoffUniforms {
     uint32_t opt_block_size;
     float target_fraction;
     uint32_t max_budget_splats;  // 0 = unlimited; >0 caps target_k
+    uint32_t selection_mode;     // 0 = exact_k, 1 = dynamic_utility_cost_budget
+    float budget_cost_units;     // cost budget B_t when selection_mode == 1
 };
 
 layout(binding=0) ByteAddressBuffer hist_buf;
 layout(binding=1) RWByteAddressBuffer cutoff_indirect_buf;
 
 groupshared uint32_t s_scan[BLOCK_SIZE];
+groupshared float s_cost_scan[BLOCK_SIZE];
 groupshared uint32_t s_cutoff_bin;
 groupshared uint32_t s_boundary_quota;
+groupshared uint32_t s_selected_k;
 groupshared uint32_t s_found;
 
 [shader("compute")]
@@ -63,6 +67,141 @@ void main(
 
     const uint32_t eligible_cnt = min(raw_eligible, u.num_splats);
     const uint32_t newborn_cnt = min(raw_newborn, eligible_cnt);
+
+    // Reverse bin index: lid == 0 -> bin 255 (highest gain), lid == 255 -> bin 0 (lowest gain)
+    const uint32_t bin = 255u - lid;
+
+    if (u.selection_mode == 1u) {
+        // Dynamic utility-cost cutoff K* = max{k : sum_{j=1..k} C_hat_j <= B_t}
+        // Per-splat cost in bin b: c(b) = 1.0 + 0.25 * (b / 255.0) cost units.
+        const float budget_units = (isfinite(u.budget_cost_units) && u.budget_cost_units > 0.0f)
+            ? u.budget_cost_units
+            : 0.0f;
+
+        uint32_t mode = 0u;
+        uint32_t hist_offset_bins = 0u;
+        uint32_t base_selected = 0u;
+        float rem_budget = 0.0f;
+
+        if (eligible_cnt > 0u && u.num_splats > 0u && budget_units > 0.0f) {
+            const float newborn_cost = float(newborn_cnt);
+            if (newborn_cost >= budget_units) {
+                // Spend budget on highest-gain newborns only
+                mode = 2u;
+                hist_offset_bins = 256u;
+                base_selected = 0u;
+                rem_budget = budget_units;
+            } else {
+                // Admit all newborns + spend remaining budget on highest-gain mature splats
+                mode = 1u;
+                hist_offset_bins = 0u;
+                base_selected = newborn_cnt;
+                rem_budget = budget_units - newborn_cost;
+            }
+        }
+
+        const float c_bin = 1.0f + 0.25f * (float(bin) / 255.0f);
+        const uint32_t bin_count = (mode != 0u && rem_budget > 0.0f)
+            ? hist_buf.Load(16u + 4u * (hist_offset_bins + bin))
+            : 0u;
+        const float bin_cost = float(bin_count) * c_bin;
+
+        s_scan[lid] = bin_count;
+        s_cost_scan[lid] = bin_cost;
+        if (lid == 0u) {
+            s_cutoff_bin = 256u;
+            s_boundary_quota = 0u;
+            s_selected_k = base_selected;
+            s_found = 0u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        // Inclusive Hillis-Steele prefix sum of both counts and modeled costs (bin 255 -> bin 0)
+        [unroll]
+        for (uint32_t offset = 1u; offset < BLOCK_SIZE; offset <<= 1u) {
+            const uint32_t add_cnt = (lid >= offset) ? s_scan[lid - offset] : 0u;
+            const float add_cost = (lid >= offset) ? s_cost_scan[lid - offset] : 0.0f;
+            GroupMemoryBarrierWithGroupSync();
+            s_scan[lid] += add_cnt;
+            s_cost_scan[lid] += add_cost;
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        if (mode != 0u && rem_budget > 0.0f) {
+            const float incl_cost = s_cost_scan[lid];
+            const float excl_cost = (lid > 0u) ? s_cost_scan[lid - 1u] : 0.0f;
+            const uint32_t excl_cnt = (lid > 0u) ? s_scan[lid - 1u] : 0u;
+            if (excl_cost < rem_budget && incl_cost >= rem_budget) {
+                const float avail_in_bin = max(rem_budget - excl_cost, 0.0f);
+                const uint32_t quota = min(bin_count, uint32_t(floor(avail_in_bin / c_bin)));
+                s_cutoff_bin = bin;
+                s_boundary_quota = quota;
+                s_selected_k = base_selected + excl_cnt + quota;
+                s_found = 1u;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+
+        if (lid == 0u) {
+            uint32_t target_k = 0u;
+            uint32_t out_cutoff_bin = 256u;
+            uint32_t out_boundary_quota = 0u;
+            if (mode != 0u) {
+                if (rem_budget <= 0.0f) {
+                    target_k = base_selected;
+                    out_cutoff_bin = 256u;
+                    out_boundary_quota = 0u;
+                } else if (s_found != 0u) {
+                    target_k = s_selected_k;
+                    out_cutoff_bin = s_cutoff_bin;
+                    out_boundary_quota = s_boundary_quota;
+                } else {
+                    // Entire histogram fits inside rem_budget
+                    target_k = base_selected + s_scan[BLOCK_SIZE - 1u];
+                    out_cutoff_bin = 0u;
+                    out_boundary_quota = 0u;
+                }
+            }
+
+            target_k = min(target_k, eligible_cnt);
+            if (u.max_budget_splats > 0u && target_k > u.max_budget_splats) {
+                target_k = u.max_budget_splats;
+            }
+
+            uint32_t active_state = ACTIVE_SET_EMPTY;
+            if (target_k == 0u || u.num_splats == 0u) {
+                active_state = ACTIVE_SET_EMPTY;
+                mode = 0u;
+                out_cutoff_bin = 256u;
+                out_boundary_quota = 0u;
+            } else if (target_k >= u.num_splats) {
+                active_state = ACTIVE_SET_FULL;
+                out_cutoff_bin = 0u;
+                out_boundary_quota = 0u;
+            } else {
+                active_state = ACTIVE_SET_PARTIAL;
+            }
+
+            const uint32_t blk = max(u.opt_block_size, 1u);
+            const uint32_t group_count_x = (active_state == ACTIVE_SET_EMPTY || target_k == 0u)
+                ? 0u
+                : ((target_k + blk - 1u) / blk);
+
+            cutoff_indirect_buf.Store(0u, group_count_x);
+            cutoff_indirect_buf.Store(4u, 1u);
+            cutoff_indirect_buf.Store(8u, 1u);
+            cutoff_indirect_buf.Store(12u, out_cutoff_bin);
+            cutoff_indirect_buf.Store(16u, out_boundary_quota);
+            cutoff_indirect_buf.Store(20u, target_k);
+            cutoff_indirect_buf.Store(24u, active_state);
+            cutoff_indirect_buf.Store(28u, mode);
+            cutoff_indirect_buf.Store(32u, eligible_cnt);
+            cutoff_indirect_buf.Store(36u, newborn_cnt);
+            cutoff_indirect_buf.Store(40u, total_gain_bits);
+            cutoff_indirect_buf.Store(44u, max_gain_bits);
+        }
+        return;
+    }
 
     float frac = u.target_fraction;
     if (!isfinite(frac)) {
@@ -110,8 +249,6 @@ void main(
         }
     }
 
-    // Reverse bin index: lid == 0 -> bin 255 (highest gain), lid == 255 -> bin 0 (lowest gain)
-    const uint32_t bin = 255u - lid;
     const uint32_t bin_count = (k_need > 0u)
         ? hist_buf.Load(16u + 4u * (hist_offset_bins + bin))
         : 0u;

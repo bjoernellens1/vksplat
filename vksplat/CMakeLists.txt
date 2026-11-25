@@ -81,6 +81,7 @@ set(HEADERS
     src/ago/core/mailbox.h
     src/ago/core/admission_control.h
     src/ago/core/scheduler.h
+    src/ago/core/rust_control_plane_ffi.h
     src/ago/spatial/dirty_tracking.h
     src/ago/runtime/gpu_executor.h
 )
@@ -94,6 +95,20 @@ target_link_libraries(vksplat PRIVATE
     glm::glm
     # asan
 )
+
+# Optional direct link of Rust AGO control plane staticlib (zero Python ctypes overhead)
+set(AGO_RUST_STATICLIB "${CMAKE_CURRENT_SOURCE_DIR}/ago_control_plane/target/release/libago_control_plane.a")
+if(EXISTS "${AGO_RUST_STATICLIB}")
+    message(STATUS "Linking Rust AGO control plane staticlib: ${AGO_RUST_STATICLIB}")
+    target_compile_definitions(vksplat PRIVATE VKSPLAT_HAS_RUST_CONTROL_PLANE=1)
+    if(UNIX AND NOT APPLE)
+        target_link_libraries(vksplat PRIVATE "${AGO_RUST_STATICLIB}" pthread dl m)
+    else()
+        target_link_libraries(vksplat PRIVATE "${AGO_RUST_STATICLIB}")
+    endif()
+else()
+    message(STATUS "Rust AGO control plane staticlib not found at ${AGO_RUST_STATICLIB}; building C++-only scheduler backend")
+endif()
 
 # Compiler-specific options
 target_compile_definitions(vksplat PRIVATE VERSION_INFO=${EXAMPLE_VERSION_INFO})

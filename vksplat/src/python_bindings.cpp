@@ -6,9 +6,16 @@
 #include "gs_trainer.h"
 #include "ago/core/scheduler.h"
 #include "ago/runtime/gpu_executor.h"
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+#include "ago/core/rust_control_plane_ffi.h"
+#endif
 
 #include <chrono>
+#include <fstream>
 #include <memory>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 namespace py = pybind11;
 
@@ -20,6 +27,19 @@ public:
     VulkanGSPipelineBuffers buffers;
     TrainerConfig config;
     std::unique_ptr<vksplat::ago::AgoScheduler> ago_scheduler_;
+    std::string ago_scheduler_backend_ = "cpp";
+    bool ago_scheduler_use_gpu_exec_ = false;
+    size_t ago_rust_max_admissions_ = 4u;
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+    struct AgoRustCpDeleter {
+        void operator()(AgoRustControlPlane* p) const noexcept {
+            if (p != nullptr) {
+                ago_cp_destroy(p);
+            }
+        }
+    };
+    std::unique_ptr<AgoRustControlPlane, AgoRustCpDeleter> ago_rust_cp_;
+#endif
     bool isect_capacity_forced = false;  // test hook: skip the proactive capacity growth once
     size_t last_isects = 0;  // intersection count of the last gated step (sizes the next batch)
     const _VulkanBuffer* current_train_depth_buf = nullptr;  // active frame's depth+weight GPU buffer when D1 depth loss is enabled
@@ -186,6 +206,7 @@ public:
             "ago_gain_histogram",
             "ago_histogram_cutoff",
             "ago_select_active_set_indirect",
+            "ago_region_vector_priority",
             "temporal_depth_reproject_scatter",
             "temporal_depth_reproject_finalize",
         };
@@ -1208,11 +1229,69 @@ public:
         float target_fraction = 0.5f,
         float newborn_warmup_steps = 10.0f,
         bool exclude_frozen = true,
-        uint32_t max_budget_splats = 0u
+        uint32_t max_budget_splats = 0u,
+        uint32_t selection_mode = 0u,
+        float budget_cost_units = 0.0f
     ) {
         trainer.select_ago_active_set_gpu_async(
-            config, buffers, target_fraction, newborn_warmup_steps, exclude_frozen, max_budget_splats
+            config, buffers, target_fraction, newborn_warmup_steps, exclude_frozen,
+            max_budget_splats, selection_mode, budget_cost_units
         );
+    }
+
+    py::list get_ago_region_priority_vectors(
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    ) {
+        static const char* kOpNames[6] = {
+            "REFINE_GEOM", "REFINE_APP", "SPLIT", "BIRTH", "MERGE_PRUNE", "CORRECTION"
+        };
+        const auto vecs = trainer.compute_ago_region_priority_vectors(
+            config, buffers, split_scale_thresh, split_grad_thresh,
+            prune_opacity_thresh, merge_scale_thresh, newborn_warmup_steps
+        );
+        py::list out;
+        for (const auto& v : vecs) {
+            py::dict d;
+            d["region_id"] = v.region_id;
+            d["splat_count"] = v.splat_count;
+            d["eligible_count"] = v.eligible_count;
+            d["u_geom"] = v.u_geom;
+            d["u_app"] = v.u_app;
+            d["u_split"] = v.u_split;
+            d["u_birth"] = v.u_birth;
+            d["u_merge"] = v.u_merge;
+            d["u_corr"] = v.u_corr;
+            d["dominant_op"] = v.dominant_op;
+            d["dominant_op_name"] = kOpNames[std::min<uint32_t>(v.dominant_op, 5u)];
+            d["eligibility_flags"] = v.eligibility_flags;
+            out.append(d);
+        }
+        return out;
+    }
+
+    py::dict get_ago_structural_candidates(
+        uint32_t max_split = 64u,
+        uint32_t max_prune = 64u,
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    ) {
+        const auto c = trainer.compute_ago_structural_candidates(
+            config, buffers, max_split, max_prune, split_scale_thresh,
+            split_grad_thresh, prune_opacity_thresh, merge_scale_thresh, newborn_warmup_steps
+        );
+        py::dict d;
+        d["split_candidate_indices"] = c.split_candidate_indices;
+        d["prune_candidate_indices"] = c.prune_candidate_indices;
+        d["split_candidates_total"] = c.split_candidates_total;
+        d["prune_candidates_total"] = c.prune_candidates_total;
+        return d;
     }
 
     py::dict get_ago_cutoff_indirect_state() {
@@ -1256,8 +1335,8 @@ public:
         return trainer.ago_execute_external_op(config, buffers, op, group_id);
     }
 
-    uint64_t ago_offload_snapshot_to_ram() {
-        return trainer.ago_offload_snapshot_to_ram(buffers);
+    uint64_t ago_offload_snapshot_to_ram(bool evict_gpu = false) {
+        return trainer.ago_offload_snapshot_to_ram(buffers, evict_gpu);
     }
 
     bool ago_restore_snapshot_from_ram(uint64_t snapshot_id) {
@@ -1270,6 +1349,80 @@ public:
 
     size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const {
         return trainer.ago_ram_snapshot_bytes(snapshot_id);
+    }
+
+    static uint64_t read_process_rss_bytes() {
+#ifdef __linux__
+        std::ifstream f("/proc/self/statm");
+        uint64_t size_pages = 0u;
+        uint64_t rss_pages = 0u;
+        if (!(f >> size_pages >> rss_pages)) {
+            return 0u;
+        }
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            return 0u;
+        }
+        return rss_pages * static_cast<uint64_t>(page_size);
+#else
+        return 0u;
+#endif
+    }
+
+    py::dict ago_get_memory_telemetry() const {
+        py::dict out;
+        out["gpu_device_allocated_bytes"] = trainer.ago_gpu_device_allocated_bytes(buffers);
+        out["host_snapshot_bytes"] = trainer.ago_total_ram_snapshot_bytes();
+        out["staging_bytes"] = trainer.getStagingAllocBytes();
+        out["is_gpu_evicted"] = trainer.is_ago_gpu_evicted();
+        out["rss_bytes"] = read_process_rss_bytes();
+        return out;
+    }
+
+    void set_ago_stage_profiling(bool enabled) {
+        trainer.set_ago_stage_profiling(enabled);
+    }
+
+    bool get_ago_stage_profiling() const {
+        return trainer.get_ago_stage_profiling();
+    }
+
+    py::dict ago_get_stage_telemetry() const {
+        const bool enabled = trainer.get_ago_stage_profiling();
+        const auto& t = trainer.get_ago_stage_timings();
+        const auto funnel = trainer.compute_ago_workload_funnel(config, buffers);
+
+        auto opt_ms = [enabled](const std::optional<double>& v) -> py::object {
+            if (!enabled || !v.has_value()) {
+                return py::none();
+            }
+            return py::float_(*v);
+        };
+
+        py::dict timings;
+        timings["projection_ms"] = opt_ms(t.projection_ms);
+        timings["tile_intersect_sort_ms"] = opt_ms(t.tile_intersect_sort_ms);
+        timings["forward_raster_ms"] = opt_ms(t.forward_raster_ms);
+        timings["backward_raster_ms"] = opt_ms(t.backward_raster_ms);
+        timings["optimizer_ms"] = opt_ms(t.optimizer_ms);
+        timings["ago_selection_ms"] = opt_ms(t.ago_selection_ms);
+
+        py::dict wf;
+        wf["total_stored_gaussians"] = funnel.total_stored_gaussians;
+        wf["gpu_resident_gaussians"] = funnel.gpu_resident_gaussians;
+        wf["projection_candidates"] = funnel.projection_candidates;
+        wf["visible_gaussians"] = funnel.visible_gaussians.has_value()
+            ? py::object(py::int_(*funnel.visible_gaussians))
+            : py::object(py::none());
+        wf["backward_active_gaussians"] = funnel.backward_active_gaussians;
+        wf["geometry_updated_gaussians"] = funnel.geometry_updated_gaussians;
+        wf["frozen_gaussians"] = funnel.frozen_gaussians;
+
+        py::dict out;
+        out["instrumentation_enabled"] = enabled;
+        out["stage_timings_ms"] = timings;
+        out["workload_funnel"] = wf;
+        return out;
     }
 
     vksplat::ago::SubmitResult ago_gpu_submit_action(const vksplat::ago::AGOAction& action) {
@@ -1292,17 +1445,131 @@ public:
         trainer.ago_gpu_shutdown();
     }
 
+    static bool has_rust_control_plane() {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    std::string ago_scheduler_backend() const {
+        return ago_scheduler_backend_;
+    }
+
     void ago_scheduler_init(
         const vksplat::ago::SchedulerConfig& cfg = {},
-        bool use_gpu_executor = false
+        bool use_gpu_executor = false,
+        const std::string& backend = "cpp"
     ) {
+        ago_scheduler_use_gpu_exec_ = use_gpu_executor;
+        if (backend == "rust") {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+            ago_scheduler_.reset();
+            const uint32_t max_inflight = std::max<uint32_t>(1u, static_cast<uint32_t>(cfg.max_admissions_per_tick));
+            const uint32_t maint_floor = static_cast<uint32_t>(cfg.admission.maintenance_floor_interval_ticks);
+            ago_rust_cp_.reset(ago_cp_create(max_inflight, maint_floor));
+            if (!ago_rust_cp_) {
+                throw std::runtime_error("ago_cp_create returned null");
+            }
+            ago_rust_max_admissions_ = std::max<size_t>(1u, cfg.max_admissions_per_tick);
+            ago_scheduler_backend_ = "rust";
+            return;
+#else
+            throw std::runtime_error(
+                "ago_scheduler_init(backend='rust') requires VkSplat built with libago_control_plane.a"
+            );
+#endif
+        }
+        if (backend != "cpp") {
+            throw std::invalid_argument("ago_scheduler_init: backend must be 'cpp' or 'rust'");
+        }
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        ago_rust_cp_.reset();
+#endif
         vksplat::ago::ActionExecutorInterface* exec =
             use_gpu_executor ? static_cast<vksplat::ago::ActionExecutorInterface*>(&trainer.ago_gpu_executor())
                              : nullptr;
         ago_scheduler_ = std::make_unique<vksplat::ago::AgoScheduler>(cfg, exec);
+        ago_scheduler_backend_ = "cpp";
     }
 
     vksplat::ago::TickResult ago_scheduler_tick() {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        if (ago_scheduler_backend_ == "rust") {
+            if (!ago_rust_cp_) {
+                ago_scheduler_init({}, ago_scheduler_use_gpu_exec_, "rust");
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            vksplat::ago::TickResult res{};
+            if (ago_scheduler_use_gpu_exec_) {
+                vksplat::ago::CompletionRecord polled[16];
+                const size_t n_comp = trainer.ago_gpu_executor().poll_completed(polled, 16u);
+                if (n_comp > 0) {
+                    AgoRustCompletion rc[16]{};
+                    for (size_t i = 0; i < n_comp; ++i) {
+                        rc[i].action_id = polled[i].action_id;
+                        rc[i].region_id = polled[i].region_id;
+                        rc[i].op = static_cast<uint8_t>(polled[i].op);
+                        rc[i].service_class = static_cast<uint8_t>(polled[i].service_class);
+                        rc[i].status = static_cast<uint8_t>(polled[i].status);
+                        rc[i].was_exclusive = polled[i].was_exclusive ? 1u : 0u;
+                        rc[i].affected_splats = polled[i].affected_splats;
+                        rc[i].realized_gain = polled[i].realized_gain;
+                        rc[i].actual_cost_ms = polled[i].actual_cost_ms;
+                        rc[i].completed_at_ms = polled[i].completed_at_ms;
+                        rc[i].event_to_map_correction_ms = polled[i].event_to_map_correction_ms;
+                        rc[i].result_map_version = polled[i].result_map_version;
+                        rc[i].result_pose_version = polled[i].result_pose_version;
+                    }
+                    res.completions_processed = ago_ingest_completions(ago_rust_cp_.get(), rc, n_comp);
+                }
+            }
+            AgoRustResourceSummary before_sum{};
+            ago_get_resource_summary(ago_rust_cp_.get(), &before_sum);
+
+            const size_t batch_cap = std::min<size_t>(ago_rust_max_admissions_, 32u);
+            AgoRustAction admitted[32]{};
+            const uint32_t n_adm = ago_schedule_batch(ago_rust_cp_.get(), admitted, batch_cap);
+            res.actions_admitted = n_adm;
+
+            if (ago_scheduler_use_gpu_exec_) {
+                for (uint32_t i = 0; i < n_adm; ++i) {
+                    vksplat::ago::AGOAction act{};
+                    act.action_id = admitted[i].action_id;
+                    act.region_id = admitted[i].region_id;
+                    act.service_class = static_cast<vksplat::ago::ServiceClass>(admitted[i].service_class);
+                    act.op = static_cast<vksplat::ago::OperationType>(admitted[i].op);
+                    act.requires_exclusive_region = admitted[i].requires_exclusive_region != 0;
+                    act.requires_gpu = admitted[i].requires_gpu != 0;
+                    act.max_splats = admitted[i].max_splats;
+                    act.required_map_version = admitted[i].required_map_version;
+                    act.required_pose_version = admitted[i].required_pose_version;
+                    act.required_evidence_version = admitted[i].required_evidence_version;
+                    act.expected_gain = admitted[i].expected_gain;
+                    act.estimated_cost_ms = admitted[i].estimated_cost_ms;
+                    act.target_fraction = admitted[i].target_fraction;
+                    act.enqueued_at_ms = admitted[i].enqueued_at_ms;
+                    act.evidence_ingested_at_ms = admitted[i].evidence_ingested_at_ms;
+                    act.deadline_ms = admitted[i].deadline_ms;
+                    (void)trainer.ago_gpu_executor().try_submit(act);
+                }
+            }
+
+            AgoRustResourceSummary after_sum{};
+            ago_get_resource_summary(ago_rust_cp_.get(), &after_sum);
+            res.tick_index = after_sum.tick_count;
+            res.stale_actions_pruned = static_cast<uint32_t>(
+                after_sum.total_rejected_stale - before_sum.total_rejected_stale);
+            res.budget_rejections = static_cast<uint32_t>(
+                after_sum.total_rejected_budget - before_sum.total_rejected_budget);
+            res.credit_rejections = static_cast<uint32_t>(
+                after_sum.total_rejected_credits - before_sum.total_rejected_credits);
+            const auto t1 = std::chrono::steady_clock::now();
+            res.tick_duration_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+            return res;
+        }
+#endif
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -1310,6 +1577,31 @@ public:
     }
 
     bool ago_scheduler_enqueue_action(const vksplat::ago::AGOAction& action) {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        if (ago_scheduler_backend_ == "rust") {
+            if (!ago_rust_cp_) {
+                ago_scheduler_init({}, ago_scheduler_use_gpu_exec_, "rust");
+            }
+            AgoRustAction ra{};
+            ra.action_id = action.action_id;
+            ra.region_id = action.region_id;
+            ra.service_class = static_cast<uint8_t>(action.service_class);
+            ra.op = static_cast<uint8_t>(action.op);
+            ra.requires_exclusive_region = action.requires_exclusive_region ? 1u : 0u;
+            ra.requires_gpu = action.requires_gpu ? 1u : 0u;
+            ra.max_splats = action.max_splats;
+            ra.required_map_version = action.required_map_version;
+            ra.required_pose_version = action.required_pose_version;
+            ra.required_evidence_version = action.required_evidence_version;
+            ra.expected_gain = action.expected_gain;
+            ra.estimated_cost_ms = action.estimated_cost_ms;
+            ra.target_fraction = action.target_fraction;
+            ra.enqueued_at_ms = action.enqueued_at_ms;
+            ra.evidence_ingested_at_ms = action.evidence_ingested_at_ms;
+            ra.deadline_ms = action.deadline_ms;
+            return ago_cp_enqueue_actions(ago_rust_cp_.get(), &ra, 1u) == 1u;
+        }
+#endif
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -1317,6 +1609,24 @@ public:
     }
 
     bool ago_scheduler_push_evidence(const vksplat::ago::EvidenceMessage& msg) {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        if (ago_scheduler_backend_ == "rust") {
+            if (!ago_rust_cp_) {
+                ago_scheduler_init({}, ago_scheduler_use_gpu_exec_, "rust");
+            }
+            AgoRustEvent ev{};
+            ev.kind = static_cast<uint8_t>(msg.kind);
+            ev.critical = msg.critical ? 1u : 0u;
+            ev.flags = msg.flags;
+            ev.region_id = msg.region_id;
+            ev.map_version = msg.map_version;
+            ev.pose_version = msg.pose_version;
+            ev.evidence_version = msg.evidence_version;
+            ev.timestamp_ms = msg.timestamp_ms;
+            ev.magnitude = msg.magnitude;
+            return ago_ingest_events(ago_rust_cp_.get(), &ev, 1u) == 1u;
+        }
+#endif
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -1330,6 +1640,21 @@ public:
     }
 
     void ago_scheduler_set_budget(const vksplat::ago::DeadlineBudget& budget) {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        if (ago_scheduler_backend_ == "rust") {
+            if (!ago_rust_cp_) {
+                ago_scheduler_init({}, ago_scheduler_use_gpu_exec_, "rust");
+            }
+            AgoRustBudget rb{};
+            rb.now_ms = budget.now_ms;
+            rb.next_deadline_ms = budget.next_deadline_ms;
+            rb.reserved_ms = budget.reserved_ms;
+            rb.inflight_ms = budget.inflight_ms;
+            rb.safety_margin_ms = budget.safety_margin_ms;
+            ago_cp_set_budget(ago_rust_cp_.get(), &rb);
+            return;
+        }
+#endif
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -1337,6 +1662,34 @@ public:
     }
 
     vksplat::ago::SchedulerSummary ago_scheduler_summary() {
+#ifdef VKSPLAT_HAS_RUST_CONTROL_PLANE
+        if (ago_scheduler_backend_ == "rust") {
+            if (!ago_rust_cp_) {
+                ago_scheduler_init({}, ago_scheduler_use_gpu_exec_, "rust");
+            }
+            AgoRustResourceSummary rs{};
+            ago_get_resource_summary(ago_rust_cp_.get(), &rs);
+            vksplat::ago::SchedulerSummary s{};
+            s.tick_count = rs.tick_count;
+            s.map_version = rs.map_version;
+            s.pose_version = rs.pose_version;
+            s.evidence_version = rs.evidence_version;
+            s.inflight_count = rs.inflight_count;
+            s.queued_actions = rs.queued_actions;
+            s.dirty_regions = rs.dirty_regions;
+            s.total_admitted = rs.total_admitted;
+            s.total_completed = rs.total_completed;
+            s.total_rejected_stale = rs.total_rejected_stale;
+            s.total_rejected_budget = rs.total_rejected_budget;
+            s.total_rejected_credits = rs.total_rejected_credits;
+            s.total_failed = rs.total_failed;
+            s.available_budget_ms = rs.available_budget_ms;
+            s.last_event_to_map_correction_ms = rs.last_event_to_map_correction_ms;
+            s.max_event_to_map_correction_ms = rs.max_event_to_map_correction_ms;
+            s.mean_event_to_map_correction_ms = rs.mean_event_to_map_correction_ms;
+            return s;
+        }
+#endif
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -1344,6 +1697,9 @@ public:
     }
 
     std::vector<vksplat::ago::EventTraceEntry> ago_scheduler_trace() {
+        if (ago_scheduler_backend_ == "rust") {
+            return {};
+        }
         if (!ago_scheduler_) {
             ago_scheduler_init();
         }
@@ -2113,17 +2469,26 @@ public:
         rasterize_forward();
     }
 
-    void backward_optimize(int step) {
+    void backward_optimize(int step, bool profile = false) {
         auto deviceGuard = DeviceGuard(&trainer);
 
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_BwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         rasterize_backward();
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_BwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_OptStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
 
         try {
             trainer.executeFusedProjectionBackwardOptimizerStep(config, uniforms, buffers, step+1);
         } catch (const std::runtime_error& err) {
             _THROW_ERROR(std::string(err.what()) + ". trainer.executeFusedProjectionBackwardOptimizerStep failed");
         }
-
+        if (profile) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_OptEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
     }
 
     void compute_pixel_loss_grad(size_t train_idx, int step) {
@@ -2233,27 +2598,89 @@ public:
     // command batch: the intersection count is read back mid-forward (one extra fence per step).
     void train_step_sync(size_t train_idx, int step) {
         begin_step(train_idx, step);
+        const bool profile = trainer.get_ago_stage_profiling();
+        {
+            auto deviceGuard = DeviceGuard(&trainer);
 
-        auto deviceGuard = DeviceGuard(&trainer);
+            if (profile) {
+                trainer.resetAgoTimestamps(VulkanGSTrainer::kStageQ_ProjStart, 2u);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            projection_forward();
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            }
 
-        forward();
-        compute_pixel_loss_grad(train_idx, step);
-        backward_optimize(step);
+            try {
+                trainer.executeCalculateIndexBufferOffset(buffers);
+            } catch (const std::runtime_error& err) {
+                _THROW_ERROR(std::string(err.what()) + ". trainer.executeCalculateIndexBufferOffset failed");
+            }
+            if (profile) {
+                trainer.resetAgoTimestamps(VulkanGSTrainer::kStageQ_TileStart, 8u);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            if (buffers.num_indices > 0) {
+                try {
+                    trainer.executeGenerateKeys(uniforms, buffers);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeGenerateKeys failed");
+                }
+                try {
+                    trainer.executeSort(uniforms, buffers, -1);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeSort failed");
+                }
+                try {
+                    trainer.executeComputeTileRanges(uniforms, buffers);
+                } catch (const std::runtime_error& err) {
+                    _THROW_ERROR(std::string(err.what()) + ". trainer.executeComputeTileRanges failed");
+                }
+            }
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+            }
+            rasterize_forward();
+            if (profile) {
+                trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            }
 
-        // post_backward_step(step+1);
-        post_backward_step(step);
+            compute_pixel_loss_grad(train_idx, step);
+            backward_optimize(step, profile);
+            post_backward_step(step);
+        }
+        if (profile && !trainer.isCommandBatchInProgress()) {
+            trainer.collectAgoStageTimings();
+        }
     }
 
     // One step recorded into the open gated batch: no host readback and no fence; see step_gate.slang.
     void train_step_gated(size_t train_idx, int step, uint32_t step_in_batch) {
         begin_step(train_idx, step);
         trainer.gateBeginStep(step_in_batch);
+        const bool profile_step = trainer.get_ago_stage_profiling() && (step_in_batch == 0u);
+        if (profile_step) {
+            trainer.resetAgoStepStageTimestamps();
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         projection_forward();
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         const int backward_impl = trainer.sampleBackwardImpl();
         trainer.executeTilesDeferred(uniforms, buffers, trainer.buildGatePlan(uniforms, buffers, backward_impl));
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        }
         rasterize_forward();
+        if (profile_step) {
+            trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_FwdEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+        }
         compute_pixel_loss_grad(train_idx, step);
-        backward_optimize(step);
+        backward_optimize(step, profile_step);
         post_backward_step(step);
     }
 
@@ -2285,6 +2712,9 @@ public:
                 }
                 trainer.gateEndBatch();
             }  // submit + the one fence of the batch
+            if (trainer.get_ago_stage_profiling()) {
+                trainer.collectAgoStageTimings();
+            }
             const auto result = trainer.gateResult();
             auto& w = PerfTimer::work_counters;
             for (uint32_t i = 0; i < result.steps_done; ++i) {
@@ -2357,6 +2787,133 @@ public:
 
     void train_step(size_t train_idx, int step) {
         train_steps({(int)train_idx}, step);
+    }
+
+    // P11-A (S3): Multi-batch autonomous GPU envelope executing AGO selection + bounded
+    // gated training steps in ONE Vulkan command-buffer submission (cpu_gpu_sync_count == 1)
+    // with dedicated VkQueryPool hardware GPU timestamps and optional VK_EXT_debug_utils labels.
+    py::dict ago_execute_multi_batch_gpu_envelope(
+        const std::vector<int>& frame_indices,
+        int first_step,
+        float budget_cost_units = 0.0f,
+        uint32_t param_mask = TrainerConfig::AGO_PARAM_ALL,
+        float newborn_warmup_steps = 10.0f,
+        bool exclude_frozen = true
+    ) {
+        const size_t n_req = std::min<size_t>(frame_indices.size(), VulkanGSTrainer::kGateMaxSteps);
+        const uint32_t selection_mode = (std::isfinite(budget_cost_units) && budget_cost_units > 0.0f) ? 1u : 0u;
+        const float target_fraction = (selection_mode == 1u) ? 1.0f : 1.0f;
+
+        py::dict out;
+        out["steps_requested"] = static_cast<uint32_t>(n_req);
+        out["steps_executed"] = 0u;
+        out["cpu_gpu_sync_count"] = 0u;
+        out["gpu_active_ms"] = 0.0;
+        out["gpu_selection_ms"] = 0.0;
+        out["overflow"] = false;
+        out["budget_cost_units"] = budget_cost_units;
+        out["param_mask"] = param_mask;
+        out["selection_mode"] = selection_mode;
+        out["timestamp_queries_enabled"] = trainer.isTimestampQueriesEnabled();
+        out["debug_utils_labels_enabled"] = trainer.hasDebugUtilsLabels();
+        out["indirect_dispatch_used"] = true;
+
+        if (n_req == 0 || buffers.num_splats == 0) {
+            return out;
+        }
+
+        if (config.sparse_tile_quantile > 0.0f) {
+            size_t tiles = 0;
+            for (size_t j = 0; j < n_req; ++j) {
+                tiles = std::max(tiles, trainer.train_tile_count(static_cast<size_t>(frame_indices[j])));
+            }
+            trainer.ensureSparseTileBuffers(tiles);
+        }
+        if (!isect_capacity_forced) {
+            trainer.ensureIsectCapacity(buffers, std::max<size_t>(
+                {size_t(1) << 18, 16 * buffers.num_splats, last_isects + (last_isects >> 1)}));
+        }
+        isect_capacity_forced = false;
+        trainer.ensureAgoSelectionBuffers(buffers);
+
+        const uint32_t prev_param_mask = config.ago_param_mask;
+        config.ago_param_mask = param_mask;
+        const uint64_t fence_waits_before = PerfTimer::work_counters.fence_waits_total;
+
+        try {
+            {
+                auto deviceGuard = DeviceGuard(&trainer);
+                trainer.resetAgoTimestamps(0u, 8u);
+                trainer.beginDebugLabel("AGO_S3_MultiBatch_Envelope", 0.1f, 0.7f, 0.9f, 1.0f);
+                trainer.writeAgoTimestamp(0u, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+
+                trainer.beginDebugLabel("AGO_Selection_Indirect", 0.9f, 0.6f, 0.1f, 1.0f);
+                trainer.select_ago_active_set_gpu_async(
+                    config,
+                    buffers,
+                    target_fraction,
+                    newborn_warmup_steps,
+                    exclude_frozen,
+                    0u,
+                    selection_mode,
+                    budget_cost_units
+                );
+                trainer.endDebugLabel();
+                trainer.writeAgoTimestamp(1u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+                trainer.beginDebugLabel("AGO_Gated_Steps", 0.2f, 0.85f, 0.35f, 1.0f);
+                trainer.gateBeginBatch();
+                try {
+                    for (size_t j = 0; j < n_req; ++j) {
+                        train_step_gated(
+                            static_cast<size_t>(frame_indices[j]),
+                            first_step + static_cast<int>(j),
+                            static_cast<uint32_t>(j)
+                        );
+                    }
+                } catch (...) {
+                    trainer.gateEndBatch();
+                    throw;
+                }
+                trainer.gateEndBatch();
+                trainer.endDebugLabel();
+
+                trainer.writeAgoTimestamp(2u, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                trainer.endDebugLabel();
+            }  // Single submission + single fence wait
+        } catch (...) {
+            config.ago_param_mask = prev_param_mask;
+            throw;
+        }
+        config.ago_param_mask = prev_param_mask;
+
+        const uint64_t fence_waits_after = PerfTimer::work_counters.fence_waits_total;
+        const auto gate_res = trainer.gateResult();
+        auto& w = PerfTimer::work_counters;
+        for (uint32_t i = 0; i < gate_res.steps_done; ++i) {
+            w.forward_passes++;
+            w.tile_intersections_total += gate_res.isects[i];
+            w.tile_intersections_last = gate_res.isects[i];
+            w.tile_intersections_max = std::max<uint64_t>(w.tile_intersections_max, gate_res.isects[i]);
+            last_isects = gate_res.isects[i];
+        }
+        if (gate_res.steps_done > 0) {
+            buffers.num_indices = last_isects;
+        }
+        if (gate_res.overflow) {
+            w.gate_overflows++;
+            trainer.ensureIsectCapacity(buffers, gate_res.needed + (gate_res.needed >> 1));
+        }
+
+        out["steps_executed"] = gate_res.steps_done;
+        out["cpu_gpu_sync_count"] = static_cast<uint32_t>(fence_waits_after - fence_waits_before);
+        out["gpu_selection_ms"] = trainer.readTimestampDeltaMs(0u, 1u);
+        out["gpu_active_ms"] = trainer.readTimestampDeltaMs(0u, 2u);
+        out["overflow"] = gate_res.overflow;
+        if (trainer.get_ago_stage_profiling()) {
+            trainer.collectAgoStageTimings();
+        }
+        return out;
     }
 
     // Test hook: shrink the intersection buffers to `capacity` so the next gated batch overflows.
@@ -2436,6 +2993,130 @@ public:
         }
         trainer.get_val_camera(idx, uniforms);
         return forward_rgbd_dict();
+    }
+
+    // P11-D(GPU): Live false-color Gaussian rasterizer mode.
+    // Temporarily maps AGO GPU telemetry into Gaussian SH-DC RGB channels, invokes
+    // render_val_depth(val_idx), and restores the exact original SH buffer bit-for-bit.
+    // mode: 0=RESIDUAL, 1=PRIORITY, 2=GPU_WORK, 3=OUTCOME
+    py::dict render_ago_false_color(size_t val_idx, int mode = 0) {
+        if (val_idx >= trainer.num_val()) {
+            throw std::out_of_range("render_ago_false_color: val index out of range");
+        }
+        if (mode < 0 || mode > 3) {
+            throw std::invalid_argument("render_ago_false_color: mode must be 0..3 (RESIDUAL, PRIORITY, GPU_WORK, OUTCOME)");
+        }
+        static const char* kModeNames[4] = { "RESIDUAL", "PRIORITY", "GPU_WORK", "OUTCOME" };
+        const size_t n = buffers.num_splats;
+        if (n == 0 || buffers.sh_coeffs.deviceBuffer.buffer == VK_NULL_HANDLE) {
+            py::dict out = render_val_depth(val_idx);
+            out["mode"] = mode;
+            out["mode_name"] = kModeNames[mode];
+            return out;
+        }
+
+        // 1. Save exact raw device bytes of buffers.sh_coeffs for bit-exact restoration.
+        const size_t sh_bytes = buffers.sh_coeffs.deviceSize() * sizeof(float);
+        std::vector<uint8_t> saved_sh_bytes(sh_bytes, 0u);
+        trainer.downloadDeviceSlice(buffers.sh_coeffs.deviceBuffer, 0, saved_sh_bytes.data(), sh_bytes);
+        const uint32_t saved_active_sh = uniforms.active_sh;
+
+        // 2. Read live AGO telemetry from GPU and compute per-splat scalar.
+        const std::vector<float> telem = trainer.get_ago_telemetry_host(n);
+        std::vector<float> vals(n, 0.0f);
+        float max_val = 0.0f;
+        for (size_t i = 0; i < n; ++i) {
+            const float grad_norm = telem[8 * i + 0];
+            const float update_norm = telem[8 * i + 1];
+            const float pred_gain = telem[8 * i + 2];
+            const float abs_proj_grad = telem[8 * i + 3];
+            const float update_count = telem[8 * i + 4];
+            const float contrib_sum = telem[8 * i + 5];
+            const float last_pred_gain = telem[8 * i + 7];
+            float v = 0.0f;
+            if (mode == 0) {
+                v = std::max(0.0f, abs_proj_grad) + 0.5f * std::max(0.0f, grad_norm);
+            } else if (mode == 1) {
+                const float g = (last_pred_gain > 0.0f) ? last_pred_gain : pred_gain;
+                v = std::max(0.0f, g) + 0.25f * std::max(0.0f, abs_proj_grad);
+            } else if (mode == 2) {
+                v = std::max(0.0f, update_count) + std::max(0.0f, contrib_sum);
+            } else {
+                v = std::max(0.0f, update_norm);
+            }
+            if (!std::isfinite(v)) v = 0.0f;
+            vals[i] = v;
+            if (v > max_val) max_val = v;
+        }
+        const float inv_max = (max_val > 1e-8f) ? (1.0f / max_val) : 0.0f;
+
+        // 3. Build temporary false-color SH buffer in the exact reordered device layout.
+        static constexpr float kShC0 = 0.28209479177387814f;
+        static constexpr size_t kShDim = 12;  // 16*3 floats = 12 float4s per splat
+        std::vector<float> temp_sh(buffers.sh_coeffs.deviceSize(), 0.0f);
+        auto turbo_like = [](float t, float& r, float& g, float& b) {
+            t = std::clamp(t, 0.0f, 1.0f);
+            if (t < 0.333f) {
+                float u = t / 0.333f;
+                r = 0.12f * (1.0f - u);
+                g = 0.20f + 0.65f * u;
+                b = 0.70f + 0.25f * u;
+            } else if (t < 0.666f) {
+                float u = (t - 0.333f) / 0.333f;
+                r = 0.95f * u;
+                g = 0.85f + 0.10f * u;
+                b = 0.95f * (1.0f - u);
+            } else {
+                float u = (t - 0.666f) / 0.334f;
+                r = 0.95f + 0.05f * u;
+                g = 0.95f * (1.0f - 0.80f * u);
+                b = 0.05f;
+            }
+        };
+
+        for (size_t i = 0; i < n; ++i) {
+            const float t = vals[i] * inv_max;
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            turbo_like(t, r, g, b);
+            const float dc0 = (r - 0.5f) / kShC0;
+            const float dc1 = (g - 0.5f) / kShC0;
+            const float dc2 = (b - 0.5f) / kShC0;
+            size_t base_off = 0u;
+            if (SH_REORDER_SIZE <= 1) {
+                base_off = i * kShDim * 4u;
+            } else {
+                const size_t blk = i / SH_REORDER_SIZE;
+                const size_t loc = i % SH_REORDER_SIZE;
+                base_off = blk * kShDim * SH_REORDER_SIZE * 4u + loc * 4u;
+            }
+            if (base_off + 2u < temp_sh.size()) {
+                temp_sh[base_off + 0u] = dc0;
+                temp_sh[base_off + 1u] = dc1;
+                temp_sh[base_off + 2u] = dc2;
+            }
+        }
+
+        // RAII guard ensures bit-exact SH restoration even on exception.
+        struct ShRestoreGuard {
+            VulkanGSTrainer& tr;
+            _VulkanBuffer& sh_buf;
+            const std::vector<uint8_t>& orig;
+            VulkanGSRendererUniforms& uniforms_ref;
+            uint32_t orig_active_sh;
+            ~ShRestoreGuard() {
+                tr.uploadDeviceSlice(sh_buf, 0, orig.data(), orig.size());
+                uniforms_ref.active_sh = orig_active_sh;
+            }
+        } restore_guard{ trainer, buffers.sh_coeffs.deviceBuffer, saved_sh_bytes, uniforms, saved_active_sh };
+
+        trainer.uploadDeviceSlice(buffers.sh_coeffs.deviceBuffer, 0, temp_sh.data(), sh_bytes);
+        uniforms.active_sh = 0;
+
+        py::dict out = render_val_depth(val_idx);
+        out["mode"] = mode;
+        out["mode_name"] = kModeNames[mode];
+        out["max_telemetry_value"] = max_val;
+        return out;
     }
 
     py::dict render_pose_rgbd(
@@ -3509,7 +4190,37 @@ PYBIND11_MODULE(vksplat, m) {
              py::arg("target_fraction") = 0.5f,
              py::arg("newborn_warmup_steps") = 10.0f,
              py::arg("exclude_frozen") = true,
-             py::arg("max_budget_splats") = 0u)
+             py::arg("max_budget_splats") = 0u,
+             py::arg("selection_mode") = 0u,
+             py::arg("budget_cost_units") = 0.0f)
+        .def("ago_execute_multi_batch_gpu_envelope", &VkSplat::ago_execute_multi_batch_gpu_envelope,
+             "P11-A (S3): Execute AGO selection + multiple bounded gated steps in ONE GPU submission with VkQueryPool hardware timestamps",
+             py::arg("frame_indices"),
+             py::arg("first_step"),
+             py::arg("budget_cost_units") = 0.0f,
+             py::arg("param_mask") = TrainerConfig::AGO_PARAM_ALL,
+             py::arg("newborn_warmup_steps") = 10.0f,
+             py::arg("exclude_frozen") = true)
+        .def("get_ago_region_priority_vectors", &VkSplat::get_ago_region_priority_vectors,
+             "P11-B: Compute GPU-resident 6-component RegionPriorityVector per region",
+             py::arg("split_scale_thresh") = 0.02f,
+             py::arg("split_grad_thresh") = 1e-4f,
+             py::arg("prune_opacity_thresh") = 0.05f,
+             py::arg("merge_scale_thresh") = 0.002f,
+             py::arg("newborn_warmup_steps") = 10.0f)
+        .def("get_ago_structural_candidates", &VkSplat::get_ago_structural_candidates,
+             "P11-B: Select bounded GPU-resident split and prune candidate splat indices",
+             py::arg("max_split") = 64u,
+             py::arg("max_prune") = 64u,
+             py::arg("split_scale_thresh") = 0.02f,
+             py::arg("split_grad_thresh") = 1e-4f,
+             py::arg("prune_opacity_thresh") = 0.05f,
+             py::arg("merge_scale_thresh") = 0.002f,
+             py::arg("newborn_warmup_steps") = 10.0f)
+        .def("render_ago_false_color", &VkSplat::render_ago_false_color,
+             "P11-D(GPU): Render live false-color Gaussian rasterizer view from AGO telemetry (0=RESIDUAL, 1=PRIORITY, 2=GPU_WORK, 3=OUTCOME) with bit-exact SH restore",
+             py::arg("val_idx"),
+             py::arg("mode") = 0)
         .def("get_ago_cutoff_indirect_state", &VkSplat::get_ago_cutoff_indirect_state,
              "Diagnostic host readback of the 12-word GPU ago_cutoff_indirect_buf_ (tests/verification only)")
         .def("set_external_strategy_mode", &VkSplat::set_external_strategy_mode,
@@ -3526,9 +4237,10 @@ PYBIND11_MODULE(vksplat, m) {
              "Execute an explicit AGO-0/L0 external strategy op (FREEZE/REOPEN/RETRACT/PRUNE/REFINE; REJECTED_UNSUPPORTED otherwise)",
              py::arg("op"), py::arg("group_id") = -1)
         .def("ago_offload_snapshot_to_ram", &VkSplat::ago_offload_snapshot_to_ram,
-             "Offload Gaussian params, Adam moments, and group states bit-for-bit to host RAM; returns snapshot_id")
+             "Offload Gaussian params, Adam moments, and group states bit-for-bit to host RAM (optionally evicting GPU device buffers); returns snapshot_id",
+             py::arg("evict_gpu") = false)
         .def("ago_restore_snapshot_from_ram", &VkSplat::ago_restore_snapshot_from_ram,
-             "Restore Gaussian params, Adam moments, and group states bit-for-bit from host RAM snapshot",
+             "Restore Gaussian params, Adam moments, and group states bit-for-bit from host RAM snapshot (re-allocating evicted GPU buffers if needed)",
              py::arg("snapshot_id"))
         .def("ago_drop_ram_snapshot", &VkSplat::ago_drop_ram_snapshot,
              "Release a host RAM snapshot by snapshot_id",
@@ -3536,6 +4248,15 @@ PYBIND11_MODULE(vksplat, m) {
         .def("ago_ram_snapshot_bytes", &VkSplat::ago_ram_snapshot_bytes,
              "Return byte size of a stored host RAM snapshot",
              py::arg("snapshot_id"))
+        .def("ago_get_memory_telemetry", &VkSplat::ago_get_memory_telemetry,
+             "Return exact S93 memory accounting dict (gpu_device_allocated_bytes, host_snapshot_bytes, staging_bytes, is_gpu_evicted, rss_bytes)")
+        .def("set_ago_stage_profiling", &VkSplat::set_ago_stage_profiling,
+             "Enable or disable opt-in S100 per-stage Vulkan timestamp profiling (default False)",
+             py::arg("enabled"))
+        .def("get_ago_stage_profiling", &VkSplat::get_ago_stage_profiling,
+             "Return whether S100 per-stage Vulkan timestamp profiling is enabled")
+        .def("ago_get_stage_telemetry", &VkSplat::ago_get_stage_telemetry,
+             "Return S100 per-stage Vulkan timestamps (None when disabled/unrecorded) and live workload_funnel counts")
         .def("ago_gpu_submit_action", &VkSplat::ago_gpu_submit_action,
              "Submit an AGOAction to the real NonBlockingGpuExecutor (non-blocking)",
              py::arg("action"))
@@ -3548,10 +4269,15 @@ PYBIND11_MODULE(vksplat, m) {
              "Return in-flight submission count in the NonBlockingGpuExecutor")
         .def("ago_gpu_shutdown", &VkSplat::ago_gpu_shutdown,
              "Safely drain and shut down the NonBlockingGpuExecutor")
+        .def_static("has_rust_control_plane", &VkSplat::has_rust_control_plane,
+             "Return True if VkSplat was built with libago_control_plane.a linked directly into C++")
+        .def("ago_scheduler_backend", &VkSplat::ago_scheduler_backend,
+             "Return active AGO scheduler backend ('cpp' or 'rust')")
         .def("ago_scheduler_init", &VkSplat::ago_scheduler_init,
-             "Initialize integrated native C++ AgoScheduler",
+             "Initialize integrated native AGO scheduler ('cpp' or directly-linked 'rust' staticlib)",
              py::arg("config") = vksplat::ago::SchedulerConfig{},
-             py::arg("use_gpu_executor") = false)
+             py::arg("use_gpu_executor") = false,
+             py::arg("backend") = "cpp")
         .def("ago_scheduler_tick", &VkSplat::ago_scheduler_tick,
              "Execute one bounded non-blocking AgoScheduler tick")
         .def("ago_scheduler_enqueue_action", &VkSplat::ago_scheduler_enqueue_action,
