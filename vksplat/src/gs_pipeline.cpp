@@ -170,6 +170,12 @@ void VulkanGSPipeline::cleanup() {
             vkDestroyQueryPool(device, timestamp_query_pool, nullptr);
             timestamp_query_pool = VK_NULL_HANDLE;
         }
+        if (ago_timestamp_query_pool_ != VK_NULL_HANDLE) {
+            vkDestroyQueryPool(device, ago_timestamp_query_pool_, nullptr);
+            ago_timestamp_query_pool_ = VK_NULL_HANDLE;
+        }
+        pfn_cmd_begin_debug_label_ = nullptr;
+        pfn_cmd_end_debug_label_ = nullptr;
         
         if (command_buffer != VK_NULL_HANDLE) {
             vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
@@ -212,9 +218,37 @@ void VulkanGSPipeline::createInstance() {
         create_info.enabledLayerCount = 1u;
         create_info.ppEnabledLayerNames = &validation_layer_name;
     }
+
+    // Enable VK_EXT_debug_utils when available for RGP / Perfetto GPU command labels.
+    std::vector<const char*> instance_extensions;
+    uint32_t inst_ext_count = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &inst_ext_count, nullptr) == VK_SUCCESS && inst_ext_count > 0) {
+        std::vector<VkExtensionProperties> inst_exts(inst_ext_count);
+        if (vkEnumerateInstanceExtensionProperties(nullptr, &inst_ext_count, inst_exts.data()) == VK_SUCCESS) {
+            for (const auto& ext : inst_exts) {
+                if (std::strcmp(ext.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                    instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                    break;
+                }
+            }
+        }
+    }
+    create_info.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+    create_info.ppEnabledExtensionNames = instance_extensions.empty() ? nullptr : instance_extensions.data();
     
     if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS)
         _THROW_ERROR("Failed to create instance");
+
+    pfn_cmd_begin_debug_label_ = nullptr;
+    pfn_cmd_end_debug_label_ = nullptr;
+    if (!instance_extensions.empty()) {
+        pfn_cmd_begin_debug_label_ = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(
+            vkGetInstanceProcAddr(instance, "vkCmdBeginDebugUtilsLabelEXT")
+        );
+        pfn_cmd_end_debug_label_ = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(
+            vkGetInstanceProcAddr(instance, "vkCmdEndDebugUtilsLabelEXT")
+        );
+    }
 }
 
 void VulkanGSPipeline::selectPhysicalDevice(int device_id) {
@@ -629,6 +663,7 @@ void VulkanGSPipeline::createQueryPools() {
         _THROW_ERROR("Failed to create timestamp query pool");
 
     timestamp_queries_enabled = false;
+    timestamp_period_ns_ = 0.0;
     if (timestamp_query_pool != VK_NULL_HANDLE && physical_device != VK_NULL_HANDLE) {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(physical_device, &props);
@@ -639,7 +674,17 @@ void VulkanGSPipeline::createQueryPools() {
             vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &qf_count, qf_props.data());
         }
         bool valid_bits = (queue_family_index < qf_count) && (qf_props[queue_family_index].timestampValidBits > 0);
+        timestamp_period_ns_ = static_cast<double>(props.limits.timestampPeriod);
         timestamp_queries_enabled = (props.limits.timestampPeriod > 0.0f) && valid_bits;
+    }
+
+    // Dedicated lightweight 64-query AGO timestamp pool (independent of PerfTimer).
+    VkQueryPoolCreateInfo agoPoolInfo = {};
+    agoPoolInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    agoPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    agoPoolInfo.queryCount = kAgoTimestampQueryCount;
+    if (vkCreateQueryPool(device, &agoPoolInfo, nullptr, &ago_timestamp_query_pool_) != VK_SUCCESS) {
+        ago_timestamp_query_pool_ = VK_NULL_HANDLE;
     }
 }
 
@@ -790,6 +835,78 @@ bool VulkanGSPipeline::writeTimestampNoExcept(int delta) {
     timestampNumWritten += 1;
     timestampStackDepth += delta;
     return true;
+}
+
+void VulkanGSPipeline::resetAgoTimestamps(uint32_t first_query, uint32_t query_count) {
+    if (!timestamp_queries_enabled || ago_timestamp_query_pool_ == VK_NULL_HANDLE || !commandBatchInProgress) {
+        return;
+    }
+    if (first_query >= kAgoTimestampQueryCount || query_count == 0u) {
+        return;
+    }
+    const uint32_t clamped = std::min(query_count, kAgoTimestampQueryCount - first_query);
+    vkCmdResetQueryPool(command_buffer, ago_timestamp_query_pool_, first_query, clamped);
+}
+
+void VulkanGSPipeline::writeAgoTimestamp(uint32_t query_index, VkPipelineStageFlagBits stage) {
+    if (!timestamp_queries_enabled || ago_timestamp_query_pool_ == VK_NULL_HANDLE || !commandBatchInProgress) {
+        return;
+    }
+    if (query_index >= kAgoTimestampQueryCount) {
+        return;
+    }
+    vkCmdWriteTimestamp(command_buffer, stage, ago_timestamp_query_pool_, query_index);
+}
+
+double VulkanGSPipeline::readTimestampDeltaMs(uint32_t start_query, uint32_t end_query) const {
+    if (!timestamp_queries_enabled || ago_timestamp_query_pool_ == VK_NULL_HANDLE ||
+        timestamp_period_ns_ <= 0.0 ||
+        start_query >= kAgoTimestampQueryCount || end_query >= kAgoTimestampQueryCount ||
+        end_query <= start_query) {
+        return 0.0;
+    }
+    const uint32_t count = (end_query - start_query) + 1u;
+    std::vector<uint64_t> values(count, 0u);
+    const VkResult qr = vkGetQueryPoolResults(
+        device,
+        ago_timestamp_query_pool_,
+        start_query,
+        count,
+        sizeof(uint64_t) * count,
+        values.data(),
+        sizeof(uint64_t),
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT
+    );
+    if (qr != VK_SUCCESS) {
+        return 0.0;
+    }
+    const uint64_t t0 = values.front();
+    const uint64_t t1 = values.back();
+    if (t1 < t0) {
+        return 0.0;
+    }
+    return static_cast<double>(t1 - t0) * timestamp_period_ns_ * 1e-6;
+}
+
+void VulkanGSPipeline::beginDebugLabel(const char* name, float r, float g, float b, float a) {
+    if (!pfn_cmd_begin_debug_label_ || !commandBatchInProgress || !name) {
+        return;
+    }
+    VkDebugUtilsLabelEXT label{};
+    label.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT;
+    label.pLabelName = name;
+    label.color[0] = r;
+    label.color[1] = g;
+    label.color[2] = b;
+    label.color[3] = a;
+    pfn_cmd_begin_debug_label_(command_buffer, &label);
+}
+
+void VulkanGSPipeline::endDebugLabel() {
+    if (!pfn_cmd_end_debug_label_ || !commandBatchInProgress) {
+        return;
+    }
+    pfn_cmd_end_debug_label_(command_buffer);
 }
 
 
@@ -1104,6 +1221,53 @@ void VulkanGSPipeline::executeCompute(
             std::to_string(deviceInfo.maxGroupsZ) + "]"
         );
     vkCmdDispatch(command_buffer, nGroupsX, nGroupsY, nGroupsZ);
+}
+
+void VulkanGSPipeline::executeComputeIndirect(
+    const DeviceBuffer& indirect_buf,
+    VkDeviceSize indirect_offset,
+    const void* push_data,
+    size_t push_size,
+    _ComputePipeline& pipeline,
+    const std::vector<DeviceBuffer>& buffers
+) {
+    if (push_size > MAX_UNIFORM_SIZE) {
+        _THROW_ERROR("Maximum uniform size exceeded");
+    }
+    if (indirect_buf.buffer == VK_NULL_HANDLE) {
+        _THROW_ERROR("executeComputeIndirect requires a valid indirect buffer");
+    }
+
+    if (pipeline.buffers != buffers) {
+        HOST_GUARD;
+        updateComputeDescriptorSet(pipeline, buffers);
+        pipeline.buffers = buffers;
+    }
+
+    DEVICE_GUARD;
+
+    vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+    vkCmdBindDescriptorSets(
+        command_buffer,
+        VK_PIPELINE_BIND_POINT_COMPUTE,
+        pipeline.pipeline_layout,
+        0,
+        1,
+        &pipeline.descriptor_set,
+        0,
+        nullptr
+    );
+    if (push_data != nullptr && push_size > 0) {
+        vkCmdPushConstants(
+            command_buffer,
+            pipeline.pipeline_layout,
+            VK_SHADER_STAGE_COMPUTE_BIT,
+            0,
+            static_cast<uint32_t>(push_size),
+            push_data
+        );
+    }
+    vkCmdDispatchIndirect(command_buffer, indirect_buf.buffer, indirect_offset);
 }
 
 

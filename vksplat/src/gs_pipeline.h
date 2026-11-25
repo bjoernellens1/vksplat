@@ -23,6 +23,8 @@ union Uniform32_t {
 
 class VulkanGSPipeline {
 public:
+    using DeviceBuffer = _VulkanBuffer;
+
     VulkanGSPipeline();
     ~VulkanGSPipeline();
 
@@ -74,6 +76,17 @@ public:
     bool writeTimestamp(int delta);
     bool writeTimestampNoExcept(int delta);
     bool isTimestampQueriesEnabled() const { return timestamp_queries_enabled; }
+    // Lightweight dedicated 64-query AGO hardware timestamp pool (independent of PerfTimer).
+    static constexpr uint32_t kAgoTimestampQueryCount = 64;
+    void resetAgoTimestamps(uint32_t first_query = 0, uint32_t query_count = kAgoTimestampQueryCount);
+    void writeAgoTimestamp(uint32_t query_index, VkPipelineStageFlagBits stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    double readTimestampDeltaMs(uint32_t start_query, uint32_t end_query) const;
+    // Optional VK_EXT_debug_utils command-buffer labels for RGP / Perfetto correlation (no-op if unavailable).
+    void beginDebugLabel(const char* name, float r = 0.2f, float g = 0.6f, float b = 0.9f, float a = 1.0f);
+    void endDebugLabel();
+    bool hasDebugUtilsLabels() const {
+        return pfn_cmd_begin_debug_label_ != nullptr && pfn_cmd_end_debug_label_ != nullptr;
+    }
     // Batched steps: only the first step of a batch records the full stage breakdown, the others only the
     // timers the backward-variant scheduler needs (the query pool is small).
     bool timestamp_scheduling_only = false;
@@ -183,7 +196,11 @@ protected:
     void waitAppendFence();
     void freeAppendStage();
     VkQueryPool timestamp_query_pool;
+    VkQueryPool ago_timestamp_query_pool_ = VK_NULL_HANDLE;
+    double timestamp_period_ns_ = 0.0;
     bool timestamp_queries_enabled = false;
+    PFN_vkCmdBeginDebugUtilsLabelEXT pfn_cmd_begin_debug_label_ = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT pfn_cmd_end_debug_label_ = nullptr;
 
     enum class DeviceVendor {
         Unknown,
@@ -280,6 +297,14 @@ protected:
         const std::vector<_VulkanBuffer> &buffers,
         int gate_slot = -1,
         const _VulkanBuffer* indirect = nullptr  // dispatch from this buffer (VkDispatchIndirectCommand at offset 0)
+    );
+    void executeComputeIndirect(
+        const DeviceBuffer& indirect_buf,
+        VkDeviceSize indirect_offset,
+        const void* push_data,
+        size_t push_size,
+        _ComputePipeline& pipeline,
+        const std::vector<DeviceBuffer>& buffers
     );
 
     bool gate_active = false;

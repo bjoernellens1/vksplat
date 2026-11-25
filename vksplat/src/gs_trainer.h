@@ -325,16 +325,71 @@ public:
         float total_predicted_gain = 0.0f;
         float max_predicted_gain = 0.0f;
     };
+    void ensureAgoSelectionBuffers(VulkanGSPipelineBuffers& buffers);
     void select_ago_active_set_gpu_async(
         const TrainerConfig& config,
         VulkanGSPipelineBuffers& buffers,
         float target_fraction = 0.5f,
         float newborn_warmup_steps = 10.0f,
         bool exclude_frozen = true,
-        uint32_t max_budget_splats = 0u
+        uint32_t max_budget_splats = 0u,
+        uint32_t selection_mode = 0u,
+        float budget_cost_units = 0.0f
     );
     AgoCutoffIndirectState get_ago_cutoff_indirect_state();
     bool get_use_ago_indirect_dispatch() const { return use_ago_indirect_dispatch_; }
+
+    // P11-B: GPU-resident 6-component RegionPriorityVector & bounded structural candidates
+    struct AgoRegionPriorityVector {
+        uint32_t region_id = 0u;
+        uint32_t splat_count = 0u;
+        uint32_t eligible_count = 0u;
+        float u_geom = 0.0f;
+        float u_app = 0.0f;
+        float u_split = 0.0f;
+        float u_birth = 0.0f;
+        float u_merge = 0.0f;
+        float u_corr = 0.0f;
+        uint32_t dominant_op = 0u;  // 0=REFINE_GEOM, 1=REFINE_APP, 2=SPLIT, 3=BIRTH, 4=MERGE_PRUNE, 5=CORRECTION
+        uint32_t eligibility_flags = 0u;
+    };
+    struct AgoStructuralCandidates {
+        std::vector<uint32_t> split_candidate_indices;
+        std::vector<uint32_t> prune_candidate_indices;
+        uint32_t split_candidates_total = 0u;
+        uint32_t prune_candidates_total = 0u;
+    };
+    std::vector<AgoRegionPriorityVector> compute_ago_region_priority_vectors(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    );
+    AgoStructuralCandidates compute_ago_structural_candidates(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        uint32_t max_split = 64u,
+        uint32_t max_prune = 64u,
+        float split_scale_thresh = 0.02f,
+        float split_grad_thresh = 1e-4f,
+        float prune_opacity_thresh = 0.05f,
+        float merge_scale_thresh = 0.002f,
+        float newborn_warmup_steps = 10.0f
+    );
+    std::pair<size_t, size_t> dispatchAgoRegionPriorityPass(
+        const TrainerConfig& config,
+        VulkanGSPipelineBuffers& buffers,
+        uint32_t max_split,
+        uint32_t max_prune,
+        float split_scale_thresh,
+        float split_grad_thresh,
+        float prune_opacity_thresh,
+        float merge_scale_thresh,
+        float newborn_warmup_steps
+    );
 
     // AGO-0 / AGO-L0: External strategy operation dispatch (explicitly returns REJECTED_UNSUPPORTED
     // for unsupported ops rather than silently falling back).
@@ -683,11 +738,14 @@ private:
     Buffer<uint32_t> ago_select_summary_buf_;
     Buffer<uint32_t> ago_hist_buf_;
     Buffer<uint32_t> ago_cutoff_indirect_buf_;
+    Buffer<uint32_t> ago_region_accum_buf_;
+    Buffer<uint32_t> ago_structural_cand_buf_;
     bool use_ago_indirect_dispatch_ = false;
     _ComputePipeline pipeline_ago_select_active_set = _ComputePipeline(6);
     _ComputePipeline pipeline_ago_gain_histogram = _ComputePipeline(5);
     _ComputePipeline pipeline_ago_histogram_cutoff = _ComputePipeline(2);
     _ComputePipeline pipeline_ago_select_active_set_indirect = _ComputePipeline(7);
+    _ComputePipeline pipeline_ago_region_vector_priority = _ComputePipeline(7);
     AgoActiveSetSummary last_ago_summary_{};
     float ago_prev_mean_gain_ = 0.0f;
 
