@@ -38,6 +38,7 @@ layout(binding=17) StructuredBuffer<float> depths;
 layout(binding=18) StructuredBuffer<float4> final_depth_state;
 layout(binding=19) StructuredBuffer<float2> train_depth_weight;
 layout(binding=20) RWByteAddressBuffer out_v_depths;
+layout(binding=21) RWStructuredBuffer<uint32_t> out_ago_gpu_counters; // S104: written only when (uniforms.render_exclude_flags & 4u) != 0
 
 [shader("compute")]
 [numthreads(TILE_WIDTH, TILE_HEIGHT, 1)]
@@ -83,8 +84,15 @@ void main(
             InterlockedOr(tile_has_active_splat, 1u);
         }
         GroupMemoryBarrierWithGroupSync();
-        if (tile_has_active_splat == 0u)
+        if (tile_has_active_splat == 0u) {
+            if ((uniforms.render_exclude_flags & 4u) != 0u && thread_rank == 0u) {
+                InterlockedAdd(out_ago_gpu_counters[3], 1u);
+            }
             return;
+        }
+    }
+    if ((uniforms.render_exclude_flags & 4u) != 0u && thread_rank == 0u) {
+        InterlockedAdd(out_ago_gpu_counters[2], 1u);
     }
 
     float4 d_current_pixel_state;

@@ -1393,6 +1393,7 @@ public:
     py::dict ago_get_stage_telemetry() const {
         const bool enabled = trainer.get_ago_stage_profiling();
         const auto& t = trainer.get_ago_stage_timings();
+        const auto& dc = trainer.get_ago_device_counters();
         const auto funnel = trainer.compute_ago_workload_funnel(config, buffers);
 
         auto opt_ms = [enabled](const std::optional<double>& v) -> py::object {
@@ -1400,6 +1401,12 @@ public:
                 return py::none();
             }
             return py::float_(*v);
+        };
+        auto opt_u64 = [enabled](const std::optional<uint64_t>& v) -> py::object {
+            if (!enabled || !v.has_value()) {
+                return py::none();
+            }
+            return py::int_(*v);
         };
 
         py::dict timings;
@@ -1409,6 +1416,12 @@ public:
         timings["backward_raster_ms"] = opt_ms(t.backward_raster_ms);
         timings["optimizer_ms"] = opt_ms(t.optimizer_ms);
         timings["ago_selection_ms"] = opt_ms(t.ago_selection_ms);
+
+        py::dict device_counters;
+        device_counters["gpu_projected_gaussians"] = opt_u64(dc.gpu_projected_gaussians);
+        device_counters["gpu_tile_intersections"] = opt_u64(dc.gpu_tile_intersections);
+        device_counters["gpu_backward_tiles_executed"] = opt_u64(dc.gpu_backward_tiles_executed);
+        device_counters["gpu_backward_tiles_skipped"] = opt_u64(dc.gpu_backward_tiles_skipped);
 
         py::dict wf;
         wf["total_stored_gaussians"] = funnel.total_stored_gaussians;
@@ -1425,6 +1438,7 @@ public:
         py::dict out;
         out["instrumentation_enabled"] = enabled;
         out["stage_timings_ms"] = timings;
+        out["device_executed_counters"] = device_counters;
         out["workload_funnel"] = wf;
         return out;
     }
@@ -2399,9 +2413,9 @@ public:
         trainer.copyToDevice(buffers.v_pixel_state);
     }
 
-    void projection_forward() {
+    void projection_forward(bool profile_counters = false) {
         uniforms.num_splats = (uint32_t)buffers.num_splats;
-        set_render_exclude_flags();
+        set_render_exclude_flags(profile_counters);
         try {
             size_t alloc_reserve = config.strategy == TrainerConfig::Strategy::MCMC ?
                 config.mcmc_alloc_cap() : 0;
@@ -2551,8 +2565,9 @@ public:
         current_train_depth_buf = nullptr;
     }
 
-    // S104: Tells projection_forward whether any group/splat is marked FROZEN_INVISIBLE (render-excluded).
-    void set_render_exclude_flags() {
+    // S104: Tells projection_forward whether any group/splat is marked FROZEN_INVISIBLE (render-excluded)
+    // and whether device-side GPU workload counters (bit 2) are active for this step.
+    void set_render_exclude_flags(bool enable_gpu_counters = false) {
         uint32_t flags = 0u;
         for (uint32_t state : buffers.group_state) {
             if (state == 4u) {
@@ -2567,13 +2582,16 @@ public:
                 break;
             }
         }
-        uniforms.render_exclude_flags = flags;
         uniforms.num_groups = (uint32_t)buffers.group_state.size();
-        if (flags != 0u) {
+        if ((flags & 3u) != 0u) {
             auto deviceGuard = DeviceGuard(&trainer);
             trainer.ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
             uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
         }
+        if (enable_gpu_counters) {
+            flags |= 4u;
+        }
+        uniforms.render_exclude_flags = flags;
     }
 
     // Tells the raster backward which frozen groups exist so that it skips their gradient atomics. The group
@@ -2634,10 +2652,11 @@ public:
             auto deviceGuard = DeviceGuard(&trainer);
 
             if (profile) {
+                trainer.resetAgoGpuCounters();
                 trainer.resetAgoTimestamps(VulkanGSTrainer::kStageQ_ProjStart, 2u);
                 trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
             }
-            projection_forward();
+            projection_forward(profile);
             if (profile) {
                 trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             }
@@ -2692,10 +2711,11 @@ public:
         trainer.gateBeginStep(step_in_batch);
         const bool profile_step = trainer.get_ago_stage_profiling() && (step_in_batch == 0u);
         if (profile_step) {
+            trainer.resetAgoGpuCounters();
             trainer.resetAgoStepStageTimestamps();
             trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         }
-        projection_forward();
+        projection_forward(profile_step);
         if (profile_step) {
             trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_ProjEnd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
             trainer.writeAgoTimestamp(VulkanGSTrainer::kStageQ_TileStart, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
@@ -2839,6 +2859,8 @@ public:
         out["steps_requested"] = static_cast<uint32_t>(n_req);
         out["steps_executed"] = 0u;
         out["cpu_gpu_sync_count"] = 0u;
+        out["intermediate_sync_count"] = 0u;
+        out["envelope_completion_fence_count"] = 0u;
         out["gpu_active_ms"] = 0.0;
         out["gpu_selection_ms"] = 0.0;
         out["overflow"] = false;
@@ -2936,8 +2958,16 @@ public:
             trainer.ensureIsectCapacity(buffers, gate_res.needed + (gate_res.needed >> 1));
         }
 
+        const uint32_t total_fences = static_cast<uint32_t>(fence_waits_after - fence_waits_before);
+        const uint32_t completion_fences = (total_fences > 0u) ? 1u : 0u;
+        const uint32_t intermediate_syncs = (total_fences > completion_fences)
+            ? (total_fences - completion_fences)
+            : 0u;
+
         out["steps_executed"] = gate_res.steps_done;
-        out["cpu_gpu_sync_count"] = static_cast<uint32_t>(fence_waits_after - fence_waits_before);
+        out["cpu_gpu_sync_count"] = total_fences;
+        out["intermediate_sync_count"] = intermediate_syncs;
+        out["envelope_completion_fence_count"] = completion_fences;
         out["gpu_selection_ms"] = trainer.readTimestampDeltaMs(0u, 1u);
         out["gpu_active_ms"] = trainer.readTimestampDeltaMs(0u, 2u);
         out["overflow"] = gate_res.overflow;

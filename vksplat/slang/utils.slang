@@ -773,7 +773,7 @@ struct Uniforms {
     float depth_loss_scale;    // lambda_depth / (H * W); 0.0 disables depth loss
     float depth_huber_delta;   // Huber delta in meters
     float depth_inv_scale;     // 1.0 / world_to_normalized_scale (meters per normalized unit)
-    uint render_exclude_flags; // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER present, bit 1: splat_state FROZEN_INVISIBLE present
+    uint render_exclude_flags; // S104: bit 0: GROUP_STATE_EXCLUDED_RENDER, bit 1: splat FROZEN_INVISIBLE, bit 2: GPU workload counters enabled
 }
 
 // Per-splat evidence states (Sub-Plan V17.7) + SURFEL_2D primitive flag (defined in config.slang)

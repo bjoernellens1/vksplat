@@ -113,9 +113,10 @@ layout(binding=7) RWStructuredBuffer<float2> out_xy_vs;
 layout(binding=8) RWStructuredBuffer<float> out_depths;
 layout(binding=9) RWStructuredBuffer<float4> out_inv_cov_vs;
 layout(binding=10) RWStructuredBuffer<float> out_rgb;
-layout(binding=11) StructuredBuffer<int32_t> group_ids;     // S104: read only when uniforms.render_exclude_flags != 0
+layout(binding=11) StructuredBuffer<int32_t> group_ids;     // S104: read only when (uniforms.render_exclude_flags & 3u) != 0
 layout(binding=12) StructuredBuffer<uint32_t> group_state;
 layout(binding=13) StructuredBuffer<uint32_t> splat_state;
+layout(binding=14) RWStructuredBuffer<uint32_t> out_ago_gpu_counters; // S104: written only when (uniforms.render_exclude_flags & 4u) != 0
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
@@ -170,7 +171,7 @@ void main(
   #if EXPORT_MODE == EXPORT_MODE_VULKAN_FORWARD
     // S104: Pre-projection spatial chunk exclusion (FROZEN_INVISIBLE / GROUP_STATE_EXCLUDED_RENDER).
     // Culled splats emit zero tiles and zero sort entries; FROZEN_VISIBLE (state 2) stays in the render-active set.
-    if (uniforms.render_exclude_flags != 0u) {
+    if ((uniforms.render_exclude_flags & 3u) != 0u) {
         bool excluded = false;
         if ((uniforms.render_exclude_flags & 2u) != 0u && is_splat_frozen_invisible(splat_state[g_idx])) {
             excluded = true;
@@ -317,7 +318,8 @@ void main(
   #endif
 
     // out_radii[g_idx] = (uint32_t)radius;  // inria
-    out_radii[g_idx] = (uint32_t)ceil(max(radii.x, radii.y));  // gsplat, only used in densification
+    const uint32_t out_rad = (uint32_t)ceil(max(radii.x, radii.y));
+    out_radii[g_idx] = out_rad;  // gsplat, only used in densification
     out_tiles_touched[g_idx] = n_tiles;
   #if USE_EMULATED_INT64
     out_rect_tile_space[2*g_idx+0] = (int32_t)rect_tile_space.min_x | ((int32_t)rect_tile_space.min_y << 16);
@@ -337,6 +339,11 @@ void main(
     out_depths[g_idx] = splat.xyz_vs.z;
     out_inv_cov_vs[g_idx] = splat.inv_cov_vs_opac;
     write_t3_float3(splat.rgb, g_idx, out_rgb);
+
+    if ((uniforms.render_exclude_flags & 4u) != 0u && out_rad > 0u && n_tiles > 0) {
+        InterlockedAdd(out_ago_gpu_counters[0], 1u);
+        InterlockedAdd(out_ago_gpu_counters[1], uint32_t(n_tiles));
+    }
 
 #elif EXPORT_MODE == EXPORT_MODE_VULKAN_BACKWARD
 
