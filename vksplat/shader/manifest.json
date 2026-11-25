@@ -193,12 +193,22 @@
         },
         "ago_select_active_set.slang": {
             "sources": {
-                "slang/ago_select_active_set.slang": "a113fe71e04cf1d6aeba91f227a412c92bcc2f805ff8f7aaf75df3f909f67344",
+                "slang/ago_select_active_set.slang": "38a7cc324660826f56e2f0d5e5a9a3d34675eb06e6ad19757e19ad1253cb3d76",
                 "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
             },
             "outputs": {
                 "shader/generated/ago_gain_histogram.spv": "4297fc4f0d60a84823e531bec9ea117048756152369cdb8080e405c90f145a7e",
-                "shader/generated/ago_select_active_set.spv": "bf8506851dbd1455e9865992abf51a7ec168bc433eab708cf3108cb05cc92d26"
+                "shader/generated/ago_select_active_set.spv": "bf8506851dbd1455e9865992abf51a7ec168bc433eab708cf3108cb05cc92d26",
+                "shader/generated/ago_select_active_set_indirect.spv": "f28e070a6a5175a4d5cd46bc08c3354d7524fa973615a0d26af79bf895245e29"
+            }
+        },
+        "ago_histogram_cutoff.slang": {
+            "sources": {
+                "slang/ago_histogram_cutoff.slang": "cb32285a341f84d9c8bb417ff41244bb7c111a4756000f2023dc60672c416c43",
+                "slang/config.slang": "a64cad64c68507f199c0118852fcac56ff216cc119f5ef3dd59bdf4400b534bd"
+            },
+            "outputs": {
+                "shader/generated/ago_histogram_cutoff.spv": "9e1888fed0bc8c5f4603690bf8214b3dabd974f0eac142cd2b23783c5a34100b"
             }
         },
         "temporal_depth_reproject.slang": {

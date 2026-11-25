@@ -347,10 +347,16 @@ class ShaderCompiler:
             ShaderJob("appearance_init", {}),
         ], ["config.slang"]))
 
-        # GPU-resident AGO-2 active-set compaction, 256-bin log-gain histogram, & step-gain summary
+        # GPU-resident AGO-2 active-set compaction, 256-bin log-gain histogram, & indirect compaction
         jobs.append(("ago_select_active_set.slang", [
             ShaderJob("ago_select_active_set", {"ENTRY": 0}),
             ShaderJob("ago_gain_histogram", {"ENTRY": 1}),
+            ShaderJob("ago_select_active_set_indirect", {"ENTRY": 2}),
+        ], ["config.slang"]))
+
+        # GPU-native 1-workgroup AGO histogram cutoff & VkDispatchIndirectCommand generator
+        jobs.append(("ago_histogram_cutoff.slang", [
+            ShaderJob("ago_histogram_cutoff", {}),
         ], ["config.slang"]))
 
         # GPU temporal depth reprojection (atomic uint32 z-buffer + cosine weight + support count)

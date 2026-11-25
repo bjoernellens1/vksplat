@@ -306,4 +306,137 @@ void main(
     }
 }
 
+#elif ENTRY == 2
+
+// GPU-native indirect compaction: reads cutoff_bin, boundary_quota, active_set_state, and mode
+// directly from `cutoff_indirect_buf` (written by `ago_histogram_cutoff.slang`) with zero host readback.
+layout(binding=4) RWStructuredBuffer<uint32_t> active_indices;
+layout(binding=5) RWByteAddressBuffer summary_buf;
+layout(binding=6) ByteAddressBuffer cutoff_indirect_buf;
+
+groupshared uint32_t s_wg_count;
+groupshared uint32_t s_wg_base;
+groupshared uint32_t s_elig[BLOCK_SIZE];
+groupshared float s_gain[BLOCK_SIZE];
+groupshared float s_max_gain[BLOCK_SIZE];
+
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void main(
+    uint3 groupThreadID : SV_GroupThreadID,
+    uint3 dispatchThreadID : SV_DispatchThreadID,
+    uniform AgoSelectUniforms u
+) {
+    const uint32_t lid = groupThreadID.x;
+    const uint32_t g_idx = dispatchThreadID.x;
+
+    const uint32_t cutoff_bin = cutoff_indirect_buf.Load(12u);
+    const uint32_t boundary_quota = cutoff_indirect_buf.Load(16u);
+    const uint32_t active_state = cutoff_indirect_buf.Load(24u);
+    const uint32_t mode = cutoff_indirect_buf.Load(28u);
+
+    bool selected = false;
+    uint32_t eligible = 0u;
+    float gain_pos = 0.0f;
+
+    if (g_idx < u.num_splats) {
+        if (!ago_is_frozen(g_idx, u)) {
+            eligible = 1u;
+            const uint32_t base = 2u * g_idx;
+            const float4 t0 = ago_telemetry[base + 0u];
+            const float4 t1 = ago_telemetry[base + 1u];
+            const float base_gain = (t1.w != 0.0f) ? t1.w : t0.z;
+            float score = base_gain + 0.25f * t0.w;
+            if (!isfinite(score)) {
+                score = 0.0f;
+            }
+            gain_pos = max(score, 0.0f);
+            const bool is_newborn = (t1.x < u.newborn_warmup_steps);
+
+            if (active_state == 0u || mode == 0u) {
+                // ActiveSetState::EMPTY — never falls back to full dispatch
+                selected = false;
+            } else if (active_state == 2u) {
+                // ActiveSetState::FULL — select all eligible splats
+                selected = true;
+            } else if (mode == 1u) {
+                if (is_newborn) {
+                    selected = true;
+                } else {
+                    const uint32_t bin = ago_gain_to_bin(gain_pos);
+                    if (bin > cutoff_bin) {
+                        selected = true;
+                    } else if (bin == cutoff_bin && boundary_quota > 0u) {
+                        uint32_t slot = 0u;
+                        summary_buf.InterlockedAdd(16u, 1u, slot);
+                        selected = (slot < boundary_quota);
+                    }
+                }
+            } else if (mode == 2u) {
+                if (is_newborn) {
+                    const uint32_t bin = ago_gain_to_bin(gain_pos);
+                    if (bin > cutoff_bin) {
+                        selected = true;
+                    } else if (bin == cutoff_bin && boundary_quota > 0u) {
+                        uint32_t slot = 0u;
+                        summary_buf.InterlockedAdd(16u, 1u, slot);
+                        selected = (slot < boundary_quota);
+                    }
+                }
+            }
+        }
+    }
+
+    if (lid == 0u) {
+        s_wg_count = 0u;
+        s_wg_base = 0u;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint32_t local_slot = 0u;
+    if (selected) {
+        InterlockedAdd(s_wg_count, 1u, local_slot);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lid == 0u && s_wg_count > 0u) {
+        summary_buf.InterlockedAdd(0u, s_wg_count, s_wg_base);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (selected) {
+        active_indices[s_wg_base + local_slot] = g_idx;
+    }
+
+    s_elig[lid] = eligible;
+    s_gain[lid] = gain_pos;
+    s_max_gain[lid] = gain_pos;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint32_t stride = BLOCK_SIZE >> 1u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            s_elig[lid] += s_elig[lid + stride];
+            s_gain[lid] += s_gain[lid + stride];
+            s_max_gain[lid] = max(s_max_gain[lid], s_max_gain[lid + stride]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (lid == 0u) {
+        if (s_elig[0] > 0u) {
+            summary_buf.InterlockedAdd(8u, s_elig[0]);
+        }
+        if (s_gain[0] > 0.0f) {
+#if USE_EMULATED_F32_ATOMIC
+            AtomicAddFloat(summary_buf, 4u, s_gain[0]);
+#else
+            summary_buf.InterlockedAddF32(4u, s_gain[0]);
+#endif
+        }
+        if (s_max_gain[0] > 0.0f) {
+            summary_buf.InterlockedMax(12u, asuint(s_max_gain[0]));
+        }
+    }
+}
+
 #endif

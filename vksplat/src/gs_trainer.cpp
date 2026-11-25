@@ -147,6 +147,10 @@ void VulkanGSTrainer::cleanup() {
     destroyBuffer(ago_hist_buf_.deviceBuffer);
     ago_hist_buf_.clear();
     ago_hist_buf_.shrink_to_fit();
+    destroyBuffer(ago_cutoff_indirect_buf_.deviceBuffer);
+    ago_cutoff_indirect_buf_.clear();
+    ago_cutoff_indirect_buf_.shrink_to_fit();
+    use_ago_indirect_dispatch_ = false;
     last_ago_summary_ = {};
     ago_prev_mean_gain_ = 0.0f;
     destroyBuffer(treproj_src_depths_.deviceBuffer);
@@ -224,6 +228,8 @@ void VulkanGSTrainer::initialize(const std::map<std::string, std::string> &spirv
     createComputePipeline(pipeline_appearance_init, spirv_paths.at("appearance_init"));
     createComputePipeline(pipeline_ago_select_active_set, spirv_paths.at("ago_select_active_set"));
     createComputePipeline(pipeline_ago_gain_histogram, spirv_paths.at("ago_gain_histogram"));
+    createComputePipeline(pipeline_ago_histogram_cutoff, spirv_paths.at("ago_histogram_cutoff"));
+    createComputePipeline(pipeline_ago_select_active_set_indirect, spirv_paths.at("ago_select_active_set_indirect"));
     createComputePipeline(pipeline_temporal_depth_scatter, spirv_paths.at("temporal_depth_reproject_scatter"));
     createComputePipeline(pipeline_temporal_depth_finalize, spirv_paths.at("temporal_depth_reproject_finalize"));
 
@@ -1020,6 +1026,8 @@ bool VulkanGSTrainer::stepIsDeferrable(const TrainerConfig &config, int step) co
     // reallocation) and keep the synchronous path; the common step is only forward/backward/optimizer.
     if (config.selective_plane_freeze)
         return false;
+    if (config.external_strategy_mode)
+        return true;
     const int every = std::max(config.refine_every, 1);
     if (config.strategy == TrainerConfig::Strategy::MCMC) {
         const bool in_window = step < config.refine_stop_iter && step > config.refine_start_iter;
@@ -1632,6 +1640,7 @@ VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_exact_k_gpu(
 
     active_splat_count_ = target_k;
     use_active_index_dispatch_ = true;
+    use_ago_indirect_dispatch_ = false;
     summary.active_count = target_k;
     summary.active_fraction = static_cast<float>(target_k) / static_cast<float>(n);
     summary.gain_threshold = gain_thr;
@@ -1640,6 +1649,302 @@ VulkanGSTrainer::AgoActiveSetSummary VulkanGSTrainer::select_ago_exact_k_gpu(
     last_ago_summary_ = summary;
     ago_prev_mean_gain_ = mean_gain;
     return summary;
+}
+
+void VulkanGSTrainer::select_ago_active_set_gpu_async(
+    const TrainerConfig& config,
+    VulkanGSPipelineBuffers& buffers,
+    float target_fraction,
+    float newborn_warmup_steps,
+    bool exclude_frozen,
+    uint32_t max_budget_splats
+) {
+    const size_t n = buffers.num_splats;
+    const float frac = std::isfinite(target_fraction) ? std::clamp(target_fraction, 0.0f, 1.0f) : 0.0f;
+    static constexpr size_t kHistWords = 4u + 512u;
+    static constexpr size_t kCutoffIndirectWords = 12u;
+
+    if (ago_cutoff_indirect_buf_.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        ago_cutoff_indirect_buf_.deviceSize() < kCutoffIndirectWords) {
+        resizeDeviceBuffer(ago_cutoff_indirect_buf_, kCutoffIndirectWords);
+    }
+
+    if (n == 0) {
+        DEVICE_GUARD;
+        vkCmdFillBuffer(
+            command_buffer,
+            ago_cutoff_indirect_buf_.deviceBuffer.buffer,
+            0,
+            kCutoffIndirectWords * sizeof(uint32_t),
+            0u
+        );
+        VkBufferMemoryBarrier empty_barrier{};
+        empty_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        empty_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        empty_barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        empty_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        empty_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        empty_barrier.buffer = ago_cutoff_indirect_buf_.deviceBuffer.buffer;
+        empty_barrier.offset = 0;
+        empty_barrier.size = kCutoffIndirectWords * sizeof(uint32_t);
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &empty_barrier, 0, nullptr
+        );
+        active_splat_count_ = 0u;
+        use_active_index_dispatch_ = true;
+        use_ago_indirect_dispatch_ = true;
+        active_set_generation_ = map_generation_;
+        return;
+    }
+
+    ensureGroupBuffersOnDevice(buffers, n);
+    if (ago_telemetry_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_telemetry_buf_.deviceSize() < 8 * n) {
+        DEVICE_GUARD;
+        resizeAndCopyDeviceBuffer(ago_telemetry_buf_, 8 * n, true);
+    }
+    const size_t padded_indices = _CEIL_ROUND(n, SUBGROUP_SIZE);
+    if (active_indices_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || active_indices_buf_.deviceSize() < padded_indices) {
+        resizeDeviceBuffer(active_indices_buf_, padded_indices);
+    }
+    if (ago_select_summary_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_select_summary_buf_.deviceSize() < 5) {
+        resizeDeviceBuffer(ago_select_summary_buf_, 5);
+    }
+    if (ago_hist_buf_.deviceBuffer.buffer == VK_NULL_HANDLE || ago_hist_buf_.deviceSize() < kHistWords) {
+        resizeDeviceBuffer(ago_hist_buf_, kHistWords);
+    }
+
+    Uniform32_t u_sel[10];
+    u_sel[0].u = static_cast<uint32_t>(n);
+    u_sel[1].u = static_cast<uint32_t>(buffers.group_state.deviceSize());
+    u_sel[2].u = config.mcmc_protect_structural_groups ? 1u : 0u;
+    u_sel[3].u = exclude_frozen ? 1u : 0u;
+    u_sel[4].f = 0.0f;
+    u_sel[5].f = newborn_warmup_steps;
+    u_sel[6].u = 0u;
+    u_sel[7].u = 0u;
+    u_sel[8].u = 0u;
+    u_sel[9].u = 0u;
+
+    Uniform32_t u_cut[4];
+    u_cut[0].u = static_cast<uint32_t>(n);
+    u_cut[1].u = static_cast<uint32_t>(SUBGROUP_SIZE);
+    u_cut[2].f = frac;
+    u_cut[3].u = max_budget_splats;
+
+    // Single non-blocking command batch: histogram -> on-device cutoff -> indirect compaction.
+    // ZERO synchronous host readbacks.
+    {
+        DEVICE_GUARD;
+
+        vkCmdFillBuffer(
+            command_buffer,
+            ago_hist_buf_.deviceBuffer.buffer,
+            0,
+            kHistWords * sizeof(uint32_t),
+            0u
+        );
+        vkCmdFillBuffer(
+            command_buffer,
+            ago_select_summary_buf_.deviceBuffer.buffer,
+            0,
+            5 * sizeof(uint32_t),
+            0u
+        );
+        vkCmdFillBuffer(
+            command_buffer,
+            ago_cutoff_indirect_buf_.deviceBuffer.buffer,
+            0,
+            kCutoffIndirectWords * sizeof(uint32_t),
+            0u
+        );
+        // Sentinel-fill active_indices with 0xFFFFFFFF so tail threads in the final
+        // indirect workgroup exit cleanly without needing a host-side count.
+        vkCmdFillBuffer(
+            command_buffer,
+            active_indices_buf_.deviceBuffer.buffer,
+            0,
+            padded_indices * sizeof(uint32_t),
+            0xFFFFFFFFu
+        );
+
+        bufferMemoryBarrier({
+            { ago_hist_buf_.deviceBuffer, TRANSFER_WRITE },
+            { ago_select_summary_buf_.deviceBuffer, TRANSFER_WRITE },
+            { ago_cutoff_indirect_buf_.deviceBuffer, TRANSFER_WRITE },
+            { active_indices_buf_.deviceBuffer, TRANSFER_WRITE },
+            { ago_telemetry_buf_.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.splat_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_ids.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+            { buffers.group_state.deviceBuffer, TRANSFER_COMPUTE_SHADER_READ_WRITE },
+        }, COMPUTE_SHADER_READ_WRITE);
+
+        // Pass 1: 256-bin log-gain histogram (mature + newborn)
+        executeCompute(
+            {{n, 256}},
+            &u_sel, sizeof(u_sel),
+            pipeline_ago_gain_histogram,
+            {
+                ago_telemetry_buf_.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                ago_hist_buf_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { ago_hist_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ);
+
+        // Pass 2: 1-workgroup (256-thread) on-device reverse prefix-sum cutoff & VkDispatchIndirectCommand
+        executeCompute(
+            {{256, 256}},
+            &u_cut, sizeof(u_cut),
+            pipeline_ago_histogram_cutoff,
+            {
+                ago_hist_buf_.deviceBuffer,
+                ago_cutoff_indirect_buf_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { ago_cutoff_indirect_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, COMPUTE_SHADER_READ);
+
+        // Pass 3: GPU-native compaction reading cutoff parameters directly from ago_cutoff_indirect_buf_
+        executeCompute(
+            {{n, 256}},
+            &u_sel, sizeof(u_sel),
+            pipeline_ago_select_active_set_indirect,
+            {
+                ago_telemetry_buf_.deviceBuffer,
+                buffers.splat_state.deviceBuffer,
+                buffers.group_ids.deviceBuffer,
+                buffers.group_state.deviceBuffer,
+                active_indices_buf_.deviceBuffer,
+                ago_select_summary_buf_.deviceBuffer,
+                ago_cutoff_indirect_buf_.deviceBuffer,
+            }
+        );
+
+        bufferMemoryBarrier({
+            { active_indices_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            { ago_select_summary_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+        }, TRANSFER_COMPUTE_SHADER_READ_WRITE);
+
+        VkBufferMemoryBarrier indirect_barrier{};
+        indirect_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        indirect_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        indirect_barrier.dstAccessMask = VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+        indirect_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        indirect_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        indirect_barrier.buffer = ago_cutoff_indirect_buf_.deviceBuffer.buffer;
+        indirect_barrier.offset = 0;
+        indirect_barrier.size = kCutoffIndirectWords * sizeof(uint32_t);
+        vkCmdPipelineBarrier(
+            command_buffer,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 0, nullptr, 1, &indirect_barrier, 0, nullptr
+        );
+    }
+
+    active_splat_count_ = static_cast<uint32_t>(n);
+    use_active_index_dispatch_ = true;
+    use_ago_indirect_dispatch_ = true;
+    active_set_generation_ = map_generation_;
+}
+
+VulkanGSTrainer::AgoCutoffIndirectState VulkanGSTrainer::get_ago_cutoff_indirect_state() {
+    AgoCutoffIndirectState out{};
+    static constexpr size_t kCutoffIndirectWords = 12u;
+    if (ago_cutoff_indirect_buf_.deviceBuffer.buffer == VK_NULL_HANDLE ||
+        ago_cutoff_indirect_buf_.deviceSize() < kCutoffIndirectWords) {
+        return out;
+    }
+    uint32_t raw[kCutoffIndirectWords] = {};
+    allocStagingBuffer(sizeof(raw));
+    {
+        std::lock_guard<std::mutex> lock(stager.mutex);
+        {
+            DEVICE_GUARD;
+            bufferMemoryBarrier({
+                { ago_cutoff_indirect_buf_.deviceBuffer, COMPUTE_SHADER_WRITE },
+            }, TRANSFER_READ);
+            VkBufferCopy copy_region{};
+            copy_region.srcOffset = 0;
+            copy_region.dstOffset = 0;
+            copy_region.size = sizeof(raw);
+            vkCmdCopyBuffer(
+                command_buffer,
+                ago_cutoff_indirect_buf_.deviceBuffer.buffer,
+                stager.buffer,
+                1,
+                &copy_region
+            );
+        }
+        HOST_GUARD;
+        void* mapped = nullptr;
+        vkMapMemory(device, stager.memory, 0, sizeof(raw), 0, &mapped);
+        memcpy(raw, mapped, sizeof(raw));
+        vkUnmapMemory(device, stager.memory);
+    }
+    out.group_count_x = raw[0];
+    out.group_count_y = raw[1];
+    out.group_count_z = raw[2];
+    out.cutoff_bin = raw[3];
+    out.boundary_quota = raw[4];
+    out.selected_count = raw[5];
+    out.active_set_state = raw[6];
+    out.selection_mode = raw[7];
+    out.eligible_count = raw[8];
+    out.newborn_count = raw[9];
+    memcpy(&out.total_predicted_gain, &raw[10], sizeof(float));
+    memcpy(&out.max_predicted_gain, &raw[11], sizeof(float));
+    return out;
+}
+
+vksplat::ago::CompletionStatus VulkanGSTrainer::ago_execute_external_op(
+    const TrainerConfig& config,
+    VulkanGSPipelineBuffers& buffers,
+    vksplat::ago::OperationType op,
+    int32_t group_id
+) {
+    using vksplat::ago::CompletionStatus;
+    using vksplat::ago::OperationType;
+    if (!config.external_strategy_mode) {
+        return CompletionStatus::REJECTED_INVALID;
+    }
+    switch (op) {
+        case OperationType::FREEZE:
+            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+                return CompletionStatus::REJECTED_INVALID;
+            }
+            buffers.group_state[static_cast<size_t>(group_id)] = 2u;  // LOCKED
+            return CompletionStatus::OK;
+        case OperationType::REOPEN:
+            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+                return CompletionStatus::REJECTED_INVALID;
+            }
+            buffers.group_state[static_cast<size_t>(group_id)] = 0u;  // FREE
+            return CompletionStatus::OK;
+        case OperationType::RETRACT:
+            if (group_id < 0 || static_cast<size_t>(group_id) >= buffers.group_state.size()) {
+                return CompletionStatus::REJECTED_INVALID;
+            }
+            buffers.group_state[static_cast<size_t>(group_id)] = 3u;  // RETRACTED
+            bumpMapGeneration();
+            return CompletionStatus::OK;
+        case OperationType::REFINE:
+            // Photometric refinement is handled by the active-set optimizer step.
+            return CompletionStatus::OK;
+        default:
+            // Explicit error status rather than silently falling back to ADC/MCMC.
+            return CompletionStatus::REJECTED_UNSUPPORTED;
+    }
 }
 
 VulkanGSTrainer::TemporalDepthReprojectResult VulkanGSTrainer::reproject_temporal_depth_gpu(
@@ -1886,7 +2191,9 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
 ) {
     const size_t num_splats = buffers.num_splats;
     const bool dispatch_active = use_active_index_dispatch_ && (active_set_generation_ == map_generation_);
-    if (num_splats == 0 || (dispatch_active && active_splat_count_ == 0u)) {
+    const bool use_indirect_ago = dispatch_active && use_ago_indirect_dispatch_ &&
+                                  (ago_cutoff_indirect_buf_.deviceBuffer.buffer != VK_NULL_HANDLE);
+    if (num_splats == 0 || (dispatch_active && !use_indirect_ago && active_splat_count_ == 0u)) {
         return;
     }
 
@@ -1894,8 +2201,10 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     PerfTimer::Timer<PerfTimer::FusedProjectionBackwardOptimizerStep> timer(this);
 
     const bool use_active_dispatch =
-        dispatch_active && active_splat_count_ > 0u && active_splat_count_ < num_splats;
-    const size_t dispatch_count = use_active_dispatch ? static_cast<size_t>(active_splat_count_) : num_splats;
+        use_indirect_ago || (dispatch_active && active_splat_count_ > 0u && active_splat_count_ < num_splats);
+    const size_t dispatch_count = use_indirect_ago
+        ? num_splats
+        : (use_active_dispatch ? static_cast<size_t>(active_splat_count_) : num_splats);
 
     const bool depth_loss_active = (uniforms.depth_loss_scale > 0.0f &&
                                     buffers.v_depths.deviceBuffer.buffer != VK_NULL_HANDLE);
@@ -1975,7 +2284,9 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
     shaderUniforms.protect_locked_groups = config.mcmc_protect_structural_groups ? 1u : 0u;
     shaderUniforms.num_anchors = static_cast<uint32_t>(buffers.splat_anchor.deviceSize() / 8);
     shaderUniforms.normal_scale_cap = config.surfel_normal_cap_m * scene_scale;
-    shaderUniforms.active_splat_count = use_active_dispatch ? active_splat_count_ : static_cast<uint32_t>(num_splats);
+    shaderUniforms.active_splat_count = use_indirect_ago
+        ? static_cast<uint32_t>(num_splats)
+        : (use_active_dispatch ? active_splat_count_ : static_cast<uint32_t>(num_splats));
     shaderUniforms.use_active_index_dispatch = use_active_dispatch ? 1u : 0u;
     shaderUniforms.ago_telemetry_enabled = ago_telemetry_enabled_ ? 1u : 0u;
     shaderUniforms.depth_loss_enabled = depth_loss_active ? 1u : 0u;
@@ -2025,7 +2336,8 @@ void VulkanGSTrainer::executeFusedProjectionBackwardOptimizerStep(
             ago_telemetry_enabled_ ? ago_abs_grad_step_buf_.deviceBuffer : ago_telemetry_buf_.deviceBuffer,
             depth_loss_active ? buffers.v_depths.deviceBuffer : ago_telemetry_buf_.deviceBuffer,
         },
-        GATE_OPTIMIZER
+        use_indirect_ago ? -1 : GATE_OPTIMIZER,
+        use_indirect_ago ? &ago_cutoff_indirect_buf_.deviceBuffer : nullptr
     );
 
     if (selective_active && anchored_xyz_snapshot_valid && num_anchored_splats <= num_splats) {
@@ -2073,6 +2385,9 @@ void VulkanGSTrainer::executeDefaultPostBackward(
     VulkanGSPipelineBuffers& buffers,
     int step
 ) {
+    if (config.external_strategy_mode) {
+        return;
+    }
     DEVICE_GUARD;
     PerfTimer::Timer<PerfTimer::DefaultPostBackward> timer(this);
 
@@ -2755,6 +3070,9 @@ void VulkanGSTrainer::executeMCMCPostBackward(
     VulkanGSPipelineBuffers& buffers,
     int step
 ) {
+    if (config.external_strategy_mode) {
+        return;
+    }
     DEVICE_GUARD;
     PerfTimer::Timer<PerfTimer::MCMCPostBackward> timer(this);
 

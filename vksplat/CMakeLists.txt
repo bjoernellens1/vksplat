@@ -60,6 +60,10 @@ set(SOURCES
     src/gs_renderer.cpp
     src/gs_trainer.cpp
     src/perf_timer.cpp
+    src/ago/spatial/dirty_tracking.cpp
+    src/ago/core/admission_control.cpp
+    src/ago/core/scheduler.cpp
+    src/ago/runtime/gpu_executor.cpp
     src/python_bindings.cpp
 )
 
@@ -73,6 +77,12 @@ set(HEADERS
     src/gs_renderer.h
     src/gs_trainer.h
     src/perf_timer.h
+    src/ago/core/action_protocol.h
+    src/ago/core/mailbox.h
+    src/ago/core/admission_control.h
+    src/ago/core/scheduler.h
+    src/ago/spatial/dirty_tracking.h
+    src/ago/runtime/gpu_executor.h
 )
 
 # Create the Python module
