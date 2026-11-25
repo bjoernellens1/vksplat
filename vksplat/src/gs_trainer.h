@@ -4,10 +4,12 @@
 
 #include "colmap_reader.h"
 #include "ago/core/action_protocol.h"
+#include "ago/runtime/gpu_executor.h"
 
 #include <random>
 #include <atomic>
 #include <limits>
+#include <unordered_map>
 
 
 // see simple_trainer.py for details
@@ -130,6 +132,15 @@ struct TrainerConfig {
     // AGO-0 External Strategy Ownership: when true, disables internal ADC densification,
     // MCMC growth/relocation, and global opacity resets so AGO owns splat lifecycle.
     bool external_strategy_mode = false;
+    // AGO-L0 Parameter-specific refinement bitmask:
+    //   PARAM_POS=1, PARAM_ROT=2, PARAM_SCALE=4, PARAM_OPAC=8, PARAM_SH=16 (default 31 = all)
+    static constexpr uint32_t AGO_PARAM_POS   = 1u;
+    static constexpr uint32_t AGO_PARAM_ROT   = 2u;
+    static constexpr uint32_t AGO_PARAM_SCALE = 4u;
+    static constexpr uint32_t AGO_PARAM_OPAC  = 8u;
+    static constexpr uint32_t AGO_PARAM_SH    = 16u;
+    static constexpr uint32_t AGO_PARAM_ALL   = 31u;
+    uint32_t ago_param_mask = AGO_PARAM_ALL;
 };
 
 
@@ -325,7 +336,7 @@ public:
     AgoCutoffIndirectState get_ago_cutoff_indirect_state();
     bool get_use_ago_indirect_dispatch() const { return use_ago_indirect_dispatch_; }
 
-    // AGO-0: External strategy operation dispatch (explicitly returns REJECTED_UNSUPPORTED
+    // AGO-0 / AGO-L0: External strategy operation dispatch (explicitly returns REJECTED_UNSUPPORTED
     // for unsupported ops rather than silently falling back).
     vksplat::ago::CompletionStatus ago_execute_external_op(
         const TrainerConfig& config,
@@ -333,6 +344,18 @@ public:
         vksplat::ago::OperationType op,
         int32_t group_id = -1
     );
+
+    // AGO-L0: Bit-exact RAM eviction & restoration of Gaussian params, Adam moments, and group states.
+    uint64_t ago_offload_snapshot_to_ram(VulkanGSPipelineBuffers& buffers);
+    bool ago_restore_snapshot_from_ram(VulkanGSPipelineBuffers& buffers, uint64_t snapshot_id);
+    bool ago_drop_ram_snapshot(uint64_t snapshot_id);
+    size_t ago_ram_snapshot_bytes(uint64_t snapshot_id) const;
+
+    // AGO-L0: Non-blocking Vulkan GPU executor wired to trainer device/queue with clean teardown.
+    vksplat::ago::NonBlockingGpuExecutor& ago_gpu_executor() { return ago_gpu_executor_; }
+    vksplat::ago::SubmitResult ago_gpu_submit_action(const vksplat::ago::AGOAction& action);
+    std::vector<vksplat::ago::CompletionRecord> ago_gpu_poll_completions(size_t max_count = 16u);
+    void ago_gpu_shutdown() { ago_gpu_executor_.shutdown(); }
 
     AgoActiveSetSummary get_ago_step_gain_summary(size_t current_num_gaussians) const;
 
@@ -667,6 +690,41 @@ private:
     _ComputePipeline pipeline_ago_select_active_set_indirect = _ComputePipeline(7);
     AgoActiveSetSummary last_ago_summary_{};
     float ago_prev_mean_gain_ = 0.0f;
+
+    // AGO-L0: Non-blocking GPU executor + device marker buffer + host RAM snapshots
+    vksplat::ago::NonBlockingGpuExecutor ago_gpu_executor_;
+    Buffer<uint32_t> ago_exec_marker_buf_;
+    struct AgoRamSnapshot {
+        size_t num_splats = 0;
+        uint64_t map_generation = 1u;
+        int ago_last_step = 0;
+        uint64_t next_splat_uid = 1u;
+        std::vector<uint8_t> xyz_ws_bytes;
+        std::vector<uint8_t> sh_coeffs_bytes;
+        std::vector<uint8_t> rotations_bytes;
+        std::vector<uint8_t> scales_opacs_bytes;
+        std::vector<uint8_t> g_xyz_ws_bytes;
+        std::vector<uint8_t> g_sh_coeffs_1_bytes;
+        std::vector<uint8_t> g_sh_coeffs_2_bytes;
+        std::vector<uint8_t> g_rotations_bytes;
+        std::vector<uint8_t> g_scales_opacs_bytes;
+        std::vector<int32_t> group_ids;
+        std::vector<uint32_t> group_state;
+        std::vector<uint32_t> splat_state;
+        std::vector<int32_t> splat_entity_ids;
+        std::vector<uint64_t> splat_uids;
+        std::vector<float> splat_anchors_host;
+        size_t total_bytes() const noexcept {
+            return xyz_ws_bytes.size() + sh_coeffs_bytes.size() + rotations_bytes.size() +
+                   scales_opacs_bytes.size() + g_xyz_ws_bytes.size() + g_sh_coeffs_1_bytes.size() +
+                   g_sh_coeffs_2_bytes.size() + g_rotations_bytes.size() + g_scales_opacs_bytes.size() +
+                   group_ids.size() * sizeof(int32_t) + group_state.size() * sizeof(uint32_t) +
+                   splat_state.size() * sizeof(uint32_t) + splat_entity_ids.size() * sizeof(int32_t) +
+                   splat_uids.size() * sizeof(uint64_t) + splat_anchors_host.size() * sizeof(float);
+        }
+    };
+    std::unordered_map<uint64_t, AgoRamSnapshot> ago_ram_snapshots_;
+    uint64_t next_ago_snapshot_id_ = 1u;
 
     // Reusable device buffers & pipelines for temporal_depth_reproject.slang
     Buffer<float> treproj_src_depths_;

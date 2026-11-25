@@ -67,45 +67,89 @@ private:
     std::atomic<uint64_t> overwritten_count_{0u};
 };
 
-// Bounded non-blocking ring queue that drops the oldest item when full.
-// Preallocates fixed capacity at construction; zero hot-path heap allocations.
+// Lock-free / wait-free bounded ring queue that drops the oldest item when full.
+// Preallocates fixed capacity at construction; zero hot-path heap allocations and
+// zero spin-locks (no atomic_flag / test_and_set).
+// Supports wait-free SPSC / lock-free MPSC producers and single consumer.
 template <typename T>
 class BoundedDropOldestQueue {
 public:
     explicit BoundedDropOldestQueue(size_t capacity = 256)
         : capacity_(capacity > 0 ? capacity : 1),
-          ring_(capacity_) {}
+          slot_count_(capacity_ + 4u),
+          slots_(slot_count_) {}
 
-    // Never blocks on fullness; if full, drops the oldest entry and inserts `item`.
-    // Returns true if an older entry was dropped.
+    // Never blocks on fullness; if full, advances head_ (dropping oldest) and writes `item`.
+    // Returns true if one or more older entries were dropped.
     bool push(const T& item) noexcept {
-        acquire_flag();
+        const uint64_t pos = tail_.fetch_add(1u, std::memory_order_acq_rel);
+        Slot& slot = slots_[static_cast<size_t>(pos % slot_count_)];
+
+        // Odd sequence marks slot in-flight write; even sequence marks published payload.
+        slot.seq.store((pos << 1u) | 1u, std::memory_order_release);
+        slot.payload = item;
+        slot.seq.store((pos + 1u) << 1u, std::memory_order_release);
+
         bool dropped = false;
-        if (count_ == capacity_) {
-            head_ = (head_ + 1u) % capacity_;
-            --count_;
-            ++dropped_count_;
-            dropped = true;
+        const uint64_t min_head = (pos + 1u > capacity_) ? (pos + 1u - capacity_) : 0u;
+        if (min_head > 0u) {
+            uint64_t h = head_.load(std::memory_order_acquire);
+            while (h < min_head) {
+                if (head_.compare_exchange_weak(
+                        h, min_head, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    dropped_count_.fetch_add(min_head - h, std::memory_order_relaxed);
+                    dropped = true;
+                    break;
+                }
+            }
         }
-        ring_[tail_] = item;
-        tail_ = (tail_ + 1u) % capacity_;
-        ++count_;
-        ++pushed_count_;
-        release_flag();
+        pushed_count_.fetch_add(1u, std::memory_order_relaxed);
         return dropped;
     }
 
     bool try_pop(T& out) noexcept {
-        acquire_flag();
-        if (count_ == 0u) {
-            release_flag();
-            return false;
+        for (;;) {
+            uint64_t h = head_.load(std::memory_order_acquire);
+            const uint64_t t = tail_.load(std::memory_order_acquire);
+            if (h >= t) {
+                return false;
+            }
+            const uint64_t min_valid = (t > capacity_) ? (t - capacity_) : 0u;
+            if (h < min_valid) {
+                if (head_.compare_exchange_weak(
+                        h, min_valid, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    dropped_count_.fetch_add(min_valid - h, std::memory_order_relaxed);
+                }
+                continue;
+            }
+
+            const Slot& slot = slots_[static_cast<size_t>(h % slot_count_)];
+            const uint64_t expected_seq = (h + 1u) << 1u;
+            const uint64_t s1 = slot.seq.load(std::memory_order_acquire);
+            if (s1 < expected_seq) {
+                // Producer claimed `h` but has not finished publishing yet; return non-blocking.
+                return false;
+            }
+            if (s1 > expected_seq) {
+                // Slot was lapped by a newer write; advance head_ past stale slot.
+                head_.compare_exchange_weak(
+                    h, h + 1u, std::memory_order_acq_rel, std::memory_order_acquire);
+                continue;
+            }
+
+            T tmp = slot.payload;
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint64_t s2 = slot.seq.load(std::memory_order_acquire);
+            if (s1 != s2) {
+                continue;
+            }
+
+            if (head_.compare_exchange_strong(
+                    h, h + 1u, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                out = tmp;
+                return true;
+            }
         }
-        out = ring_[head_];
-        head_ = (head_ + 1u) % capacity_;
-        --count_;
-        release_flag();
-        return true;
     }
 
     template <typename Fn>
@@ -120,10 +164,13 @@ public:
     }
 
     size_t size() const noexcept {
-        acquire_flag();
-        const size_t n = count_;
-        release_flag();
-        return n;
+        const uint64_t t = tail_.load(std::memory_order_acquire);
+        const uint64_t h = head_.load(std::memory_order_acquire);
+        if (t <= h) {
+            return 0u;
+        }
+        const uint64_t diff = t - h;
+        return static_cast<size_t>(diff > capacity_ ? capacity_ : diff);
     }
 
     size_t capacity() const noexcept { return capacity_; }
@@ -131,38 +178,34 @@ public:
     bool empty() const noexcept { return size() == 0u; }
 
     uint64_t dropped_count() const noexcept {
-        acquire_flag();
-        const uint64_t d = dropped_count_;
-        release_flag();
-        return d;
+        return dropped_count_.load(std::memory_order_relaxed);
     }
 
     uint64_t pushed_count() const noexcept {
-        acquire_flag();
-        const uint64_t p = pushed_count_;
-        release_flag();
-        return p;
+        return pushed_count_.load(std::memory_order_relaxed);
     }
 
 private:
-    void acquire_flag() const noexcept {
-        while (flag_.test_and_set(std::memory_order_acquire)) {
-            // Short bounded spin; critical section is O(1) memcpy.
+    struct Slot {
+        std::atomic<uint64_t> seq{0u};
+        T payload{};
+        Slot() = default;
+        Slot(const Slot& o) noexcept
+            : seq(o.seq.load(std::memory_order_relaxed)), payload(o.payload) {}
+        Slot& operator=(const Slot& o) noexcept {
+            seq.store(o.seq.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            payload = o.payload;
+            return *this;
         }
-    }
-
-    void release_flag() const noexcept {
-        flag_.clear(std::memory_order_release);
-    }
+    };
 
     size_t capacity_ = 1;
-    std::vector<T> ring_;
-    size_t head_ = 0;
-    size_t tail_ = 0;
-    size_t count_ = 0;
-    uint64_t dropped_count_ = 0;
-    uint64_t pushed_count_ = 0;
-    mutable std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+    size_t slot_count_ = 5;
+    std::vector<Slot> slots_;
+    std::atomic<uint64_t> head_{0u};
+    std::atomic<uint64_t> tail_{0u};
+    std::atomic<uint64_t> dropped_count_{0u};
+    std::atomic<uint64_t> pushed_count_{0u};
 };
 
 // Lock-free bounded FIFO queue (Vyukov MPMC ring) that NEVER drops critical messages

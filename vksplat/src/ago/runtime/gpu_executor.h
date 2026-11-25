@@ -28,7 +28,8 @@ class NonBlockingGpuExecutor : public ActionExecutorInterface {
 public:
     static constexpr uint32_t kDefaultRingSlots = 4u;
 
-    using RecordCallback = std::function<SubmitResult(VkCommandBuffer, const AGOAction&)>;
+    using RecordCallback = std::function<SubmitResult(VkCommandBuffer, const AGOAction&, uint32_t& recorded_ops)>;
+    using TeardownDrainCallback = std::function<void()>;
 
     NonBlockingGpuExecutor() noexcept = default;
     ~NonBlockingGpuExecutor() override;
@@ -45,9 +46,11 @@ public:
     ) noexcept;
 
     void set_record_callback(RecordCallback cb) { record_cb_ = std::move(cb); }
+    void set_teardown_drain_callback(TeardownDrainCallback cb) { teardown_drain_cb_ = std::move(cb); }
 
-    // Destroys Vulkan objects for idle slots (non-blocking; caller should ensure GPU idle on teardown).
-    void shutdown() noexcept;
+    // Safely drains any in-flight submissions before destroying Vulkan command buffers and fences.
+    // Intended for teardown only (outside the scheduler hot path).
+    void shutdown(uint64_t drain_timeout_ms = 5000u) noexcept;
 
     bool is_initialized() const noexcept { return initialized_; }
 
@@ -78,6 +81,7 @@ private:
     double inflight_cost_ms_ = 0.0;
     bool initialized_ = false;
     RecordCallback record_cb_{};
+    TeardownDrainCallback teardown_drain_cb_{};
 };
 
 // Deterministic CPU-only non-blocking executor for unit tests, fault injection, and latency benchmarks.
