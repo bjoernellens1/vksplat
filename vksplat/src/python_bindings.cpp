@@ -496,6 +496,9 @@ public:
             throw std::invalid_argument("group_ids and states must have the same length");
         trainer.set_group_states(buffers, gids.data(), states.data(), static_cast<size_t>(gids.size()));
     }
+    void ago_set_group_render_excluded(int32_t group_id, bool excluded) {
+        trainer.ago_set_group_render_excluded(buffers, group_id, excluded);
+    }
     py::array_t<uint32_t> get_splat_states() {
         const auto& sts = trainer.get_splat_states();
         if (sts.empty()) {
@@ -1417,6 +1420,7 @@ public:
         wf["backward_active_gaussians"] = funnel.backward_active_gaussians;
         wf["geometry_updated_gaussians"] = funnel.geometry_updated_gaussians;
         wf["frozen_gaussians"] = funnel.frozen_gaussians;
+        wf["frozen_invisible_gaussians"] = funnel.frozen_invisible_gaussians;
 
         py::dict out;
         out["instrumentation_enabled"] = enabled;
@@ -2397,6 +2401,7 @@ public:
 
     void projection_forward() {
         uniforms.num_splats = (uint32_t)buffers.num_splats;
+        set_render_exclude_flags();
         try {
             size_t alloc_reserve = config.strategy == TrainerConfig::Strategy::MCMC ?
                 config.mcmc_alloc_cap() : 0;
@@ -2546,15 +2551,41 @@ public:
         current_train_depth_buf = nullptr;
     }
 
+    // S104: Tells projection_forward whether any group/splat is marked FROZEN_INVISIBLE (render-excluded).
+    void set_render_exclude_flags() {
+        uint32_t flags = 0u;
+        for (uint32_t state : buffers.group_state) {
+            if (state == 4u) {
+                flags |= 1u;
+                break;
+            }
+        }
+        const auto& sst = trainer.get_splat_states();
+        for (uint32_t st : sst) {
+            if (st != 0xFFFFFFFFu && (st & 0x00040000u) != 0u) {
+                flags |= 2u;
+                break;
+            }
+        }
+        uniforms.render_exclude_flags = flags;
+        uniforms.num_groups = (uint32_t)buffers.group_state.size();
+        if (flags != 0u) {
+            auto deviceGuard = DeviceGuard(&trainer);
+            trainer.ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+            uniforms.num_groups = (uint32_t)buffers.group_state.deviceSize();
+        }
+    }
+
     // Tells the raster backward which frozen groups exist so that it skips their gradient atomics. The group
     // table is a small host mirror; the device tables are made resident here (inside the open batch if any).
     void set_freeze_flags() {
         uint32_t flags = 0;
         if (config.freeze_skip_backward) {
+            const bool protect_locked = config.mcmc_protect_structural_groups || config.external_strategy_mode;
             for (uint32_t state : buffers.group_state) {
                 if (state == 1u) flags |= 1u;
-                else if (state == 2u && config.mcmc_protect_structural_groups) flags |= 2u;
-                else if (state == 3u) flags |= 2u;
+                else if (state == 2u && protect_locked) flags |= 2u;
+                else if (state == 3u || state == 4u) flags |= 2u;
             }
             if (!trainer.get_splat_states().empty())
                 flags |= 4u;
@@ -3196,7 +3227,7 @@ public:
         const auto& splat_sts = trainer.get_splat_states();
         const auto& gids = trainer.get_splat_group_ids();
         const auto& gstate = buffers.group_state;
-        const bool protect_locked = config.mcmc_protect_structural_groups;
+        const bool protect_locked = config.mcmc_protect_structural_groups || config.external_strategy_mode;
 
         std::vector<uint32_t> active_indices;
         active_indices.reserve(n_total);
@@ -3207,9 +3238,9 @@ public:
             const int32_t gid = (i < gids.size()) ? gids[i] : -1;
             const uint32_t gs = (gid >= 0 && static_cast<size_t>(gid) < gstate.size()) ? gstate[gid] : 0u;
             bool frozen = false;
-            if (gs == 3u) {
+            if (gs == 3u || gs == 4u) {
                 frozen = true;
-            } else if (base_st == 4u) {
+            } else if (base_st == 4u || (raw_st != 0xFFFFFFFFu && (raw_st & 0x00040000u) != 0u)) {
                 frozen = true;
             } else if (base_st == 0xFFFFFFFFu && gs == 2u && protect_locked) {
                 frozen = true;
@@ -4083,8 +4114,11 @@ PYBIND11_MODULE(vksplat, m) {
         .def("get_splat_capacity", &VkSplat::get_splat_capacity, "Allocated capacity (elements) of per-splat buffers")
         .def("get_splat_group_ids", &VkSplat::get_splat_group_ids, "Get per-splat planar group IDs after Morton permutation")
         .def("set_splat_group_ids", &VkSplat::set_splat_group_ids, "Set per-splat planar group IDs", py::arg("group_ids"))
-        .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
+        .def("set_group_state", &VkSplat::set_group_state, "Set state for a structural group (0=normal, 1=IMAGINED, 2=LOCKED, 3=RETRACTED, 4=EXCLUDED_RENDER/FROZEN_INVISIBLE)", py::arg("group_id"), py::arg("state"), py::call_guard<py::gil_scoped_release>())
         .def("set_group_states", &VkSplat::set_group_states, "Batched set_group_state: one device upload for all (group_id, state) pairs", py::arg("group_ids"), py::arg("states"))
+        .def("ago_set_group_render_excluded", &VkSplat::ago_set_group_render_excluded,
+             "S104: Mark or unmark a group as FROZEN_INVISIBLE (pre-projection render excluded, zero tiles/sort entries); restores prior state on excluded=False",
+             py::arg("group_id"), py::arg("excluded"), py::call_guard<py::gil_scoped_release>())
         .def("get_splat_states", &VkSplat::get_splat_states, "Get per-splat evidence states (uint32)")
         .def("set_splat_states", &VkSplat::set_splat_states, "Set per-splat evidence states (uint32)", py::arg("states"))
         .def("set_splat_states_sparse", &VkSplat::set_splat_states_sparse, "Sparse update of per-splat evidence states", py::arg("rows"), py::arg("states"))

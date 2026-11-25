@@ -18,6 +18,7 @@ groupshared int n_contrib_fwd[PIXEL_BATCH_SIZE];
 groupshared float pixel_d_exp[PIXEL_BATCH_SIZE];
 groupshared float pixel_g_D_eff[PIXEL_BATCH_SIZE];
 groupshared int sg_max_contrib[MAX_SPLAT_BATCH_SIZE / SUBGROUP_SIZE];
+groupshared uint tile_has_active_splat;
 
 layout(binding=0) StructuredBuffer<int32_t> sorted_gauss_idx;
 layout(binding=1) StructuredBuffer<int32_t> tile_ranges;
@@ -58,6 +59,33 @@ void main(
     uint thread_rank = groupThreadID.x;
     uint tile_idx = uniforms.use_tile_list != 0 ? active_tiles[groupID.x] : groupID.y * grid_width + groupID.x;
     uint2 tbound0 = uint2(tile_idx%grid_width, tile_idx/grid_width) * uint2(TILE_WIDTH, TILE_HEIGHT);
+
+    uint32_t tile_idx_start = tile_ranges[tile_idx];
+    uint32_t tile_idx_end = tile_ranges[tile_idx+1];
+    if (tile_idx_start >= tile_idx_end)
+        return;
+
+    // S104: Active-tile backward early-exit — skip frozen-only tiles before reading pixel buffers.
+    if (uniforms.freeze_flags != 0u) {
+        if (thread_rank == 0u) {
+            tile_has_active_splat = 0u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        bool local_has_active = false;
+        for (uint32_t s = tile_idx_start + thread_rank; s < tile_idx_end; s += MAX_SPLAT_BATCH_SIZE) {
+            int32_t g_id = sorted_gauss_idx[s];
+            if (splat_freeze_mode(g_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state) != 2u) {
+                local_has_active = true;
+                break;
+            }
+        }
+        if (WaveActiveAnyTrue(local_has_active) && WaveIsFirstLane()) {
+            InterlockedOr(tile_has_active_splat, 1u);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tile_has_active_splat == 0u)
+            return;
+    }
 
     const bool ago_enabled = (uniforms.ago_telemetry_enabled != 0u);
     const bool depth_enabled = (uniforms.depth_loss_scale > 0.0f);
@@ -119,8 +147,6 @@ void main(
     );
     GroupMemoryBarrierWithGroupSync();
 
-    uint32_t tile_idx_start = tile_ranges[tile_idx];
-    uint32_t tile_idx_end = tile_ranges[tile_idx+1];
     tile_idx_end = tile_idx_start + min(tile_idx_end - tile_idx_start, uint32_t(max(tile_max_n_contrib, 0)));
     uint32_t num_splats_in_tile = tile_idx_end - tile_idx_start;
     if (num_splats_in_tile == 0)

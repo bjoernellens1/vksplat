@@ -13,6 +13,7 @@ groupshared uint32_t collected_idx[TILE_SIZE];
 groupshared float collected_depths[TILE_SIZE];
 
 groupshared float subgroup_shared[TILE_SIZE];
+groupshared uint tile_has_active_splat;
 
 
 layout(binding=0) StructuredBuffer<int32_t> sorted_gauss_idx;
@@ -58,12 +59,38 @@ void main(
     uint32_t tile_idx_end = tile_ranges[tile_idx+1];
 
     uint32_t thread_rank = groupThreadID.y * TILE_WIDTH + groupThreadID.x;
+    uint32_t block_size = TILE_HEIGHT * TILE_WIDTH;
+
+    if (tile_idx_start >= tile_idx_end)
+        return;
+
+    // S104: Active-tile backward early-exit — skip frozen-only tiles before reading pixel buffers.
+    // Mixed tiles (at least one splat with freeze != 2) fall through and preserve exact occlusion.
+    if (uniforms.freeze_flags != 0u) {
+        if (thread_rank == 0u) {
+            tile_has_active_splat = 0u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        bool local_has_active = false;
+        for (uint32_t s = tile_idx_start + thread_rank; s < tile_idx_end; s += block_size) {
+            int32_t g_id = sorted_gauss_idx[s];
+            if (splat_freeze_mode(g_id, uniforms.freeze_flags, uniforms.num_groups, group_ids, group_state, splat_state) != 2u) {
+                local_has_active = true;
+                break;
+            }
+        }
+        if (WaveActiveAnyTrue(local_has_active) && WaveIsFirstLane()) {
+            InterlockedOr(tile_has_active_splat, 1u);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tile_has_active_splat == 0u)
+            return;
+    }
 
     float4 d_current_pixel_state;
 
     // Load the final pixel state.
     bool is_inside = (pix_coord.x < W && pix_coord.y < H);
-    uint32_t block_size = TILE_HEIGHT * TILE_WIDTH;
     int rounds = ((tile_idx_end - tile_idx_start + block_size - 1) / block_size);
 
     int splats_left_to_process = tile_idx_end - tile_idx_start;

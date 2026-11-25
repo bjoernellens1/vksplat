@@ -440,6 +440,7 @@ public:
         size_t backward_active_gaussians = 0u;
         size_t geometry_updated_gaussians = 0u;
         size_t frozen_gaussians = 0u;
+        size_t frozen_invisible_gaussians = 0u;
     };
     void set_ago_stage_profiling(bool enabled);
     bool get_ago_stage_profiling() const { return ago_stage_profiling_enabled_; }
@@ -562,6 +563,7 @@ public:
     void reset_adc_host_readbacks() { adc_host_mask_readbacks_ = 0; }
     void set_group_state(VulkanGSPipelineBuffers& buffers, int32_t group_id, uint32_t state);
     void set_group_states(VulkanGSPipelineBuffers& buffers, const int32_t* gids, const uint32_t* states, size_t count);
+    void ago_set_group_render_excluded(VulkanGSPipelineBuffers& buffers, int32_t group_id, bool excluded);
     void set_splat_states_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, const uint32_t* states, size_t count);
     void set_splat_anchors(VulkanGSPipelineBuffers& buffers, const float* anchors_8, size_t count);
     void set_splat_anchors_sparse(VulkanGSPipelineBuffers& buffers, const uint32_t* rows, const float* anchors_8, size_t count);
@@ -900,6 +902,7 @@ private:
     } pipeline_morton_sort;
 
     void barrierAllGaussParams(VulkanGSPipelineBuffers& buffers);
+    std::unordered_map<int32_t, uint32_t> saved_group_state_before_exclude_;
 
 };
 

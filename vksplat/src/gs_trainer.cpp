@@ -1002,7 +1002,7 @@ void VulkanGSTrainer::camera_to_uniforms(const Camera &cam, VulkanGSRendererUnif
     uniforms.depth_loss_scale = 0.0f;
     uniforms.depth_huber_delta = 0.15f;
     uniforms.depth_inv_scale = 1.0f;
-    uniforms._pad_depth = 0.0f;
+    uniforms.render_exclude_flags = 0u;
 }
 
 float VulkanGSTrainer::get_world_to_normalized_scale() const {
@@ -2516,6 +2516,7 @@ VulkanGSTrainer::AgoWorkloadFunnel VulkanGSTrainer::compute_ago_workload_funnel(
     }
 
     size_t frozen = 0u;
+    size_t frozen_invisible = 0u;
     size_t skipped = 0u;
     size_t imagined_only = 0u;
     const size_t n_groups = buffers.group_state.size();
@@ -2529,8 +2530,13 @@ VulkanGSTrainer::AgoWorkloadFunnel VulkanGSTrainer::compute_ago_workload_funnel(
         const uint32_t raw_st = (i < n_states) ? splat_states[i] : 0xFFFFFFFFu;
         const uint32_t st = (raw_st == 0xFFFFFFFFu) ? 0xFFFFFFFFu : (raw_st & 0xFFu);
 
-        const bool is_frozen = (gstate == 2u);
+        const bool is_render_excluded = (gstate == 4u) ||
+            (raw_st != 0xFFFFFFFFu && (raw_st & 0x00040000u) != 0u);
+        const bool is_frozen = (gstate == 2u) || is_render_excluded;
         const bool is_retracted = (gstate == 3u) || (st == 4u);
+        if (is_render_excluded) {
+            ++frozen_invisible;
+        }
         if (is_frozen) {
             ++frozen;
         }
@@ -2553,7 +2559,9 @@ VulkanGSTrainer::AgoWorkloadFunnel VulkanGSTrainer::compute_ago_workload_funnel(
     const bool geom_mask_enabled = (config.ago_param_mask & 0x0Fu) != 0u;
     const size_t geom_eligible = (bwd_active > imagined_only) ? (bwd_active - imagined_only) : 0u;
 
+    f.projection_candidates = (gpu_n >= frozen_invisible) ? (gpu_n - frozen_invisible) : 0u;
     f.frozen_gaussians = frozen;
+    f.frozen_invisible_gaussians = frozen_invisible;
     f.backward_active_gaussians = bwd_active;
     f.geometry_updated_gaussians = geom_mask_enabled ? geom_eligible : 0u;
     return f;
@@ -4925,8 +4933,12 @@ void VulkanGSTrainer::set_group_states(
     }
     if (buffers.group_state.size() < required)
         buffers.group_state.resize(required, 0u);
-    for (size_t i = 0; i < count; ++i)
+    for (size_t i = 0; i < count; ++i) {
         buffers.group_state[gids[i]] = states[i];
+        if (states[i] != 4u) {
+            saved_group_state_before_exclude_.erase(gids[i]);
+        }
+    }
     // one upload covering the touched range, taken from the host mirror
     uploadDeviceSlice(
         buffers.group_state.deviceBuffer,
@@ -4942,6 +4954,34 @@ void VulkanGSTrainer::set_group_state(
     uint32_t state
 ) {
     set_group_states(buffers, &group_id, &state, 1);
+}
+
+void VulkanGSTrainer::ago_set_group_render_excluded(
+    VulkanGSPipelineBuffers& buffers,
+    int32_t group_id,
+    bool excluded
+) {
+    if (group_id < 0)
+        throw std::invalid_argument("group_id must be >= 0");
+    ensureGroupBuffersOnDevice(buffers, buffers.num_splats);
+    const size_t gid = static_cast<size_t>(group_id);
+    const uint32_t current = (gid < buffers.group_state.size()) ? buffers.group_state[gid] : 0u;
+    if (excluded) {
+        if (current != 4u) {
+            saved_group_state_before_exclude_[group_id] = current;
+        }
+        set_group_state(buffers, group_id, 4u);  // GROUP_STATE_EXCLUDED_RENDER (FROZEN_INVISIBLE)
+    } else {
+        uint32_t restored = 0u;
+        auto it = saved_group_state_before_exclude_.find(group_id);
+        if (it != saved_group_state_before_exclude_.end()) {
+            restored = it->second;
+            saved_group_state_before_exclude_.erase(it);
+        } else if (current != 4u) {
+            restored = current;
+        }
+        set_group_state(buffers, group_id, restored);
+    }
 }
 
 void VulkanGSTrainer::set_splat_states_sparse(
